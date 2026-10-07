@@ -292,7 +292,7 @@ describe("useAppWindowEvents", () => {
     );
     const options = eventOptions();
     const { unmount } = renderHook(() => useAppWindowEvents(options), { wrapper: StrictMode });
-    expect(registrations).toHaveLength(34);
+    expect(registrations).toHaveLength(38);
     unmount();
     await act(async () => {
       for (const registration of registrations) registration.resolve(registration.dispose);
