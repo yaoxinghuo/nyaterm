@@ -2842,6 +2842,14 @@
     "selectAll": "Select All",
     "translate": "Translate"
   },
+  "tmux": {
+    "commandPlaceholder": "tmux command, e.g. resize-pane -Z",
+    "detach": "Detach (tmux session stays on the server)",
+    "newWindow": "New window",
+    "splitHorizontal": "Split top/bottom",
+    "splitVertical": "Split left/right",
+    "window": "Window"
+  },
   "translation": {
     "ali": "Alibaba",
     "baidu": "Baidu",

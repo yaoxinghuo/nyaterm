@@ -420,6 +420,7 @@ export function ChildAppProvider({ children }: { children: ReactNode }) {
       updateTab: noopAsync,
       closeTabs: noop,
       closeTab: noop,
+      applyTmuxState: noop,
       persistTabsNow: noopAsync,
       appSettings,
       updateAppSettings,

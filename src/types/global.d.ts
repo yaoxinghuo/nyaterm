@@ -132,6 +132,15 @@ export interface WorkspacePaneBase {
   createRequestId?: string;
   /** Populated when session creation failed and the pane should stay visible as an error state. */
   connectError?: string;
+  /**
+   * Set when this pane is a tmux control-mode pane: `sessionId` is then a
+   * virtual session owned by `controlSessionId`'s SSH channel, and `paneId`
+   * is the tmux pane id (e.g. `%5`). Not persisted across restarts.
+   */
+  tmux?: {
+    controlSessionId: string;
+    paneId: string;
+  };
 }
 
 /** Leaf node representing one terminal session inside a workspace tab. */

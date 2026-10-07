@@ -18,6 +18,7 @@ import {
   removeSessionFromGroup,
   resumeSessionInGroup,
 } from "@/lib/syncInputGroups";
+import { findTmuxControlSessionId } from "@/lib/tmux/tree";
 import { findPaneBySessionId, findTabBySessionId, isSplitPane } from "@/lib/workspaceTabs";
 import type {
   PaneNode,
@@ -28,6 +29,7 @@ import type {
   Tab,
   TerminalSessionPane,
 } from "@/types/global";
+import TmuxBar from "./TmuxBar";
 import XTerminal from "./XTerminal";
 
 interface PaneWorkspaceProps {
@@ -588,27 +590,36 @@ function PaneWorkspace({
   onToggleSessionRecording,
   onSaveSessionTranscript,
 }: PaneWorkspaceProps) {
+  const tmuxControlSessionId = useMemo(
+    () => findTmuxControlSessionId(tab),
+    [tab],
+  );
   return (
     <div
-      className="absolute inset-0"
-      style={{ display: visible ? "block" : "none" }}
+      className="absolute inset-0 flex flex-col"
+      style={{ display: visible ? "flex" : "none" }}
     >
-      <PaneNodeView
-        node={tab.root}
-        tab={tab}
-        visible={visible}
-        sessionInfoById={sessionInfoById}
-        showChrome={isSplitPane(tab.root)}
-        onActivatePane={onActivatePane}
-        onUpdateSplitRatio={onUpdateSplitRatio}
-        onReconnectPane={onReconnectPane}
-        onReconnected={onReconnected}
-        onDisconnectedCloseRequested={onDisconnectedCloseRequested}
-        onConnectionError={onConnectionError}
-        recordingStatuses={recordingStatuses}
-        onToggleSessionRecording={onToggleSessionRecording}
-        onSaveSessionTranscript={onSaveSessionTranscript}
-      />
+      {tmuxControlSessionId ? (
+        <TmuxBar controlSessionId={tmuxControlSessionId} />
+      ) : null}
+      <div className="relative min-h-0 flex-1">
+        <PaneNodeView
+          node={tab.root}
+          tab={tab}
+          visible={visible}
+          sessionInfoById={sessionInfoById}
+          showChrome={isSplitPane(tab.root)}
+          onActivatePane={onActivatePane}
+          onUpdateSplitRatio={onUpdateSplitRatio}
+          onReconnectPane={onReconnectPane}
+          onReconnected={onReconnected}
+          onDisconnectedCloseRequested={onDisconnectedCloseRequested}
+          onConnectionError={onConnectionError}
+          recordingStatuses={recordingStatuses}
+          onToggleSessionRecording={onToggleSessionRecording}
+          onSaveSessionTranscript={onSaveSessionTranscript}
+        />
+      </div>
     </div>
   );
 }

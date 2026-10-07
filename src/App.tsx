@@ -144,6 +144,8 @@ import {
   openSettings,
   setOwnerMainWindowLabel,
 } from "./lib/windowManager";
+import { updateTmuxState } from "./lib/tmux/store";
+import type { TmuxSessionState } from "./lib/tmux/types";
 import {
   collectSessionPanes,
   findPaneBySessionId,
@@ -233,6 +235,7 @@ function App() {
     hasPane,
     closePane,
     updateSplitRatio,
+    applyTmuxState,
     persistTabsNow,
     updateUi,
     updateAppSettings,
@@ -600,6 +603,13 @@ function App() {
     );
 
     unsubs.push(
+      listen<TmuxSessionState>("tmux-session-state", (event) => {
+        updateTmuxState(event.payload);
+        applyTmuxState(event.payload);
+      }),
+    );
+
+    unsubs.push(
       listen<RdpCertificateVerifyRequest>("rdp-certificate-verify", (event) => {
         if (!eventTargetsCurrentWindow(event.payload.targetWindowLabel)) return;
         setRdpCertificateRequests((current) => {
@@ -779,6 +789,7 @@ function App() {
   }, [
     addTab,
     addPendingTab,
+    applyTmuxState,
     hasPane,
     hasTab,
     markPaneConnecting,
@@ -1737,12 +1748,33 @@ function App() {
   const closeReleasedSessions = useCallback(
     async (previousTabs: Tab[], nextTabs: Tab[]) => {
       const releasedSessionIds = getReleasedSessionIds(previousTabs, nextTabs);
+      const previousPanes = previousTabs.flatMap((tab) => collectSessionPanes(tab.root));
+      // tmux virtual panes share one control channel: when the last pane of a
+      // control session is released (its tab closed), detach via the control
+      // session once — the remote tmux session keeps running.
+      const remainingTmuxControls = new Set(
+        nextTabs
+          .flatMap((tab) => collectSessionPanes(tab.root))
+          .map((pane) => pane.tmux?.controlSessionId)
+          .filter((id): id is string => Boolean(id)),
+      );
+      const detachedControls = new Set<string>();
       const results = await Promise.all(
         releasedSessionIds.map((sessionId) => {
-          const pane = previousTabs
-            .flatMap((tab) => collectSessionPanes(tab.root))
-            .find((candidate) => candidate.sessionId === sessionId);
-          return pane ? closePaneBackendSession(pane) : Promise.resolve(true);
+          const pane = previousPanes.find(
+            (candidate) => candidate.sessionId === sessionId,
+          );
+          if (!pane) return Promise.resolve(true);
+          const controlId = pane.tmux?.controlSessionId;
+          if (controlId && !remainingTmuxControls.has(controlId)) {
+            if (detachedControls.has(controlId)) return Promise.resolve(true);
+            detachedControls.add(controlId);
+            return closePaneBackendSession({
+              sessionId: controlId,
+              type: "SSH",
+            });
+          }
+          return closePaneBackendSession(pane);
         }),
       );
       return results.every(Boolean);
