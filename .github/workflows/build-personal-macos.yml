@@ -34,10 +34,10 @@ jobs:
         include:
           - arch: arm64
             target: aarch64-apple-darwin
-            args: --target aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles dmg
           - arch: x64
             target: x86_64-apple-darwin
-            args: --target x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --bundles dmg
 
     steps:
       - name: Checkout repository
@@ -79,7 +79,9 @@ jobs:
 
       # No signing identities configured on purpose: the app comes out
       # ad-hoc signed, which is fine for personal use (right-click → open on
-      # first launch).
+      # first launch). `--bundles dmg` also skips the updater artifact —
+      # tauri.conf.json has an updater pubkey but no private key here, and
+      # building the updater bundle without it fails the build.
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
