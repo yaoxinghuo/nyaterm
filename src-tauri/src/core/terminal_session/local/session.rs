@@ -1464,6 +1464,7 @@ fn pty_session_thread(
                 *zm = None;
                 zmodem_input_blocked.store(false, Ordering::Release);
             }
+            SessionCommand::TmuxCommand { .. } | SessionCommand::TmuxDetach => {}
             SessionCommand::Close => {
                 break;
             }

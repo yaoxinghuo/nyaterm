@@ -313,6 +313,7 @@ fn serial_session_thread(
                 }
                 *zm = None;
             }
+            SessionCommand::TmuxCommand { .. } | SessionCommand::TmuxDetach => {}
             SessionCommand::Close => {
                 break;
             }

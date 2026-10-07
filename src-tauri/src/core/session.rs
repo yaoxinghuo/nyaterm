@@ -277,6 +277,12 @@ pub enum SessionCommand {
     },
     /// ZMODEM: user cancelled the ZMODEM transfer.
     ZmodemCancel,
+    /// tmux control mode: write one raw command line to the control channel
+    /// (used by the tmux bar for `select-window`, `split-window`, ...).
+    TmuxCommand { line: String },
+    /// tmux control mode: detach the control client and return the channel
+    /// to normal shell I/O.
+    TmuxDetach,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

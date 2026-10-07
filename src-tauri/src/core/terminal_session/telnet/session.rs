@@ -555,6 +555,7 @@ async fn telnet_session_task(
                         }
                         *zm = None;
                     }
+                    Some(SessionCommand::TmuxCommand { .. } | SessionCommand::TmuxDetach) => {}
                     Some(SessionCommand::Close) | None => {
                         break;
                     }
