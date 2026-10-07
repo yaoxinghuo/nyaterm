@@ -1,0 +1,114 @@
+# Personal macOS builds for the `personal` branch.
+#
+# Unlike the upstream release/snapshot workflows this needs no signing
+# secrets: it produces unsigned/ad-hoc-signed dmg images and uploads them as
+# workflow artifacts. Expected to be rebased/merged with upstream `main`
+# regularly; keep this file self-contained to avoid merge conflicts.
+
+name: Build Personal macOS
+
+on:
+  push:
+    branches:
+      - personal
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-personal-macos
+  cancel-in-progress: true
+
+env:
+  APP_NAME: NyaTerm
+
+jobs:
+  build:
+    name: macOS ${{ matrix.arch }}
+    runs-on: macos-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+          - arch: x64
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ./src-tauri -> target
+          key: personal-macos-${{ matrix.target }}
+          cache-on-failure: false
+        env:
+          RUST_CACHE_COMPRESS: true
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 9
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # No signing identities configured on purpose: the app comes out
+      # ad-hoc signed, which is fine for personal use (right-click → open on
+      # first launch).
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          includeUpdaterJson: false
+          args: ${{ matrix.args }}
+
+      - name: Collect macOS assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+
+          DMG_FILE="$(find "${BUNDLE_DIR}" -type f -name '*.dmg' | head -n 1 || true)"
+          if [ -z "${DMG_FILE}" ]; then
+            echo "No dmg file found under ${BUNDLE_DIR}"
+            exit 1
+          fi
+
+          cp "${DMG_FILE}" "dist-release/${APP_NAME}_personal_macos_${{ matrix.arch }}.dmg"
+          find dist-release -maxdepth 1 -type f -print
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: personal-macos-${{ matrix.arch }}
+          path: dist-release/*
+          if-no-files-found: error
+          retention-days: 30
