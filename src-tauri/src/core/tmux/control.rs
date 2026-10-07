@@ -32,9 +32,15 @@ pub(crate) enum ControlMessage {
         data: Vec<u8>,
     },
     /// `%layout-change @<window> <layout> <visible-layout> <flags>`
+    ///
+    /// `visible_layout`/`flags` were added in tmux 3.x; when the window is
+    /// zoomed (`flags` contains `Z`) the visible layout collapses to the
+    /// zoomed pane while `layout` keeps the full pane tree.
     LayoutChange {
         window: String,
         layout: LayoutCell,
+        visible_layout: LayoutCell,
+        flags: String,
     },
     WindowAdd {
         window: String,
@@ -257,19 +263,31 @@ pub(crate) fn parse_line(line: &str) -> Option<ControlMessage> {
         }
         "layout-change" => {
             let args = rest_after_keyword(line, "%layout-change")?;
-            let window = args.split_whitespace().next()?;
-            let layout_token = args.split_whitespace().nth(1)?;
+            let mut parts = args.split_whitespace();
+            let window = parts.next()?.to_string();
+            let layout_token = parts.next()?;
             let (layout, _) = parse_layout(layout_token)?;
+            // Older servers omit the trailing fields; the visible layout then
+            // equals the full layout.
+            let visible_layout = parts
+                .next()
+                .and_then(|token| parse_layout(token))
+                .map(|(cell, _)| cell)
+                .unwrap_or_else(|| layout.clone());
+            let flags = parts.next().unwrap_or_default().to_string();
             Some(ControlMessage::LayoutChange {
-                window: window.to_string(),
+                window,
                 layout,
+                visible_layout,
+                flags,
             })
         }
-        "window-add" => Some(ControlMessage::WindowAdd {
-            window: args_id(line, "%window-add")?,
+        "window-add" | "unlinked-window-add" => Some(ControlMessage::WindowAdd {
+            window: args_id(line, "%window-add").or_else(|| args_id(line, "%unlinked-window-add"))?,
         }),
-        "window-close" => Some(ControlMessage::WindowClose {
-            window: args_id(line, "%window-close")?,
+        "window-close" | "unlinked-window-close" => Some(ControlMessage::WindowClose {
+            window: args_id(line, "%window-close")
+                .or_else(|| args_id(line, "%unlinked-window-close"))?,
         }),
         "window-renamed" => {
             let args = rest_after_keyword(line, "%window-renamed")?;
@@ -489,7 +507,7 @@ fn parse_u32(input: &[u8], pos: usize) -> Option<(u32, usize)> {
 
 /// The pane tree for one window as reported to the frontend. Mirrors the
 /// frontend `PaneNode` shape so it can be applied directly.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(crate) enum TmuxUiNode {
     Pane {

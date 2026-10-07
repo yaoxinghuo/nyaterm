@@ -1567,6 +1567,13 @@ pub(super) async fn ssh_io_loop(
                                                 &result.visible,
                                             );
                                         }
+                                        // The shell's prompt is not redrawn
+                                        // after the control client detaches;
+                                        // an empty Enter makes it repaint.
+                                        // Delayed: the remounted renderer must
+                                        // attach first or the redraw is lost.
+                                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                                        let _ = channel.data("\r".as_bytes()).await;
                                         continue;
                                     }
                                     tmux::ControlExit::Closed => break "tmux-control-exit",

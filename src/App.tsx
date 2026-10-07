@@ -610,6 +610,13 @@ function App() {
     );
 
     unsubs.push(
+      listen<{ message?: string }>("tmux-command-error", (event) => {
+        const message = event.payload?.message;
+        if (message) toast.error(t("tmux.commandError", { message }));
+      }),
+    );
+
+    unsubs.push(
       listen<RdpCertificateVerifyRequest>("rdp-certificate-verify", (event) => {
         if (!eventTargetsCurrentWindow(event.payload.targetWindowLabel)) return;
         setRdpCertificateRequests((current) => {
@@ -1663,6 +1670,16 @@ function App() {
       restoredGlobalActiveTabIdRef.current = null;
       setActiveTabId(tabId);
       setActivePane(tabId, paneId);
+      // tmux panes: keep the remote "current pane" in sync with local focus
+      // so zoom/rotate and other untargeted commands act on the right pane.
+      const tab = tabsRef.current.find((item) => item.id === tabId);
+      const pane = tab ? findSessionPaneById(tab.root, paneId) : null;
+      if (pane?.tmux) {
+        void invoke("tmux_send_command", {
+          sessionId: pane.tmux.controlSessionId,
+          command: `select-pane -t '${pane.tmux.paneId}'`,
+        }).catch(() => {});
+      }
     },
     [setActivePane, setActiveTabId],
   );

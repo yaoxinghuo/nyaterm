@@ -2842,6 +2842,7 @@
     "translate": "翻译"
   },
   "tmux": {
+    "commandError": "tmux 命令失败：{{message}}",
     "commandPlaceholder": "tmux 命令，例如 resize-pane -Z",
     "detach": "分离（远端 tmux 会话保留）",
     "newWindow": "新建窗口",

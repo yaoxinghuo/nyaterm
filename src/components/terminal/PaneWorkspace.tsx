@@ -78,6 +78,13 @@ function SplitView({
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const isHorizontalSplit = split.direction === "horizontal";
+  // tmux-driven splits mirror a remote layout; dragging a divider would fight
+  // the cell-based geometry, so the divider is fixed and non-interactive.
+  const isTmuxSplit = useMemo(() => {
+    const contains = (node: PaneNode): boolean =>
+      node.kind === "leaf" ? Boolean(node.tmux) : contains(node.first) || contains(node.second);
+    return contains(split);
+  }, [split]);
 
   const handleResize = (delta: number) => {
     const size = isHorizontalSplit
@@ -119,10 +126,17 @@ function SplitView({
           onSaveSessionTranscript={onSaveSessionTranscript}
         />
       </div>
-      <ResizeHandle
-        direction={isHorizontalSplit ? "vertical" : "horizontal"}
-        onResize={handleResize}
-      />
+      {isTmuxSplit ? (
+        <div
+          className={`shrink-0 ${isHorizontalSplit ? "h-px" : "w-px"}`}
+          style={{ background: "var(--df-border)" }}
+        />
+      ) : (
+        <ResizeHandle
+          direction={isHorizontalSplit ? "vertical" : "horizontal"}
+          onResize={handleResize}
+        />
+      )}
       <div
         className="min-h-0 min-w-0 flex-1 relative"
         style={{

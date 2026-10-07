@@ -18,6 +18,23 @@ interface TmuxBarProps {
   controlSessionId: string;
 }
 
+/** Common tmux commands offered as suggestions in the command input. */
+const TMUX_COMMON_COMMANDS = [
+  "resize-pane -Z",
+  "select-layout even-horizontal",
+  "select-layout even-vertical",
+  "select-layout main-horizontal",
+  "select-layout tiled",
+  "kill-pane",
+  "respawn-pane -k",
+  "rename-window ",
+  "break-pane",
+  "swap-pane -U",
+  "swap-pane -D",
+  "last-window",
+  "synchronize-panes",
+] as const;
+
 /**
  * Minimal command bar shown while a tab is driven by tmux control mode.
  * In `-CC`, prefix keys reach the pane's stdin, so tmux-level actions must go
@@ -27,6 +44,7 @@ function TmuxBar({ controlSessionId }: TmuxBarProps) {
   const { t } = useTranslation();
   const state = useTmuxSessionState(controlSessionId);
   const [command, setCommand] = useState("");
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
 
   const send = useCallback(
     (line: string) => {
@@ -131,18 +149,54 @@ function TmuxBar({ controlSessionId }: TmuxBarProps) {
 
       <div className="mx-1 h-4 w-px" style={{ background: "var(--df-border)" }} />
 
-      <Input
-        value={command}
-        onChange={(event) => setCommand(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") submitCommand();
-        }}
-        placeholder={t("tmux.commandPlaceholder")}
-        className="h-6 flex-1 border-none bg-transparent px-1 font-mono text-xs shadow-none focus-visible:ring-0"
-        spellCheck={false}
-        autoCapitalize="off"
-        autoCorrect="off"
-      />
+      <div className="relative min-w-0 flex-1">
+        <Input
+          value={command}
+          onChange={(event) => setCommand(event.target.value)}
+          onFocus={() => setSuggestionsOpen(true)}
+          onBlur={() => setSuggestionsOpen(false)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              submitCommand();
+            } else if (event.key === "Escape") {
+              setSuggestionsOpen(false);
+            }
+          }}
+          placeholder={t("tmux.commandPlaceholder")}
+          className="h-6 w-full border-none bg-transparent px-1 font-mono text-xs shadow-none focus-visible:ring-0"
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+        />
+        {suggestionsOpen ? (
+          <div
+            className="absolute left-0 top-full z-50 mt-1 max-h-64 w-64 overflow-auto rounded-md border p-1 shadow-md"
+            style={{
+              borderColor: "var(--df-border)",
+              background: "var(--df-bg-secondary)",
+            }}
+          >
+            {TMUX_COMMON_COMMANDS.filter((entry) =>
+              entry.trim().includes(command.trim()),
+            ).map((entry) => (
+              <button
+                key={entry}
+                type="button"
+                // Picking a suggestion fires the command immediately.
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  send(entry);
+                  setCommand("");
+                  setSuggestionsOpen(false);
+                }}
+                className="block w-full rounded px-2 py-1.5 text-left font-mono text-xs hover:bg-accent"
+              >
+                {entry}
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }

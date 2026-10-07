@@ -63,7 +63,9 @@ export function buildTmuxPaneTree(
         kind: "leaf",
         paneKind: "terminal",
         sessionId: node.sessionId,
-        name: node.name,
+        // Keep the connection's session name so the tab title stays the
+        // connection label instead of the pane's current command.
+        name: basePane?.name ?? node.name,
         type: "SSH",
         connectionId: basePane?.connectionId,
         tmux: {
@@ -77,7 +79,8 @@ export function buildTmuxPaneTree(
       id: createWorkspaceId("pane"),
       kind: "split",
       direction: node.direction,
-      ratio: node.ratio,
+      // tmux-owned layout — the divider is fixed at 50/50 and not draggable.
+      ratio: 0.5,
       first: convert(node.first),
       second: convert(node.second),
     };
