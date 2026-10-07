@@ -199,7 +199,7 @@ const rule = (pattern = "ERROR", color = "#ff0000"): ResolvedHighlightRule => ({
 });
 
 function flushWriteRefresh() {
-  vi.advanceTimersByTime(XTERM_PERFORMANCE_CONFIG.highlighting.debounceMs);
+  vi.advanceTimersByTime(XTERM_PERFORMANCE_CONFIG.highlighting.writeRefreshIntervalMs);
 }
 
 function flushScrollRefresh() {
@@ -225,6 +225,51 @@ describe("KeywordHighlighter", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("refreshes keyword highlights during continuous writes", () => {
+    const lines = Array.from({ length: 40 }, () => createLine(""));
+    const harness = createHarness({ lines, baseY: 20, viewportY: 20 });
+    const highlighter = new KeywordHighlighter(harness.terminal);
+    highlighter.setRules([rule()], true);
+    flushWriteRefresh();
+    lines[20] = createLine("ERROR");
+
+    const interval = XTERM_PERFORMANCE_CONFIG.highlighting.writeRefreshIntervalMs;
+    for (let refresh = 1; refresh <= 3; refresh++) {
+      for (let write = 0; write < 4; write++) {
+        harness.write();
+        expect(lines[20].translateSpy).toHaveBeenCalledTimes(refresh - 1);
+        vi.advanceTimersByTime(interval / 4);
+      }
+      expect(lines[20].translateSpy).toHaveBeenCalledTimes(refresh);
+    }
+
+    expect(harness.decorations.filter((entry) => entry.marker.line === 20)).toHaveLength(1);
+    highlighter.dispose();
+  });
+
+  it("coalesces burst writes into one delayed highlight refresh", () => {
+    const lines = Array.from({ length: 40 }, () => createLine(""));
+    const harness = createHarness({ lines, baseY: 20, viewportY: 20 });
+    const highlighter = new KeywordHighlighter(harness.terminal);
+    highlighter.setRules([rule()], true);
+    flushWriteRefresh();
+    lines[20] = createLine("ERROR");
+
+    const interval = XTERM_PERFORMANCE_CONFIG.highlighting.writeRefreshIntervalMs;
+    for (let write = 0; write < 10; write++) {
+      harness.write();
+      if (write < 9) vi.advanceTimersByTime(interval / 10);
+    }
+    vi.advanceTimersByTime(interval / 10 - 1);
+    expect(lines[20].translateSpy).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(lines[20].translateSpy).toHaveBeenCalledTimes(1);
+
+    vi.advanceTimersByTime(interval * 2);
+    expect(lines[20].translateSpy).toHaveBeenCalledTimes(1);
+    highlighter.dispose();
   });
 
   it("uses a pure trailing debounce for continuous scrolling", () => {

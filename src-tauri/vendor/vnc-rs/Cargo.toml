@@ -18,6 +18,11 @@ name = "vnc"
 path = "src/lib.rs"
 
 [dependencies]
+aes = "0.8"
+eax = "0.5"
+rand = "0.8"
+rsa = "0.9"
+sha2 = "0.10"
 #error
 thiserror = "^1"
 flate2 = "^1"

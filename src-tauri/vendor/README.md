@@ -47,6 +47,7 @@ This directory contains local copies of upstream crates used by NyaTerm's RDP st
   - Adds configurable limits for strings, dimensions, rectangles, encoded/decoded payloads, clipboard data, and channels.
   - Reduces internal channel capacity and adds deterministic protocol/parser regression tests.
   - Adds an explicit security policy so NyaTerm can fail closed for `none`, `vnc-auth`, or password-aware `auto`.
+  - Adds RA2_256 (security type 129) with bounded RSA key exchange, AES-EAX encrypted records, username/password subtypes, and a pre-credential server-key verification callback used by NyaTerm's TOFU flow.
 - Integration status: used by NyaTerm's VNC direct-TCP manager and React pane. Raw is the required fallback; compressed encodings must remain gated by fork tests and interoperability checks before being advertised.
 
 ## Update Method

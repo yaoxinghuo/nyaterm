@@ -4,6 +4,7 @@ import { invoke } from "./invoke";
 import { logger } from "./logger";
 import { isMacOS, isWindows } from "./platform";
 import type { TerminalColors, ThemeColors } from "./themes";
+import { runtime } from "./backend/runtime";
 
 export const BACKGROUND_IMAGE_FITS = ["cover", "contain", "stretch", "tile"] as const;
 export const DEFAULT_BACKGROUND_IMAGE_FIT: BackgroundImageFit = "cover";
@@ -50,9 +51,7 @@ export function getWindowTransparencyOpacity(
 }
 
 export function windowTransparencyModeForOpacity(opacity: number): "none" | "transparent" {
-  return clampOpacity(opacity, DEFAULT_WINDOW_TRANSPARENCY_OPACITY) >= 1
-    ? "none"
-    : "transparent";
+  return clampOpacity(opacity, DEFAULT_WINDOW_TRANSPARENCY_OPACITY) >= 1 ? "none" : "transparent";
 }
 
 /** Native window transparency makes the window show through to the desktop.
@@ -74,8 +73,12 @@ function quoteCssUrl(url: string) {
 export async function loadBackgroundImageDataUrl(path: string | null | undefined): Promise<string> {
   const trimmed = path?.trim();
   if (!trimmed) return "";
+  if (runtime === "web")
+    return /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(trimmed) ? trimmed : "";
   try {
-    return await invoke<string>("read_background_image_data_url", { path: trimmed });
+    return await invoke<string>("read_background_image_data_url", {
+      path: trimmed,
+    });
   } catch (error) {
     logger.warn({
       domain: "background-image",
@@ -169,6 +172,7 @@ export function buildSurfaceCssVariables(
       "--df-bg-panel": bgPanel,
       "--df-bg-panel-solid": colors.bgPanel,
       "--df-bg-terminal": bgTerminal,
+      "--df-bg-terminal-solid": colors.bgTerminal,
       "--df-terminal-surface-bg": "transparent",
       "--df-bg-hover": bgHover,
       "--df-bg-input": bgInput,
@@ -200,6 +204,7 @@ export function buildSurfaceCssVariables(
     "--df-bg-panel": bgPanel,
     "--df-bg-panel-solid": colors.bgPanel,
     "--df-bg-terminal": bgTerminal,
+    "--df-bg-terminal-solid": colors.bgTerminal,
     "--df-terminal-surface-bg": terminalSurfaceBg,
     "--df-bg-hover": bgHover,
     "--df-bg-input": bgInput,
@@ -218,12 +223,20 @@ export function buildTerminalThemeColors(
   terminalColors: TerminalColors,
   appearance: AppearanceSettings,
 ): TerminalColors {
+  const { foregroundIntense, ...baseColors } = terminalColors;
+  const resolvedColors: TerminalColors = appearance.bold_default_foreground_highlight
+    ? {
+        ...baseColors,
+        foregroundIntense: foregroundIntense ?? terminalColors.foreground,
+      }
+    : baseColors;
+
   if (!isTerminalTransparencyEnabled(appearance)) {
-    return terminalColors;
+    return resolvedColors;
   }
 
   return {
-    ...terminalColors,
+    ...resolvedColors,
     background: "rgba(0, 0, 0, 0)",
   };
 }

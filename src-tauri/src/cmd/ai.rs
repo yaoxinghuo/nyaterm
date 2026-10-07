@@ -5,9 +5,16 @@ use crate::core::ai::{
     AiStreamStart, AppendAiAuditRequest, ClaudeCodeAccountStatus, ClaudeCodeCliStatus,
     ClaudeCodeRuntime, CodexAccountStatus, CodexCliStatus, CodexLoginFlow, CodexLoginStart,
 };
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
+use crate::storage::{self, SettingsDocKey};
+use crate::utils::crypto;
 use std::sync::Arc;
 use tauri::Emitter;
+
+#[tauri::command]
+pub fn import_ai_provider_icon(path: String) -> AppResult<String> {
+    super::connection::import_connection_icon_data_url(&path)
+}
 
 #[tauri::command]
 pub fn start_ai_chat_stream(
@@ -58,73 +65,51 @@ pub async fn refresh_ai_model_settings(
     Ok(config::mask_ai_settings(merged_ai))
 }
 
-fn merge_model_discoveries(
-    settings: &config::AiSettings,
-    discoveries: Vec<ai::AiModelDiscovery>,
-) -> Vec<config::AiModelConfigItem> {
-    let old_by_id = settings
-        .models
-        .iter()
-        .map(|model| (model.id.as_str(), model))
-        .collect::<std::collections::HashMap<_, _>>();
-    let now = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| String::new());
-    let mut seen = std::collections::HashSet::new();
-    let mut merged = Vec::new();
-
-    for item in discoveries {
-        if !seen.insert(item.id.clone()) {
-            continue;
-        }
-        if let Some(old) = old_by_id.get(item.id.as_str()) {
-            let mut model = (*old).clone();
-            model.last_seen_at = Some(now.clone());
-            merged.push(model);
-        } else {
-            merged.push(config::AiModelConfigItem {
-                id: item.id,
-                name: item.name,
-                backend: item.backend,
-                provider_kind: item.provider_kind,
-                credential_id: item.credential_id,
-                enabled: false,
-                source: item.source,
-                last_seen_at: Some(now.clone()),
-            });
-        }
-    }
-
-    for old in &settings.models {
-        if !seen.contains(&old.id)
-            && (old.source == config::AiModelSource::Manual
-                || old.backend == config::AiBackendKind::Codex)
-        {
-            merged.push(old.clone());
-        }
-    }
-
-    merged.sort_by(|left, right| left.name.cmp(&right.name));
-    merged
+#[tauri::command]
+pub async fn test_ai_provider_connection(
+    app: tauri::AppHandle,
+    ai_settings: config::AiSettings,
+    credential_id: String,
+) -> AppResult<Vec<String>> {
+    let existing = config::load_app_settings(&app)?;
+    let merged_ai = config::merge_masked_ai_settings(&existing.ai, ai_settings);
+    ai::test_provider_connection(&merged_ai, &credential_id).await
 }
 
-fn update_default_model_id(
-    settings: &config::AiSettings,
-    models: &[config::AiModelConfigItem],
-) -> Option<String> {
-    if let Some(default_model_id) = settings.default_model_id.as_deref() {
-        if models
-            .iter()
-            .any(|model| model.enabled && model.id == default_model_id)
-        {
-            return Some(default_model_id.to_string());
-        }
-    }
-    models
-        .iter()
-        .find(|model| model.enabled)
-        .map(|model| model.id.clone())
+#[tauri::command]
+pub async fn test_ai_model_connection(
+    app: tauri::AppHandle,
+    ai_settings: config::AiSettings,
+    model_id: String,
+) -> AppResult<()> {
+    let existing = config::load_app_settings(&app)?;
+    let merged_ai = config::merge_masked_ai_settings(&existing.ai, ai_settings);
+    ai::test_model_connection(&merged_ai, &model_id).await
 }
+
+#[tauri::command]
+pub fn reveal_ai_provider_api_key(credential_id: String) -> AppResult<String> {
+    let settings = storage::load_settings_doc::<config::AppSettings>(SettingsDocKey::AppSettings)?;
+    let encrypted_key = settings
+        .ai
+        .provider_credentials
+        .iter()
+        .find(|credential| credential.id == credential_id)
+        .and_then(|credential| credential.api_key.as_ref())
+        .or_else(|| {
+            settings
+                .ai
+                .provider_profiles
+                .iter()
+                .find(|profile| profile.id == credential_id)
+                .and_then(|profile| profile.api_key.as_ref())
+        })
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| AppError::Config("AI provider API key is not configured".to_string()))?;
+    crypto::decrypt(encrypted_key)
+}
+
+use nyaterm_core::core::ai::catalog::{merge_model_discoveries, update_default_model_id};
 
 #[tauri::command]
 pub fn cancel_ai_chat_stream(stream_id: String) -> AppResult<()> {
@@ -256,6 +241,7 @@ mod tests {
             enabled,
             source: config::AiModelSource::RustGenai,
             last_seen_at: None,
+            supported_reasoning_efforts: None,
         }
     }
 
@@ -269,6 +255,7 @@ mod tests {
             enabled: true,
             source: config::AiModelSource::Manual,
             last_seen_at: None,
+            supported_reasoning_efforts: None,
         }
     }
 

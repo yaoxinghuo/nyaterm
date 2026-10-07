@@ -616,11 +616,14 @@ fn entry_to_saved_connection(
         },
         group_id: None,
         description: Some(description),
+        tags: Vec::new(),
         sort_order: 0,
         icon: None,
         icon_auto_detect: None,
         auth: Some(ConnectionAuth {
             mode: if uses_key { "key" } else { "agent" }.to_string(),
+            account_id: None,
+            password_source: None,
             password_id: None,
             password: None,
             key_id,
@@ -731,6 +734,12 @@ where
     );
 
     keys.push(SshKey {
+        sort_order: keys
+            .iter()
+            .map(|key| key.sort_order)
+            .max()
+            .unwrap_or(-1)
+            .saturating_add(1),
         id: key_id.clone(),
         name,
         key: Some(encrypt(&content)?),

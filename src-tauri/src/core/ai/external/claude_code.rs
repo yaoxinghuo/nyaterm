@@ -20,7 +20,7 @@ use crate::utils::process::hide_window;
 
 use super::super::history::{append_message, save_user_message, set_session_external_session_id};
 use super::super::prompt::build_prompt;
-use super::super::redaction::{redact_context, redact_marker_values, redact_sensitive_text};
+use super::super::redaction::{redact_marker_values, redact_request, redact_sensitive_text};
 use super::super::stream::{active_streams, emit_stream_event};
 use super::super::types::{AiChatRequest, AiMessage, AiMessageRole, AiStreamEventPayload};
 use super::super::types::{now_rfc3339, uuid};
@@ -207,8 +207,7 @@ async fn run_claude_code_stream_inner(
     );
 
     if settings.redaction_enabled {
-        redact_context(&mut request.context);
-        request.user_input = redact_sensitive_text(&request.user_input);
+        redact_request(request);
     }
     if settings.record_history {
         save_user_message(&app, &session_id, request)?;
@@ -478,7 +477,7 @@ fn claude_system_context(request: &AiChatRequest) -> String {
         .or(request.terminal_session_id.as_deref())
         .unwrap_or("none");
     format!(
-        "You are running inside NyaTerm. Use NyaTerm MCP tools for terminal sessions when available. Do not read SSH passwords, private keys, OAuth tokens, or internal app credentials. Do not create separate SSH connections to bypass NyaTerm SessionManager. Default terminal session: {default_target}."
+        "You are running inside NyaTerm. Use NyaTerm MCP tools for terminal sessions when available. Any terminal command executed through NyaTerm MCP must be non-interactive and must not wait for user input, confirmation, or pager navigation. For tools that may start a pager, use tool-specific non-interactive or no-pager options such as git --no-pager ... or journalctl --no-pager. If a command requires an interactive UI, confirmation prompt, or input and has no non-interactive alternative, do not run it automatically; choose a non-interactive alternative or explain the limitation to the user. Do not read SSH passwords, private keys, OAuth tokens, or internal app credentials. Do not create separate SSH connections to bypass NyaTerm SessionManager. Default terminal session: {default_target}."
     )
 }
 
@@ -530,8 +529,14 @@ fn build_claude_invocation(
     if let Some(model) = request
         .model_name
         .as_deref()
-        .or(settings.claude_code.default_model.as_deref())
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            settings
+                .claude_code
+                .default_model
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        })
     {
         args.push("--model".to_string());
         args.push(model.to_string());
@@ -914,6 +919,10 @@ mod tests {
                 .iter()
                 .any(|arg| arg.contains("Default terminal session: term-1"))
         );
+        let system_context = arg_value(&invocation.args, "--append-system-prompt")
+            .expect("append system prompt argument");
+        assert!(system_context.contains("must be non-interactive"));
+        assert!(system_context.contains("git --no-pager"));
         assert_eq!(
             arg_value(&invocation.args, "--permission-mode"),
             Some("manual")

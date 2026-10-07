@@ -107,7 +107,10 @@ pub fn injection_script(shell: ShellKind, ready_marker: &str) -> Option<String> 
                     " __nyaterm_prune_history(){{ [ -n \"${{NYATERM_PRUNE_HISTORY:-}}\" ] || return 0; unset NYATERM_PRUNE_HISTORY; local hline history_number; hline=\"$(HISTTIMEFORMAT= history 1 2>/dev/null || true)\"; case \"$hline\" in *NYATERM_PRUNE_HISTORY*|*NYATERM_INJ*|*__nyaterm_prompt*|*NyaTermReady*) history_number=${{hline#\"${{hline%%[![:space:]]*}}\"}}; history_number=${{history_number%%[!0-9]*}}; [ -z \"$history_number\" ] || history -d \"$history_number\" 2>/dev/null || true;; esac; NYATERM_LAST_HISTCMD=\"${{HISTCMD-}}\"; }};",
                     " __nyaterm_emit_command(){{ local histcmd=\"${{HISTCMD-}}\"; if [ -n \"${{NYATERM_SKIP_COMMAND_ONCE:-}}\" ]; then unset NYATERM_SKIP_COMMAND_ONCE; NYATERM_LAST_HISTCMD=\"$histcmd\"; return 0; fi; if [ -n \"$histcmd\" ] && [ \"${{NYATERM_LAST_HISTCMD-}}\" != \"$histcmd\" ]; then NYATERM_LAST_HISTCMD=\"$histcmd\"; local cmd; cmd=\"$(fc -ln -1 2>/dev/null)\"; if [ -n \"$cmd\" ] && command -v base64 >/dev/null 2>&1; then local b64; b64=\"$(printf '%s' \"$cmd\" | base64 | tr -d '\\r\\n')\"; printf '\\033]%s%s\\007' \"$NYATERM_COMMAND_MARKER\" \"$b64\"; fi; fi; }};",
                     " __nyaterm_prompt(){{ local status=$?; __nyaterm_prune_history; __nyaterm_emit_command; local cwd=\"${{PWD//%/%25}}\"; printf '\\033]7;file://%s%s\\007' \"$(__nyaterm_host)\" \"$cwd\"; return \"$status\"; }};",
-                    " __nyaterm_install_prompt(){{ local decl f; decl=\"$(declare -p PROMPT_COMMAND 2>/dev/null || true)\"; [[ ! \"$decl\" =~ ^declare\\ -[^[:space:]]*r ]] || return 1; if [[ \"$decl\" =~ ^declare\\ -[^[:space:]]*a[^[:space:]]*\\ PROMPT_COMMAND= ]]; then for f in \"${{PROMPT_COMMAND[@]}}\"; do [ \"$f\" = __nyaterm_prompt ] && return 0; done; PROMPT_COMMAND=(__nyaterm_prompt \"${{PROMPT_COMMAND[@]}}\") || return 1; else case \"${{PROMPT_COMMAND-}}\" in *__nyaterm_prompt*) ;; *) PROMPT_COMMAND=\"__nyaterm_prompt${{PROMPT_COMMAND:+; $PROMPT_COMMAND}}\" || return 1;; esac; fi; }};",
+                    // An exported PROMPT_COMMAND reaches child shells (su, tmux,
+                    // zellij) that lack __nyaterm_prompt. Call it through a variable
+                    // they do not inherit; there $(exit $?) leaves $? untouched.
+                    " __nyaterm_install_prompt(){{ local decl f; decl=\"$(declare -p PROMPT_COMMAND 2>/dev/null || true)\"; [[ ! \"$decl\" =~ ^declare\\ -[^[:space:]]*r ]] || return 1; if [[ \"$decl\" =~ ^declare\\ -[^[:space:]]*a[^[:space:]]*\\ PROMPT_COMMAND= ]]; then for f in \"${{PROMPT_COMMAND[@]}}\"; do [ \"$f\" = __nyaterm_prompt ] && return 0; done; PROMPT_COMMAND=(__nyaterm_prompt \"${{PROMPT_COMMAND[@]}}\") || return 1; else f=__nyaterm_prompt; if [[ \"$decl\" =~ ^declare\\ -[^[:space:]]*x ]]; then __nyaterm_prompt_hook=$f || return 1; export -n __nyaterm_prompt_hook || return 1; f='${{__nyaterm_prompt_hook-$(exit $?)}}'; fi; case \"${{PROMPT_COMMAND-}}\" in *__nyaterm_prompt*) ;; *) PROMPT_COMMAND=\"$f${{PROMPT_COMMAND:+; $PROMPT_COMMAND}}\" || return 1;; esac; fi; }};",
                     " if __nyaterm_install_prompt; then __nyaterm_install_ok=1; else __nyaterm_install_ok=0; fi;",
                     " __nyaterm_prune_history;",
                     " if [ \"$__nyaterm_install_ok\" = 1 ]; then if [ -n \"${{NYATERM_READY_PENDING:-}}\" ]; then unset NYATERM_READY_PENDING; printf '{ready_osc}'; fi; else unset NYATERM_READY_PENDING; __nyaterm_ready_failed; fi;",
@@ -1195,6 +1198,43 @@ mod tests {
                 .windows(b"NyaTermReady:session-1".len())
                 .any(|value| value == b"NyaTermReady:session-1")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_bash_exported_prompt_command_does_not_break_child_shells() {
+        use std::process::Command;
+
+        let integration = injection_script(ShellKind::Bash, &build_ready_marker("session-1"))
+            .expect("bash injection script");
+        // `su`, tmux or zellij panes and a nested `bash` inherit an exported
+        // PROMPT_COMMAND but not the integration functions. The user's hook
+        // must still run there, see the real `$?` and print no error.
+        let script = format!(
+            r#"export __nyaterm_prompt_hook=stale
+export PROMPT_COMMAND='printf "hook=%s\n" "$?"'
+{integration}
+false; eval "$PROMPT_COMMAND"
+/bin/bash --noprofile --norc -c 'false; eval "$PROMPT_COMMAND"'
+HISTFILE=/dev/null /bin/bash --noprofile --norc -i </dev/null
+"#
+        );
+        let output = Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-c", &script])
+            .output()
+            .expect("run exported PROMPT_COMMAND child-shell smoke");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("NyaTermReady:session-1"),
+            "{stdout}\n{stderr}"
+        );
+        assert!(stdout.contains("\x1b]7;file://"), "{stdout}\n{stderr}");
+        assert!(!stderr.contains("command not found"), "{stdout}\n{stderr}");
+        assert_eq!(stdout.matches("hook=1\n").count(), 2, "{stdout}\n{stderr}");
+        assert!(stdout.contains("hook=0\n"), "{stdout}\n{stderr}");
     }
 
     #[cfg(unix)]

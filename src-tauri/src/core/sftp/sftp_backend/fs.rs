@@ -13,8 +13,45 @@ impl RemoteFs for SftpBackend {
     }
 
     async fn home_dir(&self) -> AppResult<String> {
-        let sftp = self.open_sftp().await?;
-        let home = sftp.canonicalize(".").await?;
+        let sftp = match self.open_sftp_for_operation("home_dir").await {
+            Ok(sftp) => sftp,
+            Err(error) => {
+                tracing::warn!(
+                    operation = "home_dir",
+                    stage = "open_session",
+                    error = %error,
+                    stream_closed = is_sftp_stream_closed_app_error(&error),
+                    "SFTP home directory operation failed"
+                );
+                return Err(error);
+            }
+        };
+        tracing::debug!(
+            sftp_session_id = sftp.sftp_session_id(),
+            operation = "home_dir",
+            stage = "open_session",
+            "SFTP home directory session opened"
+        );
+        let home = match sftp.canonicalize(".").await {
+            Ok(home) => home,
+            Err(error) => {
+                tracing::warn!(
+                    sftp_session_id = sftp.sftp_session_id(),
+                    operation = "home_dir",
+                    stage = "canonicalize",
+                    error = %error,
+                    stream_closed = is_sftp_stream_closed_error(&error),
+                    "SFTP home directory operation failed"
+                );
+                return Err(error.into());
+            }
+        };
+        tracing::debug!(
+            sftp_session_id = sftp.sftp_session_id(),
+            operation = "home_dir",
+            stage = "close_session",
+            "SFTP home directory session close requested"
+        );
         let _ = sftp.close().await;
 
         if home.is_empty() {
@@ -43,18 +80,46 @@ impl RemoteFs for SftpBackend {
         let (sftp, dir) = loop {
             let sftp = match self.open_sftp().await {
                 Ok(sftp) => sftp,
-                Err(error) if should_retry_sftp_directory_list(&error, retries_used) => {
+                Err(error)
+                    if should_retry_sftp_directory_list(
+                        &error,
+                        retries_used,
+                        self.compatibility_mode(),
+                    ) =>
+                {
                     retries_used += 1;
                     continue;
                 }
                 Err(error) => return Err(error),
             };
 
+            tracing::info!(
+                sftp_session_id = sftp.sftp_session_id(),
+                operation = "list_dir",
+                stage = "read_dir",
+                remote_path = path.display_path(),
+                "SFTP directory read started"
+            );
+            let read_started = Instant::now();
             match sftp.read_dir_bytes(path_bytes.clone()).await {
-                Ok(dir) => break (sftp, dir),
+                Ok(dir) => {
+                    tracing::info!(
+                        sftp_session_id = sftp.sftp_session_id(),
+                        operation = "list_dir",
+                        stage = "read_dir_completed",
+                        remote_path = path.display_path(),
+                        elapsed_ms = read_started.elapsed().as_millis(),
+                        "SFTP directory read completed"
+                    );
+                    break (sftp, dir);
+                }
                 Err(error) => {
                     let error = AppError::Sftp(error);
-                    let should_retry = should_retry_sftp_directory_list(&error, retries_used);
+                    let should_retry = should_retry_sftp_directory_list(
+                        &error,
+                        retries_used,
+                        self.compatibility_mode(),
+                    );
                     let _ = sftp.close().await;
                     if should_retry {
                         retries_used += 1;
@@ -149,8 +214,26 @@ impl RemoteFs for SftpBackend {
         }
 
         let _ = sftp.close().await;
+        tracing::info!(
+            sftp_session_id = sftp.sftp_session_id(),
+            operation = "list_dir",
+            stage = "resolving_identities",
+            remote_path = path.display_path(),
+            shell_available = self.shell_available,
+            entry_count = pending.len(),
+            uid_count = uid_set.len(),
+            gid_count = gid_set.len(),
+            "SFTP directory identity resolution started"
+        );
         let user_names = self.resolve_uid_names(uid_set).await;
         let group_names = self.resolve_gid_names(gid_set).await;
+        tracing::info!(
+            sftp_session_id = sftp.sftp_session_id(),
+            operation = "list_dir",
+            stage = "identities_resolved",
+            remote_path = path.display_path(),
+            "SFTP directory identity resolution completed"
+        );
         let entries = pending
             .into_iter()
             .map(
@@ -294,6 +377,7 @@ impl RemoteFs for SftpBackend {
             ignore_sftp_not_found(sftp.remove_file_bytes(raw_path).await)?;
         } else if sftp_attrs_is_dir(&meta) {
             let _ = sftp.close().await;
+            drop(sftp);
             self.remove_dir_fast_ref(path).await?;
             return Ok(());
         } else {
@@ -693,6 +777,7 @@ impl RemoteFs for SftpBackend {
                             local_path: safe_local_path,
                             direction: "download".to_string(),
                             kind: "file".to_string(),
+                            source: None,
                             status: "completed".to_string(),
                             size: 0,
                             bytes_transferred: 0,
@@ -786,6 +871,7 @@ impl RemoteFs for SftpBackend {
             }
         };
         let _ = sftp_for_resolve.close().await;
+        drop(sftp_for_resolve);
 
         let mut last_err = None;
         for attempt in 0..=max_retries {
@@ -867,19 +953,21 @@ impl RemoteFs for SftpBackend {
             &directory_controller.build_event("started", 0, None),
         );
 
-        let result = async {
-            let inventory = self
-                .collect_remote_directory_inventory(remote_path, local_path, &directory_controller)
-                .await?;
-            self.download_remote_directory_files(
-                app,
-                inventory,
-                directory_controller.clone(),
-                &transfer_settings,
-            )
+        let result = match self
+            .collect_remote_directory_inventory(remote_path, local_path, &directory_controller)
             .await
-        }
-        .await;
+        {
+            Ok(inventory) => self
+                .download_remote_directory_files(
+                    app,
+                    inventory,
+                    directory_controller.clone(),
+                    &transfer_settings,
+                )
+                .await
+                .map_err(|error| ("download_files", error)),
+            Err(error) => Err(("inventory", error)),
+        };
 
         match result {
             Ok(summary) => {
@@ -902,7 +990,7 @@ impl RemoteFs for SftpBackend {
                 unregister_transfer(&directory_controller.id());
                 Ok(())
             }
-            Err(e) => {
+            Err((stage, e)) => {
                 if matches!(e, AppError::Cancelled(_)) {
                     let _ = app.emit(
                         "transfer-event",
@@ -910,6 +998,16 @@ impl RemoteFs for SftpBackend {
                     );
                     cleanup_cancelled_download(local_path).await;
                 } else {
+                    tracing::warn!(
+                        operation = "download_directory",
+                        session_id,
+                        transfer_id = %directory_controller.id(),
+                        remote_path,
+                        stage,
+                        error = %e,
+                        stream_closed = is_sftp_stream_closed_app_error(&e),
+                        "SFTP directory download failed"
+                    );
                     let _ = app.emit(
                         "transfer-event",
                         &directory_controller.build_event("error", 0, Some(e.to_string())),
@@ -946,6 +1044,7 @@ impl RemoteFs for SftpBackend {
             return Ok(());
         }
         let _ = sftp_for_check.close().await;
+        drop(sftp_for_check);
 
         let (request_kib, pipeline_depth, max_concurrent_writes) =
             sftp_pipeline_config(transfer_settings, self.pipeline_depth_override);

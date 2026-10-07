@@ -184,6 +184,7 @@ function renderFocusHarness(selection: string) {
       <>
         <TerminalContextMenu
           sessionId="session-1"
+          appLocked={false}
           terminalRef={{ current: terminal }}
           onFind={() => {
             // Match TerminalSearchBar's existing post-show focus effect.
@@ -225,6 +226,7 @@ function renderTerminalContextMenu({
     <div onContextMenu={onAncestorContextMenu}>
       <TerminalContextMenu
         sessionId="session-1"
+        appLocked={false}
         terminalRef={terminalRef}
         onFind={vi.fn()}
         onPasteText={vi.fn()}

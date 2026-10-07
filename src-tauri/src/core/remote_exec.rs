@@ -5,6 +5,100 @@ use russh::ChannelMsg;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+/// A private exec channel, never `SessionCommand::Write` or the user's PTY.
+/// The guard closes the channel even when its enclosing RPC future is dropped.
+struct ProbeChannel(Option<russh::Channel<russh::client::Msg>>);
+
+impl Drop for ProbeChannel {
+    fn drop(&mut self) {
+        if let Some(channel) = self.0.take() {
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(2), channel.close()).await;
+            });
+        }
+    }
+}
+
+pub async fn exec_ssh_session_probe(
+    manager: &Arc<SessionManager>,
+    session_id: &str,
+    script: &[u8],
+    timeout: Duration,
+    cancellation: CancellationToken,
+) -> AppResult<nyaterm_plugin_runtime::probe::ProbeOutput> {
+    ensure_remote_exec_enabled(manager, session_id).await?;
+    let info = manager.session_info(session_id).await?;
+    if info.ssh_profile == Some(crate::config::SshProfile::NetworkDevice) {
+        return Err(AppError::Config(
+            "Remote probes are disabled for network devices".into(),
+        ));
+    }
+    let ssh_handle = get_ssh_handle(manager, session_id).await?;
+    let operation = async {
+        let handle_mtx = ssh_handle.target_handle();
+        let channel = handle_mtx
+            .lock()
+            .await
+            .channel_open_session()
+            .await
+            .map_err(|e| AppError::Channel(e.to_string()))?;
+        let mut guard = ProbeChannel(Some(channel));
+        let channel = guard.0.as_mut().unwrap();
+        channel
+            .exec(true, b"sh -s".as_slice())
+            .await
+            .map_err(|e| AppError::Channel(e.to_string()))?;
+        channel
+            .data(script)
+            .await
+            .map_err(|e| AppError::Channel(e.to_string()))?;
+        channel
+            .eof()
+            .await
+            .map_err(|e| AppError::Channel(e.to_string()))?;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_status = None;
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } => {
+                    if stdout.len() + stderr.len() + data.len() > 1024 * 1024 {
+                        return Err(AppError::Config("Probe output exceeds 1 MiB".into()));
+                    }
+                    stdout.extend_from_slice(&data);
+                }
+                ChannelMsg::ExtendedData { data, .. } => {
+                    if stdout.len() + stderr.len() + data.len() > 1024 * 1024 {
+                        return Err(AppError::Config("Probe output exceeds 1 MiB".into()));
+                    }
+                    stderr.extend_from_slice(&data);
+                }
+                ChannelMsg::ExitStatus {
+                    exit_status: status,
+                } => exit_status = Some(status),
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+            if stdout.len() + stderr.len() > 1024 * 1024 {
+                return Err(AppError::Config("Probe output exceeds 1 MiB".into()));
+            }
+        }
+        Ok(nyaterm_plugin_runtime::probe::ProbeOutput {
+            stdout: String::from_utf8(stdout)
+                .map_err(|_| AppError::Config("Probe stdout must be UTF-8".into()))?,
+            stderr: String::from_utf8(stderr)
+                .map_err(|_| AppError::Config("Probe stderr must be UTF-8".into()))?,
+            exit_status,
+        })
+    };
+    tokio::select! {
+        () = cancellation.cancelled() => Err(AppError::Cancelled("Probe cancelled".into())),
+        result = tokio::time::timeout(timeout, operation) =>
+            result.map_err(|_| AppError::Cancelled("Probe timed out".into()))?,
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RemoteCommandOutput {

@@ -37,6 +37,7 @@ function appendPoint(
 export function useNetworkHistory(
   sessionId: string | null,
   stats: RemoteStats | null,
+  liveSessionIds: ReadonlySet<string> | null = null,
 ): NetworkHistoryStore {
   const historiesRef = useRef(new Map<string, NetworkHistorySeries>());
   const lastStatsRef = useRef(new Map<string, RemoteStats>());
@@ -59,7 +60,27 @@ export function useNetworkHistory(
   }
 
   useEffect(() => {
-    if (!sessionId || !stats || lastStatsRef.current.get(sessionId) === stats) return;
+    if (liveSessionIds === null) return;
+    let changed = false;
+    for (const cachedSessionId of historiesRef.current.keys()) {
+      if (liveSessionIds.has(cachedSessionId)) continue;
+      historiesRef.current.delete(cachedSessionId);
+      lastStatsRef.current.delete(cachedSessionId);
+      changed = true;
+    }
+    if (changed) {
+      for (const listener of listenersRef.current) listener();
+    }
+  }, [liveSessionIds]);
+
+  useEffect(() => {
+    if (
+      !sessionId ||
+      !stats ||
+      (liveSessionIds !== null && !liveSessionIds.has(sessionId)) ||
+      lastStatsRef.current.get(sessionId) === stats
+    )
+      return;
 
     lastStatsRef.current.set(sessionId, stats);
     const timestamp = Date.now();
@@ -85,7 +106,7 @@ export function useNetworkHistory(
     for (const listener of listenersRef.current) {
       listener();
     }
-  }, [sessionId, stats]);
+  }, [liveSessionIds, sessionId, stats]);
 
   return storeRef.current;
 }

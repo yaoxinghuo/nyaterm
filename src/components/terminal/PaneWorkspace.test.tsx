@@ -14,6 +14,7 @@ vi.mock("@/context/AppContext", () => ({
     tabs: [],
     syncGroups: [],
     broadcastToAll: false,
+    isLocked: true,
     setSyncGroups: vi.fn(),
   }),
 }));
@@ -123,6 +124,7 @@ describe("PaneWorkspace RDP routing", () => {
         sessionId: "terminal-session",
         sessionType: "SSH",
         active: true,
+        appLocked: true,
         visible: true,
       }),
     );
@@ -134,6 +136,39 @@ describe("PaneWorkspace RDP routing", () => {
       }),
     );
     expect(view.getAllByTestId(/(?:x-terminal|rdp-pane-host)/)).toHaveLength(2);
+  });
+
+  it("keeps inactive panes mounted but hidden in pane focus mode", () => {
+    const tab = tabWithRoot(
+      {
+        id: "split-1",
+        kind: "split",
+        direction: "vertical",
+        ratio: 0.4,
+        first: terminalPane(),
+        second: rdpPane(),
+      },
+      "rdp-pane",
+    );
+
+    const view = render(
+      <PaneWorkspace
+        tab={tab}
+        visible
+        paneFocusMode
+        onActivatePane={vi.fn()}
+        onUpdateSplitRatio={vi.fn()}
+      />,
+    );
+
+    expect(view.getByTestId("x-terminal")).not.toBeNull();
+    expect(view.getByTestId("rdp-pane-host")).not.toBeNull();
+    expect(xTerminalMock).toHaveBeenCalledWith(
+      expect.objectContaining({ visible: false, active: false }),
+    );
+    expect(rdpPaneHostMock).toHaveBeenCalledWith(
+      expect.objectContaining({ visible: true, active: true }),
+    );
   });
 
   it("routes VNC leaves to VncPaneHost without invoking RDP or terminal hosts", () => {

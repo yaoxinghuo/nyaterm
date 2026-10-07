@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createXTerminalDataOriginTracker,
   resolveXTerminalDataOrigin,
+  shouldBlockXTerminalData,
 } from "./xterminalKeyboardInput";
 
 describe("xterm data origin tracking", () => {
@@ -49,5 +50,11 @@ describe("xterm data origin tracking", () => {
     expect(tracker.consume()).toBe("keyboard");
     tracker.endUserInputEvent();
     expect(tracker.consume()).toBe("terminal_response");
+  });
+
+  it("blocks user input while locked but preserves terminal responses", () => {
+    expect(shouldBlockXTerminalData(true, "keyboard")).toBe(true);
+    expect(shouldBlockXTerminalData(true, "terminal_response")).toBe(false);
+    expect(shouldBlockXTerminalData(false, "keyboard")).toBe(false);
   });
 });

@@ -1,3 +1,4 @@
+import { supports } from "@/lib/backend/runtime";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@/lib/invoke";
 import type { RemoteStats } from "@/types/global";
@@ -23,8 +24,10 @@ export function useRemoteStats(
   activeSessionId: string | null,
   enabled: boolean,
   intervalSeconds: number,
+  liveSessionIds: ReadonlySet<string> | null = null,
 ): RemoteStatsState {
   const [state, setState] = useState<OwnedRemoteStatsState | null>(null);
+  const statsCacheRef = useRef(new Map<string, RemoteStats>());
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const warmupRefreshRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const warmupRetrySessionRef = useRef<string | null>(null);
@@ -33,7 +36,10 @@ export function useRemoteStats(
   const fetchingGenerationRef = useRef<number | null>(null);
   const failCountRef = useRef(0);
   const pollIntervalMs = Math.max(1, intervalSeconds) * 1000;
-  const requestedSessionId = enabled ? activeSessionId : null;
+  const requestedSessionId =
+    enabled && activeSessionId && (liveSessionIds === null || liveSessionIds.has(activeSessionId))
+      ? activeSessionId
+      : null;
 
   // Let async completions see a session switch before the corresponding effect flushes.
   activeSessionRef.current = requestedSessionId;
@@ -46,7 +52,11 @@ export function useRemoteStats(
 
   const fetchStats = useCallback(
     async (sessionId: string, generation: number, manual = false) => {
-      if (!isCurrentRequest(sessionId, generation)) return null;
+      if (
+        !supports("remoteMonitoring") ||
+        !isCurrentRequest(sessionId, generation)
+      )
+        return null;
       if (fetchingGenerationRef.current === generation) return null;
       fetchingGenerationRef.current = generation;
       if (manual) {
@@ -56,9 +66,16 @@ export function useRemoteStats(
       }
 
       try {
-        const data = await invoke<RemoteStats>("get_remote_stats", { sessionId });
-        if (!isCurrentRequest(sessionId, generation)) return null;
+        const data = await invoke<RemoteStats>("get_remote_stats", {
+          sessionId,
+        });
+        if (
+          !supports("remoteMonitoring") ||
+          !isCurrentRequest(sessionId, generation)
+        )
+          return null;
 
+        statsCacheRef.current.set(sessionId, data);
         setState((current) => ({
           sessionId,
           stats: data,
@@ -84,10 +101,15 @@ export function useRemoteStats(
         }
         return data;
       } catch {
-        if (!isCurrentRequest(sessionId, generation)) return null;
+        if (
+          !supports("remoteMonitoring") ||
+          !isCurrentRequest(sessionId, generation)
+        )
+          return null;
 
         failCountRef.current += 1;
         const clearStats = failCountRef.current >= MAX_CONSECUTIVE_FAILURES;
+        if (clearStats) statsCacheRef.current.delete(sessionId);
         setState((current) => ({
           sessionId,
           stats: clearStats || current?.sessionId !== sessionId ? null : current.stats,
@@ -115,6 +137,14 @@ export function useRemoteStats(
   }, [fetchStats, requestedSessionId]);
 
   useEffect(() => {
+    // A null list means session discovery has not completed yet.
+    if (liveSessionIds === null) return;
+    for (const sessionId of statsCacheRef.current.keys()) {
+      if (!liveSessionIds.has(sessionId)) statsCacheRef.current.delete(sessionId);
+    }
+  }, [liveSessionIds]);
+
+  useEffect(() => {
     const generation = generationRef.current + 1;
     generationRef.current = generation;
     fetchingGenerationRef.current = null;
@@ -140,7 +170,7 @@ export function useRemoteStats(
 
     setState({
       sessionId: requestedSessionId,
-      stats: null,
+      stats: statsCacheRef.current.get(requestedSessionId) ?? null,
       error: false,
       isManualRefreshing: false,
     });
@@ -165,10 +195,13 @@ export function useRemoteStats(
   }, [fetchStats, pollIntervalMs, requestedSessionId]);
 
   const visibleState = state?.sessionId === requestedSessionId ? state : null;
+  const cachedStats = requestedSessionId
+    ? (statsCacheRef.current.get(requestedSessionId) ?? null)
+    : null;
 
   return {
-    sessionId: visibleState?.sessionId ?? null,
-    stats: visibleState?.stats ?? null,
+    sessionId: requestedSessionId,
+    stats: visibleState ? visibleState.stats : cachedStats,
     error: visibleState?.error ?? false,
     isManualRefreshing: visibleState?.isManualRefreshing ?? false,
     refresh,

@@ -20,28 +20,68 @@ use crate::config::{
     AgentCommandExecutionMode, AiAgentKind, AiPermissionMode, AiSettings, RiskLevel,
 };
 use crate::core::capabilities::{
-    TerminalExecuteRequest, TerminalExecutionPresentation, execute_terminal_command,
+    RiskReasonCode, TerminalExecuteRequest, TerminalExecutionPresentation, execute_terminal_command,
 };
 use crate::core::session::{SessionManager, SessionType};
 use crate::core::ssh::SshConnectionHandles;
 use crate::error::{AppError, AppResult};
 use crate::utils::process::hide_window;
 
-use super::history::{append_ai_audit, append_message, save_user_message};
+use super::history::{append_ai_audit, append_message, load_history, save_user_message};
 use super::model::{ResolvedAiModel, build_chat_options, build_client, resolve_request_model};
-use super::parser::{extract_json_object, parse_model_output, trim_string_to_option};
+use super::parser::{
+    extract_json_object, extract_text_from_assistant, parse_model_output, trim_string_to_option,
+};
 use super::prompt::{
     agent_execution_disabled_message, agent_max_steps_message, agent_send_only_observation,
     agent_system_prompt, build_agent_failed_message, build_agent_prompt,
     build_agent_rejected_message, build_agent_unknown_action_message, build_observation_message,
 };
-use super::redaction::{redact_context, redact_sensitive_text};
+use super::redaction::{redact_request, redact_sensitive_text};
 use super::stream::{active_streams, emit_stream_event, is_cancelled};
 use super::types::{
-    AgentActionKind, AgentLlmResponse, AgentStepAction, AgentStepPayload, AgentStepStatus,
-    AiChatRequest, AiMessage, AiMessageRole, AiStreamEventPayload, AiTerminalTarget,
-    AppendAiAuditRequest, CommandObservation, now_rfc3339, uuid,
+    AgentActionKind, AgentApprovalReasonCode, AgentLlmResponse, AgentStepAction, AgentStepPayload,
+    AgentStepStatus, AiChatRequest, AiMessage, AiMessageRole, AiStreamEventPayload,
+    AiTerminalTarget, AppendAiAuditRequest, CommandObservation, now_rfc3339, uuid,
 };
+
+fn build_initial_agent_conversation(
+    request: &AiChatRequest,
+    settings: &AiSettings,
+    prior_messages: &[AiMessage],
+) -> Vec<ChatMessage> {
+    let mut conversation = vec![ChatMessage::system(agent_system_prompt(
+        &request.options.language,
+    ))];
+
+    if let Some(session_id) = request.session_id.as_deref() {
+        let history_messages: Vec<_> = prior_messages
+            .iter()
+            .filter(|message| {
+                message.session_id == session_id
+                    && matches!(message.role, AiMessageRole::User | AiMessageRole::Assistant)
+            })
+            .collect();
+        let skip = history_messages
+            .len()
+            .saturating_sub(request.options.history_turns as usize);
+        for message in history_messages.into_iter().skip(skip) {
+            match message.role {
+                AiMessageRole::User => conversation.push(ChatMessage::user(&message.content)),
+                AiMessageRole::Assistant => {
+                    let content = extract_text_from_assistant(&message.content);
+                    if !content.is_empty() {
+                        conversation.push(ChatMessage::assistant(content));
+                    }
+                }
+                AiMessageRole::System => {}
+            }
+        }
+    }
+
+    conversation.push(ChatMessage::user(build_agent_prompt(request, settings)));
+    conversation
+}
 
 // ---------------------------------------------------------------------------
 // Agent approval
@@ -370,7 +410,8 @@ struct RiskAssessment {
     local_risk: RiskLevel,
     local_auto_executable: bool,
     effective_risk: RiskLevel,
-    risk_reason: Option<String>,
+    model_risk_reason: Option<String>,
+    local_risk_reason_code: Option<RiskReasonCode>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -566,58 +607,46 @@ fn max_risk(a: RiskLevel, b: RiskLevel) -> RiskLevel {
     if a >= b { a } else { b }
 }
 
-fn risk_label(risk: &RiskLevel) -> &'static str {
-    match risk {
-        RiskLevel::Low => "low",
-        RiskLevel::Medium => "medium",
-        RiskLevel::High => "high",
-        RiskLevel::Critical => "critical",
-    }
-}
-
-fn assess_local_command_risk(command: &str) -> (RiskLevel, String, bool) {
+fn assess_local_command_risk(command: &str) -> (RiskLevel, Option<RiskReasonCode>, bool) {
     let risk = crate::core::capabilities::assess_command_risk(command);
-    (risk.level, risk.reason, risk.auto_executable)
+    (risk.level, risk.reason_code, risk.auto_executable)
 }
 
 fn assess_agent_command_risk(parsed: &AgentLlmResponse, command: &str) -> RiskAssessment {
     let model_risk = parsed.risk_level.clone().unwrap_or(RiskLevel::Medium);
-    let (local_risk, local_reason, local_auto_executable) = assess_local_command_risk(command);
+    let (local_risk, local_reason_code, local_auto_executable) = assess_local_command_risk(command);
     let effective_risk = max_risk(model_risk.clone(), local_risk.clone());
-    let risk_reason = parsed
+    let model_risk_reason = parsed
         .risk_reason
         .as_ref()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("AI: {}; local: {}", value.trim(), local_reason))
-        .or_else(|| Some(format!("local: {local_reason}")));
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
     RiskAssessment {
         model_risk,
         local_risk,
         local_auto_executable,
         effective_risk,
-        risk_reason,
+        model_risk_reason,
+        local_risk_reason_code: local_reason_code,
     }
 }
 
 fn decide_agent_command_execution(
     settings: &AiSettings,
     assessment: &RiskAssessment,
-) -> (ApprovalDecision, Option<String>) {
+) -> (ApprovalDecision, Option<AgentApprovalReasonCode>) {
     match settings.agent_command_execution_mode {
         AgentCommandExecutionMode::ConfirmEach => (
             ApprovalDecision::NeedsApproval,
-            Some("execution policy requires confirmation for every command".to_string()),
+            Some(AgentApprovalReasonCode::ConfirmEachCommand),
         ),
         AgentCommandExecutionMode::Auto => (ApprovalDecision::Auto, None),
         AgentCommandExecutionMode::Smart => {
             if assessment.effective_risk == RiskLevel::Critical {
                 return (
                     ApprovalDecision::NeedsApproval,
-                    Some(
-                        "critical risk always requires manual confirmation in smart mode"
-                            .to_string(),
-                    ),
+                    Some(AgentApprovalReasonCode::CriticalRisk),
                 );
             }
             if assessment.effective_risk <= settings.agent_smart_auto_execute_max_risk {
@@ -625,11 +654,7 @@ fn decide_agent_command_execution(
             } else {
                 (
                     ApprovalDecision::NeedsApproval,
-                    Some(format!(
-                        "effective risk {} exceeds smart auto-execute threshold {}",
-                        risk_label(&assessment.effective_risk),
-                        risk_label(&settings.agent_smart_auto_execute_max_risk)
-                    )),
+                    Some(AgentApprovalReasonCode::RiskExceedsThreshold),
                 )
             }
         }
@@ -639,11 +664,11 @@ fn decide_agent_command_execution(
 fn decide_external_agent_command_execution(
     mode: &AiPermissionMode,
     assessment: &RiskAssessment,
-) -> (ApprovalDecision, Option<String>) {
+) -> (ApprovalDecision, Option<AgentApprovalReasonCode>) {
     match mode {
         AiPermissionMode::Observer | AiPermissionMode::Confirm => (
             ApprovalDecision::NeedsApproval,
-            Some("external agent permission mode requires confirmation".to_string()),
+            Some(AgentApprovalReasonCode::ExternalAgentPermission),
         ),
         AiPermissionMode::Auto
             if assessment.local_auto_executable && assessment.effective_risk < RiskLevel::High =>
@@ -652,7 +677,7 @@ fn decide_external_agent_command_execution(
         }
         AiPermissionMode::Auto => (
             ApprovalDecision::NeedsApproval,
-            Some("safe auto requires confirmation for unknown or high-risk commands".to_string()),
+            Some(AgentApprovalReasonCode::SafeAutoUnknownOrHighRisk),
         ),
         AiPermissionMode::FullAccess => (ApprovalDecision::Auto, None),
     }
@@ -662,7 +687,7 @@ fn build_execute_action(
     command: &str,
     target: Option<AiTerminalTarget>,
     assessment: &RiskAssessment,
-    approval_reason: Option<String>,
+    approval_reason_code: Option<AgentApprovalReasonCode>,
 ) -> AgentStepAction {
     AgentStepAction {
         kind: AgentActionKind::ExecuteCommand,
@@ -671,8 +696,9 @@ fn build_execute_action(
         risk_level: Some(assessment.effective_risk.clone()),
         model_risk_level: Some(assessment.model_risk.clone()),
         local_risk_level: Some(assessment.local_risk.clone()),
-        risk_reason: assessment.risk_reason.clone(),
-        approval_reason,
+        model_risk_reason: assessment.model_risk_reason.clone(),
+        local_risk_reason_code: assessment.local_risk_reason_code,
+        approval_reason_code,
         answer: None,
     }
 }
@@ -685,8 +711,9 @@ fn build_final_action(answer: String) -> AgentStepAction {
         risk_level: None,
         model_risk_level: None,
         local_risk_level: None,
-        risk_reason: None,
-        approval_reason: None,
+        model_risk_reason: None,
+        local_risk_reason_code: None,
+        approval_reason_code: None,
         answer: Some(answer),
     }
 }
@@ -792,7 +819,7 @@ pub(super) async fn run_external_agent_command_step(
     let assessment = assess_agent_command_risk(&parsed, &command);
     let command_target =
         resolve_agent_command_target(request, parsed.target_terminal_session_id.as_deref())?;
-    let (decision, approval_reason) = if request.agent_kind == AiAgentKind::Nyaterm {
+    let (decision, approval_reason_code) = if request.agent_kind == AiAgentKind::Nyaterm {
         decide_agent_command_execution(settings, &assessment)
     } else {
         decide_external_agent_command_execution(&request.permission_mode, &assessment)
@@ -825,7 +852,7 @@ pub(super) async fn run_external_agent_command_step(
                 &command,
                 Some(command_target.clone()),
                 &assessment,
-                approval_reason.clone(),
+                approval_reason_code.clone(),
             ),
             observation: None,
             status: AgentStepStatus::NeedsApproval,
@@ -850,7 +877,7 @@ pub(super) async fn run_external_agent_command_step(
                     &command,
                     Some(command_target.clone()),
                     &assessment,
-                    approval_reason,
+                    approval_reason_code,
                 ),
                 observation: None,
                 status: AgentStepStatus::Rejected,
@@ -1095,7 +1122,7 @@ async fn run_agent_legacy_json_step(
         };
         let stream_result =
             super::responses::run_responses_chat_messages_stream_without_text_deltas(
-                app,
+                &super::stream::DesktopAiSink(app),
                 stream_id,
                 &synthetic_request,
                 settings,
@@ -1225,6 +1252,100 @@ fn parse_legacy_agent_step_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use genai::chat::ChatRole;
+
+    fn agent_request(session_id: Option<&str>, history_turns: u16) -> AiChatRequest {
+        serde_json::from_value(json!({
+            "sessionId": session_id,
+            "action": "generate_command",
+            "userInput": "current task",
+            "options": { "historyTurns": history_turns }
+        }))
+        .unwrap()
+    }
+
+    fn history_message(session_id: &str, role: AiMessageRole, content: &str) -> AiMessage {
+        AiMessage {
+            id: format!("msg-{}", uuid()),
+            session_id: session_id.to_string(),
+            role,
+            content: content.to_string(),
+            created_at: now_rfc3339(),
+            reasoning_content: None,
+            command_cards: vec![],
+        }
+    }
+
+    #[test]
+    fn agent_conversation_restores_previous_turn_once() {
+        let request = agent_request(Some("s1"), 20);
+        let history = vec![
+            history_message("s1", AiMessageRole::User, "previous task"),
+            history_message("s1", AiMessageRole::Assistant, "previous answer"),
+        ];
+
+        let conversation =
+            build_initial_agent_conversation(&request, &AiSettings::default(), &history);
+
+        assert_eq!(conversation.len(), 4);
+        assert_eq!(conversation[0].role, ChatRole::System);
+        assert_eq!(conversation[1].role, ChatRole::User);
+        assert_eq!(conversation[1].content.first_text(), Some("previous task"));
+        assert_eq!(conversation[2].role, ChatRole::Assistant);
+        assert_eq!(
+            conversation[2].content.first_text(),
+            Some("previous answer")
+        );
+        assert_eq!(conversation[3].role, ChatRole::User);
+        assert!(
+            conversation[3]
+                .content
+                .first_text()
+                .unwrap()
+                .contains("current task")
+        );
+        assert_eq!(
+            conversation
+                .iter()
+                .filter(|message| message
+                    .content
+                    .first_text()
+                    .is_some_and(|text| text.contains("current task")))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn agent_conversation_limits_history_to_same_session() {
+        let request = agent_request(Some("s1"), 2);
+        let history = vec![
+            history_message("s1", AiMessageRole::User, "old task"),
+            history_message("s1", AiMessageRole::Assistant, "old answer"),
+            history_message("s2", AiMessageRole::User, "other session"),
+            history_message("s1", AiMessageRole::User, "recent task"),
+            history_message("s1", AiMessageRole::Assistant, "recent answer"),
+        ];
+
+        let conversation =
+            build_initial_agent_conversation(&request, &AiSettings::default(), &history);
+
+        assert_eq!(conversation.len(), 4);
+        assert_eq!(conversation[1].content.first_text(), Some("recent task"));
+        assert_eq!(conversation[2].content.first_text(), Some("recent answer"));
+    }
+
+    #[test]
+    fn agent_conversation_omits_history_for_new_or_disabled_session() {
+        let history = vec![history_message("s1", AiMessageRole::User, "old task")];
+        for request in [agent_request(None, 20), agent_request(Some("s1"), 0)] {
+            let conversation =
+                build_initial_agent_conversation(&request, &AiSettings::default(), &history);
+            assert_eq!(conversation.len(), 2);
+            assert_eq!(conversation[0].role, ChatRole::System);
+            assert_eq!(conversation[1].role, ChatRole::User);
+        }
+    }
 
     fn parsed_response(risk: Option<RiskLevel>) -> AgentLlmResponse {
         AgentLlmResponse {
@@ -1236,6 +1357,20 @@ mod tests {
             risk_reason: Some("model reason".to_string()),
             answer: None,
         }
+    }
+
+    #[test]
+    fn keeps_model_and_local_risk_reasons_separate() {
+        let assessment = assess_agent_command_risk(&parsed_response(Some(RiskLevel::Low)), "ls");
+
+        assert_eq!(
+            assessment.model_risk_reason.as_deref(),
+            Some("model reason")
+        );
+        assert_eq!(
+            assessment.local_risk_reason_code,
+            Some(RiskReasonCode::ReadOnlyDiagnostic)
+        );
     }
 
     #[test]
@@ -1544,9 +1679,26 @@ pub(super) async fn run_agent_stream(
     );
 
     if settings.redaction_enabled {
-        redact_context(&mut request.context);
-        request.user_input = redact_sensitive_text(&request.user_input);
+        redact_request(&mut request);
     }
+
+    // Snapshot history before persisting this turn so its user message is not replayed twice.
+    let prior_messages = if request.options.history_turns > 0 {
+        match load_history(&app) {
+            Ok(history) => history.messages,
+            Err(error) => {
+                tracing::warn!(
+                    stream_id = %stream_id,
+                    session_id = %session_id,
+                    error = %error,
+                    "Failed to load agent conversation history"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     if settings.record_history {
         if let Err(error) = save_user_message(&app, &session_id, &request) {
@@ -1595,11 +1747,7 @@ pub(super) async fn run_agent_stream(
         "AI agent stream resolved configuration"
     );
 
-    let mut conversation = vec![ChatMessage::system(agent_system_prompt(
-        &request.options.language,
-    ))];
-    let initial_prompt = build_agent_prompt(&request, &settings);
-    conversation.push(ChatMessage::user(initial_prompt));
+    let mut conversation = build_initial_agent_conversation(&request, &settings, &prior_messages);
 
     let mut final_answer: Option<String> = None;
     let mut all_steps: Vec<AgentStepPayload> = Vec::new();
@@ -1790,7 +1938,7 @@ pub(super) async fn run_agent_stream(
                         continue;
                     }
                 };
-                let (decision, approval_reason) =
+                let (decision, approval_reason_code) =
                     decide_agent_command_execution(&settings, &assessment);
 
                 tracing::info!(
@@ -1816,7 +1964,7 @@ pub(super) async fn run_agent_stream(
                             &command,
                             Some(command_target.clone()),
                             &assessment,
-                            approval_reason.clone(),
+                            approval_reason_code.clone(),
                         ),
                         observation: None,
                         status: AgentStepStatus::NeedsApproval,
@@ -1846,7 +1994,7 @@ pub(super) async fn run_agent_stream(
                                 &command,
                                 Some(command_target.clone()),
                                 &assessment,
-                                approval_reason,
+                                approval_reason_code,
                             ),
                             observation: None,
                             status: AgentStepStatus::Rejected,

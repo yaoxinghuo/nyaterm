@@ -267,6 +267,7 @@ impl SftpBackend {
         let max_open_handles = sftp.max_open_handles();
         let result = collect_remove_inventory(&sftp, path, path_bytes.clone()).await;
         let _ = sftp.close().await;
+        drop(sftp);
         let inventory = result?;
 
         if inventory.files.is_empty() && inventory.dirs.is_empty() {
@@ -290,11 +291,12 @@ impl SftpBackend {
             };
         }
 
-        let concurrency = sftp_directory_concurrency(max_open_handles);
+        let concurrency = sftp_directory_concurrency(max_open_handles, self.compatibility_mode());
         let pool = SftpSessionPool::new(
             self,
             concurrency.session_pool_size,
             SftpClientConfig::default(),
+            "remove_directory_files",
         )
         .await?;
         let result = remove_inventory_concurrent(pool.clone(), inventory, concurrency).await;
@@ -308,7 +310,16 @@ impl SftpBackend {
         local_path: &str,
         directory_controller: &Arc<TransferController>,
     ) -> AppResult<RemoteDirectoryInventory> {
-        let sftp = self.open_sftp().await?;
+        let sftp = self
+            .open_sftp_for_operation("download_directory_inventory")
+            .await?;
+        tracing::debug!(
+            sftp_session_id = sftp.sftp_session_id(),
+            operation = "download_directory_inventory",
+            stage = "inventory_start",
+            remote_path,
+            "SFTP directory inventory started"
+        );
         let max_open_handles = sftp.max_open_handles();
         let result = self
             .collect_remote_directory_inventory_inner(
@@ -333,7 +344,7 @@ impl SftpBackend {
 
     pub(super) async fn collect_remote_directory_inventory_inner(
         &self,
-        sftp: &SftpSession,
+        sftp: &ManagedSftpSession,
         remote_path: &str,
         local_path: &str,
         directory_controller: &Arc<TransferController>,
@@ -344,7 +355,21 @@ impl SftpBackend {
             .await
             .map_err(|e| AppError::Channel(format!("Failed to create local dir: {}", e)))?;
 
-        let dir = sftp.read_dir(remote_path).await?;
+        let dir = match sftp.read_dir(remote_path).await {
+            Ok(dir) => dir,
+            Err(error) => {
+                tracing::warn!(
+                    sftp_session_id = sftp.sftp_session_id(),
+                    operation = "download_directory_inventory",
+                    stage = "read_dir",
+                    remote_path,
+                    error = %error,
+                    stream_closed = is_sftp_stream_closed_error(&error),
+                    "Failed to read remote directory during download inventory"
+                );
+                return Err(error.into());
+            }
+        };
         let mut files = Vec::new();
         let mut total_size = 0u64;
 
@@ -498,7 +523,8 @@ impl SftpBackend {
         directory_controller: Arc<TransferController>,
         transfer_settings: &crate::config::TransferSettings,
     ) -> AppResult<DirectoryTransferSummary> {
-        let concurrency = sftp_directory_concurrency(inventory.max_open_handles);
+        let concurrency =
+            sftp_directory_concurrency(inventory.max_open_handles, self.compatibility_mode());
         if inventory.files.is_empty() {
             return Ok(DirectoryTransferSummary {
                 completed: 0,
@@ -516,6 +542,7 @@ impl SftpBackend {
             self,
             concurrency.session_pool_size,
             sftp_client_config(request_kib, max_concurrent_writes),
+            "download_directory_files",
         )
         .await?;
         let result = run_download_directory_workers(
@@ -541,7 +568,8 @@ impl SftpBackend {
         directory_controller: &Arc<TransferController>,
         transfer_settings: &crate::config::TransferSettings,
     ) -> AppResult<DirectoryTransferSummary> {
-        let concurrency = sftp_directory_concurrency(inventory.max_open_handles);
+        let concurrency =
+            sftp_directory_concurrency(inventory.max_open_handles, self.compatibility_mode());
         if inventory.files.is_empty() {
             return Ok(DirectoryTransferSummary {
                 completed: 0,
@@ -559,6 +587,7 @@ impl SftpBackend {
             self,
             concurrency.session_pool_size,
             sftp_client_config(request_kib, max_concurrent_writes),
+            "upload_directory_files",
         )
         .await?;
         let result = run_upload_directory_workers(

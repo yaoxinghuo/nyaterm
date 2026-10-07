@@ -12,6 +12,7 @@ interface OwnedRemoteGpuOverviewState {
 }
 
 export interface RemoteGpuOverviewState {
+  paused?: boolean;
   sessionId: string | null;
   overview: RemoteGpuOverview | null;
   error: boolean;

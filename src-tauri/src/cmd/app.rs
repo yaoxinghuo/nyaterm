@@ -30,7 +30,7 @@ pub struct AppLockStateChangedPayload {
     locked: bool,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalDropPathEntry {
     path: String,
@@ -110,15 +110,21 @@ pub struct AppSupportInfo {
     os: String,
     architecture: String,
     runtime: String,
+    package_manager: Option<String>,
+    #[cfg(windows)]
+    conpty: crate::platform::windows_conpty::LocalConptyInfo,
 }
 
 #[tauri::command]
 pub fn get_support_info(state: tauri::State<'_, crate::runtime::AppRuntime>) -> AppSupportInfo {
-    let runtime = state.info().mode;
+    let info = state.info();
     AppSupportInfo {
         os: operating_system_label(),
         architecture: std::env::consts::ARCH.to_string(),
-        runtime,
+        runtime: info.mode,
+        package_manager: info.package_manager,
+        #[cfg(windows)]
+        conpty: crate::platform::windows_conpty::support_info(),
     }
 }
 
@@ -155,41 +161,17 @@ fn operating_system_label() -> String {
 
 #[cfg(target_os = "windows")]
 fn windows_version_label() -> String {
-    use windows::Win32::System::SystemInformation::OSVERSIONINFOEXW;
-    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-
-    const VER_NT_WORKSTATION: u8 = 1;
-    type RtlGetVersion = unsafe extern "system" fn(*mut OSVERSIONINFOEXW) -> i32;
-
-    let mut version = OSVERSIONINFOEXW {
-        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOEXW>() as u32,
-        ..Default::default()
-    };
-
-    let Some(rtl_get_version) = (unsafe {
-        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
-        if ntdll.is_null() {
-            None
-        } else {
-            GetProcAddress(ntdll, c"RtlGetVersion".as_ptr().cast())
-        }
-    }) else {
-        return "Windows".to_string();
-    };
-
-    let rtl_get_version: RtlGetVersion = unsafe { std::mem::transmute(rtl_get_version) };
-
-    // RtlGetVersion queries the current Windows version in-process, avoiding a console process.
-    if unsafe { rtl_get_version(&mut version) } >= 0 {
-        windows_version_label_from_parts(
-            version.dwMajorVersion,
-            version.dwMinorVersion,
-            version.dwBuildNumber,
-            version.wProductType == VER_NT_WORKSTATION,
-        )
-    } else {
-        "Windows".to_string()
-    }
+    crate::platform::windows_version::current_windows_version().map_or_else(
+        || "Windows".to_string(),
+        |version| {
+            windows_version_label_from_parts(
+                version.major,
+                version.minor,
+                version.build,
+                version.workstation,
+            )
+        },
+    )
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -245,7 +227,62 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{macos_version_label_from_parts, windows_version_label_from_parts};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{
+        macos_version_label_from_parts, resolve_local_directory_children,
+        windows_version_label_from_parts,
+    };
+
+    static TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after Unix epoch")
+                .as_nanos();
+            let counter = TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "nyaterm-app-test-{label}-{}-{unique}-{counter}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create test directory");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn child_kinds(entries: &[super::LocalDropPathEntry]) -> HashMap<String, bool> {
+        entries
+            .iter()
+            .map(|entry| {
+                let name = Path::new(&entry.path)
+                    .file_name()
+                    .expect("entry should have a file name")
+                    .to_string_lossy()
+                    .to_string();
+                (name, entry.is_dir)
+            })
+            .collect()
+    }
 
     #[test]
     fn windows_version_label_uses_native_version_parts() {
@@ -276,6 +313,80 @@ mod tests {
         assert_eq!(macos_version_label_from_parts(Some("macOS"), None), "macOS");
         assert_eq!(macos_version_label_from_parts(None, None), "macOS");
     }
+
+    #[test]
+    fn resolves_only_first_level_directory_children() {
+        let root = TestDirectory::new("children");
+        fs::write(root.path().join("index.html"), "index").expect("create file");
+        fs::create_dir(root.path().join("assets")).expect("create assets directory");
+        fs::create_dir(root.path().join("images")).expect("create images directory");
+
+        let entries =
+            resolve_local_directory_children(vec![root.path().to_string_lossy().to_string()])
+                .expect("resolve directory children");
+        let kinds = child_kinds(&entries);
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(kinds.get("index.html"), Some(&false));
+        assert_eq!(kinds.get("assets"), Some(&true));
+        assert_eq!(kinds.get("images"), Some(&true));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| Path::new(&entry.path) != root.path())
+        );
+    }
+
+    #[test]
+    fn resolves_empty_directory_to_no_entries() {
+        let root = TestDirectory::new("empty");
+
+        let entries =
+            resolve_local_directory_children(vec![root.path().to_string_lossy().to_string()])
+                .expect("resolve empty directory");
+
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn resolves_unicode_directory_children() {
+        let root = TestDirectory::new("unicode");
+        fs::write(root.path().join("首页.html"), "index").expect("create Unicode file");
+        fs::create_dir(root.path().join("静态资源")).expect("create Unicode directory");
+
+        let entries =
+            resolve_local_directory_children(vec![root.path().to_string_lossy().to_string()])
+                .expect("resolve Unicode directory children");
+        let kinds = child_kinds(&entries);
+
+        assert_eq!(kinds.get("首页.html"), Some(&false));
+        assert_eq!(kinds.get("静态资源"), Some(&true));
+    }
+
+    #[test]
+    fn rejects_missing_and_non_directory_paths() {
+        let root = TestDirectory::new("invalid");
+        let missing = root.path().join("missing");
+        let file = root.path().join("file.txt");
+        fs::write(&file, "file").expect("create file");
+
+        let missing_error =
+            resolve_local_directory_children(vec![missing.to_string_lossy().to_string()])
+                .expect_err("missing directory should fail");
+        assert!(
+            missing_error
+                .to_string()
+                .contains("Failed to inspect selected local directory")
+        );
+
+        let file_error = resolve_local_directory_children(vec![file.to_string_lossy().to_string()])
+            .expect_err("file input should fail");
+        assert!(
+            file_error
+                .to_string()
+                .contains("Selected local path is not a directory")
+        );
+    }
 }
 
 #[tauri::command]
@@ -296,6 +407,12 @@ pub fn set_app_lock_state(
             AppLockStateChangedPayload { locked },
         );
         if locked {
+            if let Some(manager) = app.try_state::<Arc<crate::core::plugins::PluginManager>>() {
+                let manager = manager.inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    manager.revoke_all().await;
+                });
+            }
             if let Some(manager) = app.try_state::<Arc<crate::core::mcp::McpManager>>() {
                 let manager = manager.inner().clone();
                 tauri::async_runtime::spawn(async move {
@@ -434,18 +551,62 @@ pub fn resolve_local_drop_paths(paths: Vec<String>) -> AppResult<Vec<LocalDropPa
             continue;
         }
 
-        let path = std::path::PathBuf::from(trimmed);
-        let Ok(metadata) = std::fs::metadata(&path) else {
+        let path = PathBuf::from(trimmed);
+        let Ok(entry) = resolve_local_path_entry(path) else {
             continue;
         };
 
-        resolved.push(LocalDropPathEntry {
-            path: path.to_string_lossy().to_string(),
-            is_dir: metadata.is_dir(),
-        });
+        resolved.push(entry);
     }
 
     Ok(resolved)
+}
+
+#[tauri::command]
+pub fn resolve_local_directory_children(paths: Vec<String>) -> AppResult<Vec<LocalDropPathEntry>> {
+    let mut resolved = Vec::new();
+    let mut seen_directories = HashSet::new();
+
+    for raw_path in paths {
+        let trimmed = raw_path.trim();
+        if trimmed.is_empty() || !seen_directories.insert(trimmed.to_string()) {
+            continue;
+        }
+
+        let directory = PathBuf::from(trimmed);
+        let metadata = std::fs::metadata(&directory).map_err(|error| {
+            AppError::Config(format!(
+                "Failed to inspect selected local directory: {error}"
+            ))
+        })?;
+        if !metadata.is_dir() {
+            return Err(AppError::Config(
+                "Selected local path is not a directory".to_string(),
+            ));
+        }
+
+        for child in std::fs::read_dir(&directory).map_err(|error| {
+            AppError::Config(format!("Failed to read selected local directory: {error}"))
+        })? {
+            let child = child.map_err(|error| {
+                AppError::Config(format!("Failed to read local directory entry: {error}"))
+            })?;
+            resolved.push(resolve_local_path_entry(child.path()).map_err(|error| {
+                AppError::Config(format!("Failed to inspect local directory entry: {error}"))
+            })?);
+        }
+    }
+
+    resolved.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(resolved)
+}
+
+fn resolve_local_path_entry(path: PathBuf) -> std::io::Result<LocalDropPathEntry> {
+    let metadata = std::fs::metadata(&path)?;
+    Ok(LocalDropPathEntry {
+        path: path.to_string_lossy().to_string(),
+        is_dir: metadata.is_dir(),
+    })
 }
 
 const MAX_BACKGROUND_IMAGE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB

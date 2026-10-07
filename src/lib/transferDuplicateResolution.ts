@@ -1,3 +1,4 @@
+import { randomUUID } from "@/lib/uuid";
 import { getRemoteParentDirectory } from "@/components/panel/file-explorer/model";
 import type { EnqueueUploadRequest } from "@/context/TransferContext";
 import { invoke } from "@/lib/invoke";
@@ -6,6 +7,13 @@ import {
   type TransferDuplicatePromptChoice,
 } from "@/lib/transferDuplicatePrompt";
 import type { FileEntry, FileProperties } from "@/types/global";
+
+export function findMissingRemoteEntries(
+  sessionId: string,
+  paths: string[],
+): Promise<string[]> {
+  return invoke<string[]>("find_missing_remote_entries", { sessionId, paths });
+}
 
 async function remotePathExists(
   sessionId: string,
@@ -60,7 +68,7 @@ async function resolveDuplicateChoice(params: {
       return "proceed";
     case "ask":
       return showTransferDuplicatePrompt({
-        requestId: crypto.randomUUID(),
+        requestId: randomUUID(),
         sessionId,
         remotePath,
         fileName,

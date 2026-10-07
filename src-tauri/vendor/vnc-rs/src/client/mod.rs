@@ -6,3 +6,4 @@ mod security;
 
 pub use connection::VncClient;
 pub use connector::{VncConnector, VncSecurityPolicy};
+pub use security::ra2::VncServerKey;

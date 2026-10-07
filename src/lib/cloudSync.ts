@@ -24,7 +24,7 @@ export const DEFAULT_CLOUD_SYNC_SETTINGS: CloudSyncSettings = {
   auto_check_on_startup: true,
   auto_push_on_change: true,
   auto_pull_remote_changes: true,
-  sync_debounce_seconds: 15,
+  sync_debounce_seconds: 60,
   webdav: {
     endpoint: "",
     root: "",
@@ -79,6 +79,7 @@ export const DEFAULT_CLOUD_SYNC_STATUS: CloudSyncStatus = {
   provider: "webdav",
   state: "idle",
   message: "",
+  error_code: null,
   current_operation: null,
   last_checked_at_ms: null,
   last_synced_at_ms: null,
@@ -236,4 +237,39 @@ export function hasConflict(conflict?: CloudConflictPreview | null) {
 
 export function isRemoteInconsistentConflict(conflict?: CloudConflictPreview | null) {
   return conflict?.kind === "remote_inconsistent";
+}
+
+/** Providers that keep every sync object in one flat gist-style file list. */
+export function isGistCloudProvider(provider?: string | null) {
+  return provider === "gitee_snippet" || provider === "github_gist";
+}
+
+/** `CloudSyncStatus.error_code` published for Gitee snippet capacity failures. */
+export const GIST_CAPACITY_ERROR_CODE = "gist_capacity";
+
+/**
+ * Fallback for statuses that predate `error_code` (or a failure path that did not
+ * set one). New checks must key off the code, never off this prose match.
+ */
+export function isGistCapacitySyncFailure(message?: string | null) {
+  if (!message) {
+    return false;
+  }
+  return (
+    message.includes("was not accepted by remote storage") ||
+    message.includes("rejected file") ||
+    message.includes("gist may be at file capacity")
+  );
+}
+
+/** Capacity recovery only applies to Gitee Snippet's hard file-count limit. */
+export function needsGistCapacityRecovery(
+  provider?: string | null,
+  message?: string | null,
+  errorCode?: string | null,
+) {
+  if (provider !== "gitee_snippet") {
+    return false;
+  }
+  return errorCode === GIST_CAPACITY_ERROR_CODE || isGistCapacitySyncFailure(message);
 }

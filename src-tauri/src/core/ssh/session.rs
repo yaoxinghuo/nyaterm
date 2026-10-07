@@ -581,10 +581,23 @@ async fn create_ssh_session_inner(
         remote_file_browser_enabled = capabilities.remote_file_browser_enabled,
         remote_stats_enabled = capabilities.remote_stats_enabled,
         shell_detection_timeout_ms = config.sftp.shell_detection_timeout_ms,
+        sftp_compatibility_mode = config.sftp.compatibility_mode,
         "SSH session initialization starting"
     );
+    let mut preinitialized_remote_fs = None;
     let (shell, sftp_only) = if explicit_sftp {
-        crate::core::sftp::probe_sftp_subsystem(&ssh_connection).await?;
+        if config.sftp.compatibility_mode {
+            preinitialized_remote_fs = Some(
+                crate::core::sftp::create_compatibility_remote_fs(
+                    &app,
+                    ssh_connection.clone(),
+                    &config,
+                )
+                .await?,
+            );
+        } else {
+            crate::core::sftp::probe_sftp_subsystem(&ssh_connection).await?;
+        }
         tracing::info!(session_id = %session_id, "Explicit SFTP-only runtime established");
         (None, true)
     } else {
@@ -610,13 +623,44 @@ async fn create_ssh_session_inner(
         match shell_result {
             Ok(shell) => (Some(shell), false),
             Err(shell_error) => {
-                try_sftp_only_fallback(
-                    &session_id,
-                    capabilities.remote_file_browser_enabled,
-                    shell_error,
-                    || crate::core::sftp::probe_sftp_subsystem(&ssh_connection),
-                )
-                .await?;
+                if config.sftp.compatibility_mode {
+                    if !capabilities.remote_file_browser_enabled {
+                        return Err(shell_error);
+                    }
+                    match crate::core::sftp::create_compatibility_remote_fs(
+                        &app,
+                        ssh_connection.clone(),
+                        &config,
+                    )
+                    .await
+                    {
+                        Ok(remote_fs) => {
+                            tracing::info!(
+                                session_id = %session_id,
+                                shell_error = %shell_error,
+                                "SSH shell unavailable; continuing with compatibility SFTP-only session"
+                            );
+                            preinitialized_remote_fs = Some(remote_fs);
+                        }
+                        Err(probe_error) => {
+                            tracing::warn!(
+                                session_id = %session_id,
+                                shell_error = %shell_error,
+                                sftp_probe_error = %probe_error,
+                                "Compatibility SFTP initialization failed on current SSH transport"
+                            );
+                            return Err(shell_error);
+                        }
+                    }
+                } else {
+                    try_sftp_only_fallback(
+                        &session_id,
+                        capabilities.remote_file_browser_enabled,
+                        shell_error,
+                        || crate::core::sftp::probe_sftp_subsystem(&ssh_connection),
+                    )
+                    .await?;
+                }
                 config.runtime_mode = SshRuntimeMode::Sftp;
                 (None, true)
             }
@@ -658,6 +702,19 @@ async fn create_ssh_session_inner(
         apply_sftp_only_runtime_policy(&mut session_info);
     }
 
+    if preinitialized_remote_fs.is_none()
+        && config.sftp.compatibility_mode
+        && session_info.remote_file_browser_enabled
+    {
+        preinitialized_remote_fs = Some(crate::core::sftp::create_auto_remote_fs(
+            &app,
+            ssh_connection.clone(),
+            &config,
+            false,
+            true,
+        ));
+    }
+
     let cwd: SharedCwd = Arc::new(tokio::sync::Mutex::new(Default::default()));
     let ssh_config_arc: Arc<dyn std::any::Any + Send + Sync> = Arc::new(config.clone());
     let ssh_handle_arc: Arc<dyn std::any::Any + Send + Sync> = ssh_connection.clone();
@@ -668,7 +725,7 @@ async fn create_ssh_session_inner(
         ssh_config: Some(ssh_config_arc),
         ssh_handle: Some(ssh_handle_arc),
         cwd: cwd.clone(),
-        remote_fs: None,
+        remote_fs: preinitialized_remote_fs,
     };
     manager.add_session(session_handle).await;
     tracing::info!(session_id = %session_id, "SSH session registered");
@@ -748,7 +805,7 @@ pub async fn create_multiplexed_ssh_session(
     startup_command: Option<SshStartupCommand>,
     session_ready_hook: Option<SessionReadyHook>,
 ) -> AppResult<String> {
-    let (config, ssh_connection, owner_window_label) = {
+    let (config, ssh_connection, owner_window_label, shared_remote_fs) = {
         let sessions = manager.sessions.lock().await;
         let source = sessions.get(source_session_id).ok_or_else(|| {
             AppError::SessionNotFound(format!("Session '{}' not found", source_session_id))
@@ -780,10 +837,17 @@ pub async fn create_multiplexed_ssh_session(
             .downcast::<SshConnectionHandles>()
             .map_err(|_| AppError::Config("Failed to get SSH handle".to_string()))?;
 
+        let shared_remote_fs = if config.sftp.compatibility_mode {
+            source.remote_fs.clone()
+        } else {
+            None
+        };
+
         (
             config,
             ssh_connection,
             source.info.owner_window_label.clone(),
+            shared_remote_fs,
         )
     };
 
@@ -889,7 +953,7 @@ pub async fn create_multiplexed_ssh_session(
         ssh_config: Some(ssh_config_arc),
         ssh_handle: Some(ssh_handle_arc),
         cwd: cwd.clone(),
-        remote_fs: None,
+        remote_fs: shared_remote_fs,
     };
     manager.add_session(session_handle).await;
     tracing::info!(

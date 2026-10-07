@@ -1,9 +1,11 @@
 use super::{
     auth::{read_security_failure, AuthHelper, AuthResult, SecurityType},
     connection::VncClient,
+    security::ra2::{self, ServerKeyVerifier, VncServerKey},
 };
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tracing::{info, trace};
 
@@ -33,7 +35,7 @@ where
 {
     pub fn try_start(
         self,
-    ) -> Pin<Box<dyn Future<Output = Result<Self, VncError>> + Send + Sync + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self, VncError>> + Send + 'static>> {
         Box::pin(async move {
             match self {
                 VncState::Handshake(mut connector) => {
@@ -64,120 +66,149 @@ where
                     )
                     .await?;
 
-                    if connector.security_policy == VncSecurityPolicy::NoneOnly
-                        && !security_types.contains(&SecurityType::None)
-                    {
-                        return Err(VncError::RequiredSecurityTypeUnavailable("none"));
-                    }
-                    if connector.security_policy == VncSecurityPolicy::VncAuthOnly
-                        && !security_types.contains(&SecurityType::VncAuth)
-                    {
-                        return Err(VncError::RequiredSecurityTypeUnavailable("vnc-auth"));
-                    }
-
-                    let prefer_none = match connector.security_policy {
-                        VncSecurityPolicy::Auto => connector.auth_methond.is_none(),
-                        VncSecurityPolicy::NoneOnly => true,
-                        VncSecurityPolicy::VncAuthOnly => false,
+                    let selected = match connector.security_policy {
+                        VncSecurityPolicy::NoneOnly => {
+                            if !security_types.contains(&SecurityType::None) {
+                                return Err(VncError::RequiredSecurityTypeUnavailable("none"));
+                            }
+                            SecurityType::None
+                        }
+                        VncSecurityPolicy::VncAuthOnly => {
+                            if !security_types.contains(&SecurityType::VncAuth) {
+                                return Err(VncError::RequiredSecurityTypeUnavailable("vnc-auth"));
+                            }
+                            SecurityType::VncAuth
+                        }
+                        VncSecurityPolicy::Auto if connector.credentials_available => {
+                            if connector.rfb_version != VncVersion::RFB33
+                                && security_types.contains(&SecurityType::RA2_256)
+                            {
+                                SecurityType::RA2_256
+                            } else if security_types.contains(&SecurityType::VncAuth) {
+                                SecurityType::VncAuth
+                            } else {
+                                return Err(VncError::UnsupportedSecurityType);
+                            }
+                        }
+                        VncSecurityPolicy::Auto => {
+                            if security_types.contains(&SecurityType::None) {
+                                SecurityType::None
+                            } else {
+                                return Err(VncError::UnsupportedSecurityType);
+                            }
+                        }
                     };
 
-                    if prefer_none && security_types.contains(&SecurityType::None) {
-                        match connector.rfb_version {
-                            VncVersion::RFB33 => {
-                                // If the security-type is 1, for no authentication, the server does not
-                                // send the SecurityResult message but proceeds directly to the
-                                // initialization messages (Section 7.3).
-                                info!("No auth needed in vnc3.3");
-                            }
-                            VncVersion::RFB37 => {
-                                // After the security handshake, if the security-type is 1, for no
-                                // authentication, the server does not send the SecurityResult message
-                                // but proceeds directly to the initialization messages (Section 7.3).
-                                info!("No auth needed in vnc3.7");
-                                SecurityType::write(&SecurityType::None, &mut connector.stream)
-                                    .await?;
-                            }
-                            VncVersion::RFB38 => {
-                                info!("No auth needed in vnc3.8");
-                                SecurityType::write(&SecurityType::None, &mut connector.stream)
-                                    .await?;
-                                let result: AuthResult =
-                                    connector.stream.read_u32().await?.try_into()?;
-                                if result == AuthResult::Failed {
-                                    let reason = read_security_failure(
-                                        &mut connector.stream,
-                                        &connector.limits,
-                                    )
-                                    .await?;
-                                    return Err(VncError::SecurityFailure(reason));
+                    let client = match selected {
+                        SecurityType::None => {
+                            match connector.rfb_version {
+                                VncVersion::RFB33 => {
+                                    info!("No auth needed in vnc3.3");
+                                }
+                                VncVersion::RFB37 => {
+                                    info!("No auth needed in vnc3.7");
+                                    SecurityType::write(&selected, &mut connector.stream).await?;
+                                }
+                                VncVersion::RFB38 => {
+                                    info!("No auth needed in vnc3.8");
+                                    SecurityType::write(&selected, &mut connector.stream).await?;
+                                    let result: AuthResult =
+                                        connector.stream.read_u32().await?.try_into()?;
+                                    if result == AuthResult::Failed {
+                                        let reason = read_security_failure(
+                                            &mut connector.stream,
+                                            &connector.limits,
+                                        )
+                                        .await?;
+                                        return Err(VncError::SecurityFailure(reason));
+                                    }
                                 }
                             }
+                            VncClient::new(
+                                connector.stream,
+                                connector.allow_shared,
+                                connector.pixel_format,
+                                connector.encodings,
+                                connector.limits,
+                            )
+                            .await?
                         }
-                    } else {
-                        // choose a auth method
-                        if security_types.contains(&SecurityType::VncAuth) {
-                            if connector.rfb_version != VncVersion::RFB33 {
-                                // In the security handshake (Section 7.1.2), rather than a two-way
-                                // negotiation, the server decides the security type and sends a single
-                                // word:
-
-                                //            +--------------+--------------+---------------+
-                                //            | No. of bytes | Type [Value] | Description   |
-                                //            +--------------+--------------+---------------+
-                                //            | 4            | U32          | security-type |
-                                //            +--------------+--------------+---------------+
-
-                                // The security-type may only take the value 0, 1, or 2.  A value of 0
-                                // means that the connection has failed and is followed by a string
-                                // giving the reason, as described in Section 7.1.2.
-                                SecurityType::write(&SecurityType::VncAuth, &mut connector.stream)
-                                    .await?;
+                        SecurityType::VncAuth => {
+                            let credential = connector
+                                .auth_methond
+                                .take()
+                                .ok_or(VncError::NoPassword)?
+                                .await?;
+                            if credential.len() > 8 {
+                                return Err(VncError::CredentialTooLong {
+                                    field: "classic VNC password",
+                                    actual: credential.len(),
+                                    limit: 8,
+                                });
                             }
-                        } else {
-                            return Err(VncError::UnsupportedSecurityType);
-                        }
-
-                        // get password
-                        if connector.auth_methond.is_none() {
-                            return Err(VncError::NoPassword);
-                        }
-
-                        let credential = connector
-                            .auth_methond
-                            .take()
-                            .ok_or(VncError::NoPassword)?
-                            .await?;
-
-                        // auth
-                        let auth = AuthHelper::read(&mut connector.stream, &credential).await?;
-                        auth.write(&mut connector.stream).await?;
-                        let result = auth.finish(&mut connector.stream).await?;
-                        if let AuthResult::Failed = result {
-                            if let VncVersion::RFB37 = connector.rfb_version {
-                                // In VNC Authentication (Section 7.2.2), if the authentication fails,
-                                // the server sends the SecurityResult message, but does not send an
-                                // error message before closing the connection.
-                                return Err(VncError::WrongPassword);
-                            } else {
+                            if connector.rfb_version != VncVersion::RFB33 {
+                                SecurityType::write(&selected, &mut connector.stream).await?;
+                            }
+                            let auth = AuthHelper::read(&mut connector.stream, &credential).await?;
+                            auth.write(&mut connector.stream).await?;
+                            let result = auth.finish(&mut connector.stream).await?;
+                            if let AuthResult::Failed = result {
+                                if let VncVersion::RFB37 = connector.rfb_version {
+                                    return Err(VncError::WrongPassword);
+                                }
                                 let reason =
                                     read_security_failure(&mut connector.stream, &connector.limits)
                                         .await?;
                                 return Err(VncError::SecurityFailure(reason));
                             }
+                            VncClient::new(
+                                connector.stream,
+                                connector.allow_shared,
+                                connector.pixel_format,
+                                connector.encodings,
+                                connector.limits,
+                            )
+                            .await?
                         }
-                    }
+                        SecurityType::RA2_256 => {
+                            let verifier = connector
+                                .server_key_verifier
+                                .clone()
+                                .ok_or(VncError::Ra2ServerKeyVerifierRequired)?;
+                            let credential = connector
+                                .auth_methond
+                                .take()
+                                .ok_or(VncError::NoPassword)?
+                                .await?;
+                            let username = connector.username.take().unwrap_or_default();
+                            ra2::validate_credentials(&username, &credential)?;
+                            SecurityType::write(&selected, &mut connector.stream).await?;
+                            let (stream, server_key) = ra2::authenticate(
+                                connector.stream,
+                                username,
+                                credential,
+                                verifier,
+                                connector.limits,
+                                connector.rfb_version,
+                            )
+                            .await?;
+                            let client = VncClient::new(
+                                stream,
+                                connector.allow_shared,
+                                connector.pixel_format,
+                                connector.encodings,
+                                connector.limits,
+                            )
+                            .await?;
+                            if let Some(notify) = connector.server_key_authenticated {
+                                notify(server_key);
+                            }
+                            client
+                        }
+                        _ => return Err(VncError::UnsupportedSecurityType),
+                    };
                     info!("auth done, client connected");
-
-                    Ok(VncState::Connected(
-                        VncClient::new(
-                            connector.stream,
-                            connector.allow_shared,
-                            connector.pixel_format,
-                            connector.encodings,
-                            connector.limits,
-                        )
-                        .await?,
-                    ))
+                    Ok(VncState::Connected(client))
                 }
                 VncState::Connected(_) => Err(VncError::ConnectError),
             }
@@ -201,6 +232,10 @@ where
 {
     stream: S,
     auth_methond: Option<F>,
+    credentials_available: bool,
+    username: Option<String>,
+    server_key_verifier: Option<ServerKeyVerifier>,
+    server_key_authenticated: Option<Arc<dyn Fn(VncServerKey) + Send + Sync>>,
     security_policy: VncSecurityPolicy,
     rfb_version: VncVersion,
     allow_shared: bool,
@@ -245,6 +280,10 @@ where
         Self {
             stream,
             auth_methond: None,
+            credentials_available: false,
+            username: None,
+            server_key_verifier: None,
+            server_key_authenticated: None,
             security_policy: VncSecurityPolicy::Auto,
             allow_shared: true,
             rfb_version: VncVersion::RFB38,
@@ -295,6 +334,38 @@ where
     ///
     pub fn set_auth_method(mut self, auth_callback: F) -> Self {
         self.auth_methond = Some(auth_callback);
+        self.credentials_available = true;
+        self
+    }
+
+    pub fn set_credentials_available(mut self, available: bool) -> Self {
+        self.credentials_available = available;
+        self
+    }
+
+    pub fn set_username(mut self, username: impl Into<String>) -> Self {
+        self.username = Some(username.into());
+        self
+    }
+
+    pub fn set_server_key_verifier<V, Fut>(mut self, verifier: V) -> Self
+    where
+        V: Fn(VncServerKey) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), VncError>> + Send + 'static,
+    {
+        self.server_key_verifier = Some(Arc::new(move |key| Box::pin(verifier(key))));
+        self
+    }
+
+    /// Notify the application after server-key confirmation, authenticated
+    /// ServerHash, SecurityResult, and RFB initialization have all succeeded.
+    /// This callback has no storage policy; applications must still guard
+    /// cancellation and connection ownership before committing trust.
+    pub fn set_server_key_authenticated<V>(mut self, notify: V) -> Self
+    where
+        V: Fn(VncServerKey) + Send + Sync + 'static,
+    {
+        self.server_key_authenticated = Some(Arc::new(notify));
         self
     }
 
@@ -406,7 +477,10 @@ mod tests {
             .unwrap()
     }
 
-    async fn write_server_init(server: &mut DuplexStream) {
+    async fn write_server_init<S>(server: &mut S)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         server.write_all(&2_u16.to_be_bytes()).await.unwrap();
         server.write_all(&2_u16.to_be_bytes()).await.unwrap();
         server
@@ -615,11 +689,259 @@ mod tests {
         server_task.await.unwrap();
     }
 
+    async fn run_ra2_handshake(subtype: u8, expected_username: &'static str) {
+        let (client, mut server) = tokio::io::duplex(16 * 1024);
+        let limits = VncLimits::default();
+        let server_task = tokio::spawn(async move {
+            server.write_all(b"RFB 003.008\n").await.unwrap();
+            let mut version = [0_u8; 12];
+            server.read_exact(&mut version).await.unwrap();
+            assert_eq!(&version, b"RFB 003.008\n");
+            server.write_all(&[4, 99, 1, 2, 129]).await.unwrap();
+            assert_eq!(server.read_u8().await.unwrap(), 129);
+
+            let mut encrypted = crate::client::security::ra2::accept_test_handshake(
+                server,
+                subtype,
+                expected_username,
+                "raspberry",
+                limits,
+            )
+            .await;
+            assert_eq!(encrypted.read_u8().await.unwrap(), 1);
+            write_server_init(&mut encrypted).await;
+        });
+
+        let notification_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notified = notification_count.clone();
+        let state = VncConnector::new(client)
+            .set_auth_method(async { Ok("raspberry".to_owned()) })
+            .set_credentials_available(true)
+            .set_username("pi")
+            .set_server_key_verifier(|key| async move {
+                assert!(key.bits() >= 2048);
+                assert!(!key.encoded().is_empty());
+                Ok(())
+            })
+            .set_server_key_authenticated(move |key| {
+                assert!(!key.encoded().is_empty());
+                notified.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .set_security_policy(VncSecurityPolicy::Auto)
+            .add_encoding(VncEncoding::Raw)
+            .build()
+            .unwrap()
+            .try_start()
+            .await
+            .unwrap();
+        assert_eq!(
+            notification_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        state.finish().unwrap().close().await.unwrap();
+        server_task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn none_security_33_37_38() {
         run_none_handshake(VncVersion::RFB33).await;
         run_none_handshake(VncVersion::RFB37).await;
         run_none_handshake(VncVersion::RFB38).await;
+    }
+
+    #[tokio::test]
+    async fn ra2_256_auto_prefers_encrypted_auth_and_supports_both_subtypes() {
+        run_ra2_handshake(1, "pi").await;
+        run_ra2_handshake(2, "").await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_or_timed_out_accepted_handshake_never_notifies_trust() {
+        use rsa::traits::PublicKeyParts;
+        for timeout_case in [false, true] {
+            let (client, mut server) = tokio::io::duplex(16 * 1024);
+            let (exchanged, exchange_ready) = tokio::sync::oneshot::channel();
+            let server_task = tokio::spawn(async move {
+                let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).unwrap();
+                server.write_all(b"RFB 003.008\n").await.unwrap();
+                let mut version = [0; 12];
+                server.read_exact(&mut version).await.unwrap();
+                server.write_all(&[1, 129]).await.unwrap();
+                assert_eq!(server.read_u8().await.unwrap(), 129);
+                server.write_u32(1024).await.unwrap();
+                server.write_all(&key.n().to_bytes_be()).await.unwrap();
+                let mut exponent = vec![0; 128 - key.e().to_bytes_be().len()];
+                exponent.extend(key.e().to_bytes_be());
+                server.write_all(&exponent).await.unwrap();
+                let client_bits = server.read_u32().await.unwrap();
+                let mut client_key = vec![0; (client_bits as usize).div_ceil(8) * 2];
+                server.read_exact(&mut client_key).await.unwrap();
+                // Confirmation succeeded and key exchange started, but the
+                // cryptographic server identity has not yet been authenticated.
+                exchanged.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let notified = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let notification = notified.clone();
+            let mut handshake = tokio::spawn(async move {
+                VncConnector::new(client)
+                    .set_auth_method(async { Ok("raspberry".into()) })
+                    .set_server_key_verifier(|_| async { Ok(()) })
+                    .set_server_key_authenticated(move |_| {
+                        notification.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .add_encoding(VncEncoding::Raw)
+                    .build()
+                    .unwrap()
+                    .try_start()
+                    .await
+            });
+            exchange_ready.await.unwrap();
+            if timeout_case {
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(10), &mut handshake)
+                        .await
+                        .is_err()
+                );
+            }
+            handshake.abort();
+            assert!(matches!(handshake.await, Err(error) if error.is_cancelled()));
+            assert!(!notified.load(std::sync::atomic::Ordering::SeqCst));
+            server_task.abort();
+            let _ = server_task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_ra2_handshakes_never_notify_authenticated_key() {
+        for outcome in [
+            "reject",
+            "hash-mismatch",
+            "transport-error",
+            "security-failure",
+            "truncated-init",
+        ] {
+            let (client, mut server) = tokio::io::duplex(16 * 1024);
+            let server_task = tokio::spawn(async move {
+                server.write_all(b"RFB 003.008\n").await.unwrap();
+                let mut version = [0; 12];
+                server.read_exact(&mut version).await.unwrap();
+                server.write_all(&[1, 129]).await.unwrap();
+                assert_eq!(server.read_u8().await.unwrap(), 129);
+                if outcome == "reject" {
+                    let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 1024).unwrap();
+                    use rsa::traits::PublicKeyParts;
+                    server.write_u32(1024).await.unwrap();
+                    server.write_all(&key.n().to_bytes_be()).await.unwrap();
+                    let mut exponent = vec![0; 128 - key.e().to_bytes_be().len()];
+                    exponent.extend(key.e().to_bytes_be());
+                    server.write_all(&exponent).await.unwrap();
+                    return;
+                }
+                let mut encrypted = ra2::establish_test_encryption(
+                    server,
+                    VncLimits::default(),
+                    outcome == "hash-mismatch",
+                )
+                .await;
+                if matches!(outcome, "hash-mismatch" | "transport-error") {
+                    encrypted.flush().await.unwrap();
+                    return;
+                }
+                encrypted.write_u8(2).await.unwrap();
+                assert_eq!(encrypted.read_u8().await.unwrap(), 0);
+                let len = encrypted.read_u8().await.unwrap();
+                let mut password = vec![0; usize::from(len)];
+                encrypted.read_exact(&mut password).await.unwrap();
+                if outcome == "security-failure" {
+                    encrypted.write_u32(1).await.unwrap();
+                    encrypted.write_u32(6).await.unwrap();
+                    encrypted.write_all(b"denied").await.unwrap();
+                } else {
+                    encrypted.write_u32(0).await.unwrap();
+                    encrypted.flush().await.unwrap();
+                    let _shared = encrypted.read_u8().await.unwrap();
+                    encrypted.write_u16(2).await.unwrap();
+                }
+                encrypted.flush().await.unwrap();
+            });
+            let notified = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let notification = notified.clone();
+            let result = VncConnector::new(client)
+                .set_auth_method(async { Ok("raspberry".into()) })
+                .set_server_key_verifier(move |_| async move {
+                    if outcome == "reject" {
+                        Err(VncError::Ra2ServerKeyRejected("rejected".into()))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .set_server_key_authenticated(move |_| {
+                    notification.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .add_encoding(VncEncoding::Raw)
+                .build()
+                .unwrap()
+                .try_start()
+                .await;
+            assert!(result.is_err(), "{outcome}");
+            assert!(
+                !notified.load(std::sync::atomic::Ordering::SeqCst),
+                "{outcome}"
+            );
+            server_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_with_credentials_never_downgrades_to_none() {
+        let (client, mut server) = tokio::io::duplex(128);
+        tokio::spawn(async move {
+            server.write_all(b"RFB 003.008\n").await.unwrap();
+            let mut version = [0_u8; 12];
+            server.read_exact(&mut version).await.unwrap();
+            server.write_all(&[1, 1]).await.unwrap();
+        });
+
+        let result = VncConnector::new(client)
+            .set_auth_method(async { Ok("password".to_owned()) })
+            .set_credentials_available(true)
+            .set_security_policy(VncSecurityPolicy::Auto)
+            .add_encoding(VncEncoding::Raw)
+            .build()
+            .unwrap()
+            .try_start()
+            .await;
+        assert!(matches!(result, Err(VncError::UnsupportedSecurityType)));
+    }
+
+    #[tokio::test]
+    async fn classic_vnc_auth_keeps_the_eight_byte_limit() {
+        let (client, mut server) = tokio::io::duplex(128);
+        tokio::spawn(async move {
+            server.write_all(b"RFB 003.008\n").await.unwrap();
+            let mut version = [0_u8; 12];
+            server.read_exact(&mut version).await.unwrap();
+            server.write_all(&[1, 2]).await.unwrap();
+        });
+
+        let result = VncConnector::new(client)
+            .set_auth_method(async { Ok("123456789".to_owned()) })
+            .set_credentials_available(true)
+            .set_security_policy(VncSecurityPolicy::Auto)
+            .add_encoding(VncEncoding::Raw)
+            .build()
+            .unwrap()
+            .try_start()
+            .await;
+        assert!(matches!(
+            result,
+            Err(VncError::CredentialTooLong {
+                field: "classic VNC password",
+                actual: 9,
+                limit: 8
+            })
+        ));
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { supports } from "@/lib/backend/runtime";
+import { getCurrentWindow } from "@/lib/backend/platform/window";
 import { ChevronsUpDownIcon, Eye, EyeOff } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -17,6 +18,7 @@ import {
 import type { ConnectionOption } from "@/components/network/shared";
 import { KeyManagementTab } from "@/components/panel/security-auth/KeyManagementTab";
 import { PasswordManagementTab } from "@/components/panel/security-auth/PasswordManagementTab";
+import { AccountSelector } from "@/components/sessions/AccountSelector";
 import { ConnectionRecordingSettings } from "@/components/sessions/ConnectionRecordingSettings";
 import { SessionNetworkSection } from "@/components/sessions/SessionNetworkSection";
 import {
@@ -71,11 +73,12 @@ import {
 } from "@/lib/sshAgent";
 import { cn } from "@/lib/utils";
 import type {
+  AccountPasswordSource,
   AlgorithmOption,
   OtpEntry,
   ProxyConfig,
   RecordingMode,
-  SavedPassword,
+  SavedAccount,
   SftpSettings,
   SshAgentEndpoint,
   SshAgentForwardingConfig,
@@ -95,13 +98,14 @@ const DEFAULT_SFTP_SHELL_DETECTION_TIMEOUT_MS = 3000;
 const MIN_SFTP_SHELL_DETECTION_TIMEOUT_MS = 100;
 const MAX_SFTP_SHELL_DETECTION_TIMEOUT_MS = 60_000;
 export type SshAuthMode = "none" | "password" | "key" | "agent";
-type PasswordSource = "ask" | "direct" | "saved";
 type SshTerminalTypeSelection = SshTerminalType | "default";
 
 function isSupportedSshAgentEndpoint(type: SshAgentEndpoint["type"]): boolean {
   if (type === "auto") return true;
   if (isWindows) return type === "pageant" || type === "windows_open_ssh";
-  return (isMacOS || isLinux) && (type === "environment" || type === "unix_socket");
+  return (
+    (isMacOS || isLinux) && (type === "environment" || type === "unix_socket")
+  );
 }
 
 function defaultForwardingEndpoint(): SshAgentEndpoint {
@@ -116,10 +120,14 @@ interface SshFormProps {
   setPort: (v: number) => void;
   username: string;
   setUsername: (v: string) => void;
+  accountId: string;
+  setAccountId: (v: string) => void;
+  accounts: SavedAccount[];
+  onAccountsChanged: (accounts: SavedAccount[]) => void;
+  passwordSource: AccountPasswordSource;
+  setPasswordSource: (v: AccountPasswordSource) => void;
   authType: SshAuthMode;
   setAuthType: (v: SshAuthMode) => void;
-  passwordId: string;
-  setPasswordId: (v: string) => void;
   password: string;
   setPassword: (v: string) => void;
   hasPassword: boolean;
@@ -264,7 +272,9 @@ function AdvancedCombobox({
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm">{clearLabel}</div>
                 </div>
-                {!value ? <MdCheck className="mt-0.5 text-sm text-primary" /> : null}
+                {!value ? (
+                  <MdCheck className="mt-0.5 text-sm text-primary" />
+                ) : null}
               </CommandItem>
             </CommandGroup>
             <CommandGroup className="p-0">
@@ -282,7 +292,9 @@ function AdvancedCombobox({
                     <div className="truncate text-sm">{option.label}</div>
                     <div className="truncate text-xs text-muted-foreground">{option.subtitle}</div>
                   </div>
-                  {option.id === value ? <MdCheck className="mt-0.5 text-sm text-primary" /> : null}
+                  {option.id === value ? (
+                    <MdCheck className="mt-0.5 text-sm text-primary" />
+                  ) : null}
                 </CommandItem>
               ))}
             </CommandGroup>
@@ -447,10 +459,14 @@ export function SshForm({
   setPort,
   username,
   setUsername,
+  accountId,
+  setAccountId,
+  accounts,
+  onAccountsChanged,
+  passwordSource,
+  setPasswordSource,
   authType,
   setAuthType,
-  passwordId,
-  setPasswordId,
   password,
   setPassword,
   hasPassword,
@@ -511,9 +527,7 @@ export function SshForm({
 }: SshFormProps) {
   const { t } = useTranslation();
   const [sshKeys, setSshKeys] = useState<SshKey[]>([]);
-  const [savedPasswords, setSavedPasswords] = useState<SavedPassword[]>([]);
   const [showKeyDropdown, setShowKeyDropdown] = useState(false);
-  const [showPasswordDropdown, setShowPasswordDropdown] = useState(false);
   const [showKeyManagement, setShowKeyManagement] = useState(false);
   const [showPasswordManagement, setShowPasswordManagement] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -532,10 +546,6 @@ export function SshForm({
   const [supportedAlgorithms, setSupportedAlgorithms] = useState<SupportedSshAlgorithms | null>(
     null,
   );
-  const [passwordSource, setPasswordSource] = useState<PasswordSource>(
-    passwordId ? "saved" : password || hasPassword ? "direct" : "ask",
-  );
-
   const loadSshKeys = useCallback(async () => {
     try {
       const keys = await invoke<SshKey[]>("get_ssh_keys");
@@ -548,17 +558,13 @@ export function SshForm({
     }
   }, [keyId, setKeyId]);
 
-  const loadPasswords = useCallback(async () => {
+  const loadAccounts = useCallback(async () => {
     try {
-      const passwords = await invoke<SavedPassword[]>("get_saved_passwords");
-      setSavedPasswords(passwords);
-      if (passwordId && !passwords.some((p) => p.id === passwordId)) {
-        setPasswordId("");
-      }
+      onAccountsChanged(await invoke<SavedAccount[]>("get_saved_passwords"));
     } catch {
       /* ignore */
     }
-  }, [passwordId, setPasswordId]);
+  }, [onAccountsChanged]);
 
   const loadAgentIdentities = useCallback(async () => {
     const generation = ++agentIdentityRequestGeneration.current;
@@ -615,31 +621,23 @@ export function SshForm({
   }, [loadAgentIdentities, showAgentIdentityPicker]);
 
   useEffect(() => {
-    if (passwordId) {
-      setPasswordSource("saved");
-    } else if (password || hasPassword) {
-      setPasswordSource("direct");
-    }
-  }, [hasPassword, password, passwordId]);
-
-  useEffect(() => {
     let unlisten: () => void;
     getCurrentWindow()
       .onFocusChanged((event) => {
         if (event.payload) {
           void loadSshKeys();
-          void loadPasswords();
+          void loadAccounts();
         }
       })
       .then((fn) => {
         unlisten = fn;
       });
     void loadSshKeys();
-    void loadPasswords();
+    void loadAccounts();
     return () => {
       if (unlisten) unlisten();
     };
-  }, [loadSshKeys, loadPasswords]);
+  }, [loadAccounts, loadSshKeys]);
 
   useEffect(() => {
     invoke<SupportedSshAlgorithms>("get_supported_ssh_algorithms")
@@ -669,7 +667,8 @@ export function SshForm({
   }, [authAgentEndpoint.type, setAuthAgentEndpoint]);
 
   const selectedKeyName = sshKeys.find((k) => k.id === keyId)?.name;
-  const selectedPasswordName = savedPasswords.find((p) => p.id === passwordId)?.name;
+  const selectedAccount = accounts.find((account) => account.id === accountId);
+  const accountProvidesUsername = Boolean(selectedAccount?.username.trim());
   const availableAgentEndpointTypes: SshAgentEndpoint["type"][] = isWindows
     ? ["auto", "pageant", "windows_open_ssh"]
     : isMacOS || isLinux
@@ -818,6 +817,20 @@ export function SshForm({
           />
         </div>
       </div>
+      <AccountSelector
+        accounts={accounts}
+        value={accountId}
+        onChange={(nextAccountId) => {
+          setAccountId(nextAccountId);
+          if (nextAccountId) {
+            setPasswordSource("account");
+            setPassword("");
+            setHasPassword(false);
+          } else if (!nextAccountId && passwordSource === "account") {
+            setPasswordSource("ask");
+          }
+        }}
+      />
       <div>
         <Label className="text-xs font-medium text-foreground/80">
           {t("dialog.username")}
@@ -825,9 +838,17 @@ export function SshForm({
         </Label>
         <Input
           className="mt-1 text-xs h-8"
-          value={username}
+          value={accountProvidesUsername ? selectedAccount?.username : username}
           onChange={(e) => setUsername(e.target.value)}
+          readOnly={accountProvidesUsername}
         />
+        {accountId ? (
+          <p className="mt-1 text-[0.6875rem] text-muted-foreground">
+            {accountProvidesUsername
+              ? t("dialog.usernameProvidedByAccount")
+              : t("dialog.accountUsernameFallbackDescription")}
+          </p>
+        ) : null}
       </div>
       <div>
         <Label className="text-xs font-medium text-foreground/80">
@@ -839,7 +860,6 @@ export function SshForm({
             const nextAuthType = v as SshAuthMode;
             setAuthType(nextAuthType);
             if (nextAuthType === "none") {
-              setPasswordId("");
               setPassword("");
               setHasPassword(false);
               setKeyId("");
@@ -857,7 +877,11 @@ export function SshForm({
             <TabsTrigger value="key" className="text-xs">
               {t("dialog.privateKey")}
             </TabsTrigger>
-            <TabsTrigger value="agent" className="text-xs">
+            <TabsTrigger
+              disabled={!supports("sshAgent")}
+              value="agent"
+              className="text-xs"
+            >
               {t("dialog.sshAgent", "SSH Agent")}
             </TabsTrigger>
           </TabsList>
@@ -878,30 +902,27 @@ export function SshForm({
             <Tabs
               value={passwordSource}
               onValueChange={(value) => {
-                const nextSource = value as PasswordSource;
+                const nextSource = value as AccountPasswordSource;
                 setPasswordSource(nextSource);
-                if (nextSource === "direct") {
-                  setPasswordId("");
-                } else if (nextSource === "saved") {
-                  setPassword("");
-                  setHasPassword(false);
-                } else {
-                  setPasswordId("");
+                if (nextSource !== "direct") {
                   setPassword("");
                   setHasPassword(false);
                 }
               }}
               className="mt-1 w-full"
             >
-              <TabsList className="grid h-8 w-full grid-cols-3 pointer-events-auto">
-                <TabsTrigger value="ask" className="text-xs">
-                  {t("dialog.askWhenConnecting")}
-                </TabsTrigger>
+              <TabsList className="grid h-8 w-full grid-cols-2 pointer-events-auto">
+                {accountId ? (
+                  <TabsTrigger value="account" className="text-xs">
+                    {t("dialog.accountPassword")}
+                  </TabsTrigger>
+                ) : (
+                  <TabsTrigger value="ask" className="text-xs">
+                    {t("dialog.askWhenConnecting")}
+                  </TabsTrigger>
+                )}
                 <TabsTrigger value="direct" className="text-xs">
                   {t("dialog.directPassword")}
-                </TabsTrigger>
-                <TabsTrigger value="saved" className="text-xs">
-                  {t("dialog.savedPassword")}
                 </TabsTrigger>
               </TabsList>
 
@@ -928,7 +949,6 @@ export function SshForm({
                     value={password}
                     onChange={(e) => {
                       setPassword(e.target.value);
-                      setPasswordId("");
                       if (e.target.value) {
                         setHasPassword(false);
                       }
@@ -971,75 +991,28 @@ export function SshForm({
                 </div>
               </TabsContent>
 
-              <TabsContent value="saved" className="mt-3 border-0 outline-none">
-                <Label className="text-xs font-medium text-foreground/80">
-                  {t("dialog.savedPassword")}
-                </Label>
-                <Popover open={showPasswordDropdown} onOpenChange={setShowPasswordDropdown}>
-                  <PopoverTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      className="mt-1 h-8 w-full justify-between text-xs font-normal"
-                    >
-                      <span className={`truncate ${passwordId ? "" : "text-muted-foreground"}`}>
-                        {selectedPasswordName || t("dialog.selectPassword")}
-                      </span>
-                      <MdExpandMore className="shrink-0 text-xs text-muted-foreground" />
-                    </Button>
-                  </PopoverTrigger>
-                  <PopoverContent
-                    align="start"
-                    side="bottom"
-                    sideOffset={4}
-                    collisionPadding={16}
-                    className="w-(--radix-popover-trigger-width) min-w-56 overflow-hidden p-0"
+              <TabsContent value="account" className="mt-3 border-0 outline-none">
+                <div className="flex items-center justify-between gap-3 rounded-md border border-dashed bg-accent/25 px-3 py-2">
+                  <div className="min-w-0 text-[0.6875rem] leading-relaxed text-muted-foreground">
+                    {selectedAccount
+                      ? selectedAccount.has_password
+                        ? t("dialog.accountPasswordDescription", { name: selectedAccount.name })
+                        : t("dialog.accountPasswordMissingDescription", {
+                            name: selectedAccount.name,
+                          })
+                      : t("dialog.missingAccountDescription")}
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 shrink-0 gap-1 px-2 text-xs"
+                    onClick={() => setShowPasswordManagement(true)}
                   >
-                    <div className="max-h-40 overflow-y-auto overflow-x-hidden">
-                      <button
-                        type="button"
-                        className={`w-full px-3 py-1.5 text-left text-xs transition-colors hover:bg-accent ${!passwordId ? "bg-primary/15 text-primary" : "text-muted-foreground"}`}
-                        onClick={() => {
-                          setPasswordId("");
-                          setShowPasswordDropdown(false);
-                        }}
-                      >
-                        {t("dialog.none")}
-                      </button>
-                      {savedPasswords.map((p) => (
-                        <button
-                          key={p.id}
-                          type="button"
-                          className={`w-full px-3 py-1.5 text-left text-xs transition-colors hover:bg-accent ${passwordId === p.id ? "bg-primary/15 text-primary" : ""}`}
-                          onClick={() => {
-                            setPasswordId(p.id);
-                            setPassword("");
-                            setHasPassword(false);
-                            setShowPasswordDropdown(false);
-                          }}
-                        >
-                          {p.name}
-                        </button>
-                      ))}
-                      {savedPasswords.length === 0 && (
-                        <div className="px-3 py-2 text-xs text-muted-foreground">
-                          {t("dialog.noPasswords")}
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      className="flex w-full shrink-0 items-center gap-1.5 border-t bg-popover px-3 py-1.5 text-left text-xs text-primary transition-colors hover:bg-accent"
-                      onClick={() => {
-                        setShowPasswordDropdown(false);
-                        setShowPasswordManagement(true);
-                      }}
-                    >
-                      <MdSettings className="text-sm" />
-                      {t("dialog.managePasswords")}
-                    </button>
-                  </PopoverContent>
-                </Popover>
+                    <MdSettings className="text-sm" />
+                    {t("dialog.manageAccounts")}
+                  </Button>
+                </div>
               </TabsContent>
             </Tabs>
           </TabsContent>
@@ -1205,15 +1178,26 @@ export function SshForm({
           <span>{t("dialog.advancedConfig")}</span>
         </CollapsibleTrigger>
         <CollapsibleContent className="mt-3 space-y-3">
-          <Tabs defaultValue="network" className="w-full">
+          <Tabs
+            defaultValue={supports("networkProxy") ? "network" : "two-factor"}
+            className="w-full"
+          >
             <TabsList className="grid h-8 w-full grid-cols-3 pointer-events-auto">
-              <TabsTrigger value="network" className="text-xs">
+              <TabsTrigger
+                disabled={!supports("networkProxy")}
+                value="network"
+                className="text-xs"
+              >
                 {t("dialog.proxySelect")}
               </TabsTrigger>
               <TabsTrigger value="two-factor" className="text-xs">
                 {t("dialog.twoFactorAuth")}
               </TabsTrigger>
-              <TabsTrigger value="agent" className="text-xs">
+              <TabsTrigger
+                disabled={!supports("sshAgent")}
+                value="agent"
+                className="text-xs"
+              >
                 {t("dialog.sshAgent", "SSH Agent")}
               </TabsTrigger>
             </TabsList>
@@ -1613,7 +1597,11 @@ export function SshForm({
           </Tabs>
           <Tabs defaultValue="post-login" className="w-full">
             <TabsList className="grid h-8 w-full grid-cols-5 pointer-events-auto">
-              <TabsTrigger value="post-login" className="text-xs">
+              <TabsTrigger
+                disabled={!supports("nativeFiles")}
+                value="post-login"
+                className="text-xs"
+              >
                 {t("dialog.commandExecution")}
               </TabsTrigger>
               <TabsTrigger value="terminal" className="text-xs">
@@ -1622,7 +1610,11 @@ export function SshForm({
               <TabsTrigger value="sftp" className="text-xs">
                 SFTP
               </TabsTrigger>
-              <TabsTrigger value="x11" className="text-xs">
+              <TabsTrigger
+                disabled={!supports("nativeFiles")}
+                value="x11"
+                className="text-xs"
+              >
                 {t("dialog.x11Forwarding")}
               </TabsTrigger>
               <TabsTrigger value="backspace" className="text-xs">
@@ -1702,8 +1694,13 @@ export function SshForm({
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="standard">{t("dialog.sshProfileStandard")}</SelectItem>
-                        <SelectItem value="network_device">
+                        <SelectItem value="standard">
+                          {t("dialog.sshProfileStandard")}
+                        </SelectItem>
+                        <SelectItem
+                          disabled={!supports("sshExtensions")}
+                          value="network_device"
+                        >
                           {t("dialog.sshProfileNetworkDevice")}
                         </SelectItem>
                       </SelectContent>
@@ -1760,9 +1757,24 @@ export function SshForm({
                     <SelectContent>
                       <SelectItem value="global">{t("connection.encodingFollowGlobal")}</SelectItem>
                       <SelectItem value="UTF-8">UTF-8</SelectItem>
-                      <SelectItem value="GBK">GBK</SelectItem>
-                      <SelectItem value="GB2312">GB2312</SelectItem>
-                      <SelectItem value="GB18030">GB18030</SelectItem>
+                      <SelectItem
+                        disabled={!supports("legacyEncoding")}
+                        value="GBK"
+                      >
+                        GBK
+                      </SelectItem>
+                      <SelectItem
+                        disabled={!supports("legacyEncoding")}
+                        value="GB2312"
+                      >
+                        GB2312
+                      </SelectItem>
+                      <SelectItem
+                        disabled={!supports("legacyEncoding")}
+                        value="GB18030"
+                      >
+                        GB18030
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -1776,18 +1788,21 @@ export function SshForm({
                   <Switch
                     className="mt-0.5"
                     size="sm"
+                    disabled={!supports("shellIntegration")}
                     checked={remoteDynamicTabTitle}
                     onCheckedChange={setRemoteDynamicTabTitle}
                   />
                 </div>
-                <ConnectionRecordingSettings
-                  useGlobal={recordingUseGlobal}
-                  onUseGlobalChange={setRecordingUseGlobal}
-                  autoStart={recordingAutoStart}
-                  onAutoStartChange={setRecordingAutoStart}
-                  mode={recordingMode}
-                  onModeChange={setRecordingMode}
-                />
+                {supports("recording") && (
+                  <ConnectionRecordingSettings
+                    useGlobal={recordingUseGlobal}
+                    onUseGlobalChange={setRecordingUseGlobal}
+                    autoStart={recordingAutoStart}
+                    onAutoStartChange={setRecordingAutoStart}
+                    mode={recordingMode}
+                    onModeChange={setRecordingMode}
+                  />
+                )}
               </div>
             </TabsContent>
 
@@ -1800,10 +1815,11 @@ export function SshForm({
                       {t("dialog.sftpAdvancedDesc")}
                     </p>
                   </div>
-                  <div className="flex shrink-0 items-center gap-2">
+                  <div className="shrink-0">
                     <Switch
                       checked={sftpSettings.enabled}
                       disabled={networkDeviceProfile}
+                      aria-label={t("dialog.sftpAdvanced")}
                       onCheckedChange={(enabled) =>
                         setSftpSettings({
                           ...sftpSettings,
@@ -1811,10 +1827,29 @@ export function SshForm({
                         })
                       }
                     />
-                    <span className="text-xs text-muted-foreground">
-                      {t("dialog.enabled", "Enabled")}
-                    </span>
                   </div>
+                </div>
+
+                <div className="mt-3 flex max-w-md items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <Label className="text-xs font-medium text-foreground/80">
+                      {t("dialog.sftpCompatibilityMode")}
+                    </Label>
+                    <p className="mt-1 text-[0.6875rem] leading-relaxed text-muted-foreground">
+                      {t("dialog.sftpCompatibilityModeDesc")}
+                    </p>
+                  </div>
+                  <Switch
+                    className="mt-0.5 shrink-0"
+                    checked={sftpSettings.compatibility_mode}
+                    disabled={sftpDisabled || !supports("sshExtensions")}
+                    onCheckedChange={(compatibility_mode) =>
+                      setSftpSettings({
+                        ...sftpSettings,
+                        compatibility_mode,
+                      })
+                    }
+                  />
                 </div>
 
                 <div className="mt-3 max-w-md">
@@ -1835,11 +1870,21 @@ export function SshForm({
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="off">{t("dialog.sftpCwdFollowOff")}</SelectItem>
-                      <SelectItem value="shell_integration">
+                      <SelectItem value="off">
+                        {t("dialog.sftpCwdFollowOff")}
+                      </SelectItem>
+                      <SelectItem
+                        disabled={!supports("shellIntegration")}
+                        value="shell_integration"
+                      >
                         {t("dialog.sftpCwdFollowShellIntegration")}
                       </SelectItem>
-                      <SelectItem value="rc_file">{t("dialog.sftpCwdFollowRcFile")}</SelectItem>
+                      <SelectItem
+                        disabled={!supports("shellIntegration")}
+                        value="rc_file"
+                      >
+                        {t("dialog.sftpCwdFollowRcFile")}
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                   <p className="mt-2 text-[0.6875rem] leading-relaxed text-muted-foreground">
@@ -1870,7 +1915,11 @@ export function SshForm({
                       min={MIN_SFTP_SHELL_DETECTION_TIMEOUT_MS}
                       max={MAX_SFTP_SHELL_DETECTION_TIMEOUT_MS}
                       step={100}
-                      disabled={sftpDisabled || sftpSettings.cwd_follow_mode === "off"}
+                      disabled={
+                        sftpDisabled ||
+                        !supports("shellIntegration") ||
+                        sftpSettings.cwd_follow_mode === "off"
+                      }
                     />
                     <span className="shrink-0 text-[0.625rem] text-muted-foreground">ms</span>
                   </div>
@@ -1901,9 +1950,24 @@ export function SshForm({
                         {t("dialog.sftpFilenameEncodingFollowTerminal")}
                       </SelectItem>
                       <SelectItem value="UTF-8">UTF-8</SelectItem>
-                      <SelectItem value="GBK">GBK</SelectItem>
-                      <SelectItem value="GB2312">GB2312</SelectItem>
-                      <SelectItem value="GB18030">GB18030</SelectItem>
+                      <SelectItem
+                        disabled={!supports("legacyEncoding")}
+                        value="GBK"
+                      >
+                        GBK
+                      </SelectItem>
+                      <SelectItem
+                        disabled={!supports("legacyEncoding")}
+                        value="GB2312"
+                      >
+                        GB2312
+                      </SelectItem>
+                      <SelectItem
+                        disabled={!supports("legacyEncoding")}
+                        value="GB18030"
+                      >
+                        GB18030
+                      </SelectItem>
                     </SelectContent>
                   </Select>
                   <p className="mt-2 text-[0.6875rem] leading-relaxed text-muted-foreground">
@@ -2109,7 +2173,7 @@ export function SshForm({
         onOpenChange={(open) => {
           setShowPasswordManagement(open);
           if (!open) {
-            void loadPasswords();
+            void loadAccounts();
           }
         }}
       >

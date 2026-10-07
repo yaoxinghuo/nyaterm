@@ -1,5 +1,14 @@
-import { listen } from "@tauri-apps/api/event";
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { runtime } from "@/lib/backend/runtime";
+import { randomUUID } from "@/lib/uuid";
+import { listen } from "@/lib/backend/api";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useAppLockState } from "@/hooks/useAppLockState";
 import { DEFAULT_AI_SETTINGS } from "@/lib/aiSettings";
 import { DEFAULT_CLOUD_SYNC_SETTINGS } from "@/lib/cloudSync";
@@ -34,10 +43,12 @@ import {
   findSessionPaneById,
   getFirstSessionPane,
   getNextPersistOrder,
-  insertTabAfter,
-  moveTab,
-  removeSessionPane,
-  replaceSessionReferences as replacePaneSessionReferences,
+    insertTabAfter,
+    moveTab,
+    removeSessionPane,
+    replaceSessionReferences as replacePaneSessionReferences,
+    resolveFileDocumentInsertAfterTabId,
+    resolveNextActiveTabAfterFileDocumentClose,
   restoreTabFromPersistence,
   serializeTabsForPersistence,
   splitSessionPane,
@@ -52,6 +63,7 @@ import type {
   Group,
   PaneSplitDirection,
   SavedConnection,
+  SessionInfo,
   SessionPane,
   SessionType,
   SyncGroup,
@@ -71,7 +83,7 @@ import {
 } from "./AppContext";
 
 function createSessionRequestId() {
-  return crypto.randomUUID();
+  return randomUUID();
 }
 
 const DEFAULT_APP_SETTINGS: AppSettings = {
@@ -81,6 +93,7 @@ const DEFAULT_APP_SETTINGS: AppSettings = {
     minimize_to_tray: false,
     boss_key: null,
     confirm_on_close: true,
+    rdp_client_mode: "builtin",
   },
   appearance: {
     theme: "github-dark",
@@ -90,6 +103,7 @@ const DEFAULT_APP_SETTINGS: AppSettings = {
     font_size: DEFAULT_TERMINAL_FONT_SIZE,
     font_weight: 400,
     font_weight_bold: 700,
+    bold_default_foreground_highlight: false,
     background_opacity: 1.0,
     background_image_path: null,
     background_image_fit: "cover",
@@ -263,6 +277,7 @@ const DEFAULT_APP_SETTINGS: AppSettings = {
     asset_sort_direction: null,
     recent_connection_ids: [],
     transfer_height: 180,
+    file_explorer_view_mode: "list",
     file_explorer_show_hidden_files: true,
     file_explorer_auto_sync_cwd_connection_ids: [],
     file_explorer_favorite_dirs_by_connection_id: {},
@@ -278,6 +293,7 @@ const RECENT_CONNECTION_LIMIT = 10;
 const DEFAULT_RUNTIME_INFO: AppRuntimeInfo = {
   portable: false,
   mode: "installed",
+  packageManager: null,
   executableDir: "",
   dataDir: "",
   configDir: "",
@@ -488,7 +504,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   // 2. Save App Settings Debounced
   const updateAppSettings = useCallback(
-    (updates: Partial<AppSettings> | ((prev: AppSettings) => Partial<AppSettings>)) => {
+    (
+      updates:
+        | Partial<AppSettings>
+        | ((prev: AppSettings) => Partial<AppSettings>),
+    ) => {
       setAppSettings((prev) => {
         const nextUpdates = typeof updates === "function" ? updates(prev) : updates;
         const next = normalizeQuickCommandAppSettings({
@@ -685,7 +705,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         : [...tabsRef.current, newTab];
       void commitTabs(nextTabs);
       setActiveTabId(newTab.id);
-      return { tabId: newTab.id, createRequestId };
+      return { tabId: newTab.id, paneId: pane.id, createRequestId };
     },
     [commitTabs, setActiveTabId],
   );
@@ -872,7 +892,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
       const pane = createFileDocumentPane(input);
       const tab = createWorkspaceTab(pane, getNextPersistOrder(tabsRef.current));
-      void commitTabs([...tabsRef.current, tab]);
+      const afterTabId = resolveFileDocumentInsertAfterTabId(
+        tabsRef.current,
+        input.sessionId,
+        activeTabIdRef.current,
+      );
+      const nextTabs = afterTabId
+        ? insertTabAfter(tabsRef.current, afterTabId, tab)
+        : [...tabsRef.current, tab];
+      void commitTabs(nextTabs);
       setActiveTabId(tab.id);
       return { tabId: tab.id, paneId: pane.id, created: true };
     },
@@ -906,7 +934,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (!nextRoot) {
         const nextTabs = currentTabs.filter((item) => item.id !== tabId);
         if (activeTabIdRef.current === tabId) {
-          const fallback = nextTabs[Math.max(0, index - 1)] ?? nextTabs[0] ?? null;
+          const fileReturnId = resolveNextActiveTabAfterFileDocumentClose(
+            currentTabs,
+            [tabId],
+            tabId,
+          );
+          const fallback =
+            (fileReturnId ? nextTabs.find((item) => item.id === fileReturnId) : null) ??
+            nextTabs[Math.max(0, index - 1)] ??
+            nextTabs[0] ??
+            null;
           setActiveTabId(fallback?.id ?? null);
         }
         void commitTabs(nextTabs, { immediatePersist: options?.immediatePersist });
@@ -966,9 +1003,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }
 
       if (!nextActiveTabId && currentActiveTabId && idsToClose.has(currentActiveTabId)) {
-        const activeIndex = currentTabs.findIndex((tab) => tab.id === currentActiveTabId);
-        const fallbackTab = nextTabs[Math.max(0, activeIndex - 1)] ?? nextTabs[0] ?? null;
-        nextActiveTabId = fallbackTab?.id ?? null;
+        const fileReturnId = resolveNextActiveTabAfterFileDocumentClose(
+          currentTabs,
+          idsToClose,
+          currentActiveTabId,
+        );
+        if (fileReturnId && nextTabs.some((tab) => tab.id === fileReturnId)) {
+          nextActiveTabId = fileReturnId;
+        } else {
+          const activeIndex = currentTabs.findIndex((tab) => tab.id === currentActiveTabId);
+          const fallbackTab = nextTabs[Math.max(0, activeIndex - 1)] ?? nextTabs[0] ?? null;
+          nextActiveTabId = fallbackTab?.id ?? null;
+        }
       }
 
       if (!nextActiveTabId && nextTabs.length > 0) {
@@ -1113,7 +1159,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const pendingLockedStartupRestoreTabsRef = useRef<Tab[] | null>(null);
 
   const restoreSessionsForTabs = useCallback(
-    (tabsToRestore: Tab[]) => {
+    async (tabsToRestore: Tab[]) => {
+      const reusable = runtime === "web" ? await invoke<SessionInfo[]>("list_sessions").catch(() => []) : [];
       const tasks: Promise<unknown>[] = [];
       tabsToRestore.forEach((tab) => {
         const panes = collectSessionPanes(tab.root);
@@ -1122,6 +1169,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
           if (!hasPane(tab.id, pane.id)) return;
 
           const cid = pane.connectionId;
+          const live = reusable.find((session) => session.ready !== false && session.workspace_pane_id === pane.id && session.session_type === pane.type && (session.connection_id ?? undefined) === cid);
+          if (live) {
+            tasks.push((async () => {
+              // Wait for the previous page's socket to release its attachment.
+              for (let attempt = 0; live.attached && attempt < 120; attempt++) {
+                await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
+                const info = await invoke<SessionInfo>("get_session_info", { sessionId: live.id });
+                live.attached = info.attached;
+              }
+              await handleRestoredSessionCreated(tab.id, pane.id, live.id, cid);
+            })().catch((error) => handleRestoredSessionFailed(tab.id, pane.id, pane.type, cid, error)));
+            return;
+          }
           switch (pane.type) {
             case "SSH":
               if (!cid) {
@@ -1131,6 +1191,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
               tasks.push(invoke<string>("create_ssh_session", {
                 connectionId: cid,
                 createRequestId: pane.createRequestId,
+                recordingScopeId: pane.id,
               })
                 .then((sessionId) => handleRestoredSessionCreated(tab.id, pane.id, sessionId, cid))
                 .catch((e) =>
@@ -1141,6 +1202,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
               tasks.push(invoke<string>("create_local_session", {
                 connectionId: cid || null,
                 createRequestId: pane.createRequestId,
+                recordingScopeId: pane.id,
               })
                 .then((sessionId) => handleRestoredSessionCreated(tab.id, pane.id, sessionId))
                 .catch((e) =>
@@ -1155,6 +1217,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
               tasks.push(invoke<string>("create_telnet_session", {
                 connectionId: cid,
                 createRequestId: pane.createRequestId,
+                recordingScopeId: pane.id,
               })
                 .then((sessionId) => handleRestoredSessionCreated(tab.id, pane.id, sessionId))
                 .catch((e) =>
@@ -1169,6 +1232,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
               tasks.push(invoke<string>("create_serial_session", {
                 connectionId: cid,
                 createRequestId: pane.createRequestId,
+                recordingScopeId: pane.id,
               })
                 .then((sessionId) => handleRestoredSessionCreated(tab.id, pane.id, sessionId))
                 .catch((e) =>
@@ -1181,8 +1245,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
                 return;
               }
               tasks.push(invoke<string>("create_vnc_session", {
+                ownerWindowLabel: getOwnerMainWindowLabel(),
                 connectionId: cid,
                 createRequestId: pane.createRequestId,
+                recordingScopeId: pane.id,
               })
                 .then((sessionId) => handleRestoredSessionCreated(tab.id, pane.id, sessionId, cid))
                 .catch((e) =>
@@ -1212,7 +1278,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   );
 
   useEffect(() => {
-    if (hasRestored.current || !appSettingsLoaded.current || !lockStateLoaded) return;
+    if (hasRestored.current || !settingsLoaded || !lockStateLoaded) return;
 
     hasRestored.current = true;
     const primaryWindow = isPrimaryMainWindow();
@@ -1255,7 +1321,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       });
     }
     setStartupRestoreComplete(true);
-  }, [appSettings, isLocked, lockStateLoaded, restoreSessionsForTabs, setActiveTabId]);
+  }, [
+    appSettings,
+    isLocked,
+    lockStateLoaded,
+    restoreSessionsForTabs,
+    setActiveTabId,
+    settingsLoaded,
+  ]);
 
   useEffect(() => {
     if (isLocked) return;

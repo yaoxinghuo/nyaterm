@@ -1,6 +1,12 @@
-import { getVersion } from "@tauri-apps/api/app";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { getVersion } from "@/lib/backend/platform/app";
+import { openUrl } from "@/lib/backend/platform/opener";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { MdCheckCircle, MdError, MdRestartAlt } from "react-icons/md";
 import ReactMarkdown from "react-markdown";
@@ -78,7 +84,9 @@ function MarkdownContent({ content }: { content: string }) {
               {children}
             </ol>
           ),
-          li: ({ children }: MarkdownNodeProps) => <li className="pl-0.5">{children}</li>,
+          li: ({ children }: MarkdownNodeProps) => (
+            <li className="pl-0.5">{children}</li>
+          ),
           hr: () => <hr className="my-3 border-border/70" />,
           a: ({ children, href }: MarkdownNodeProps) => (
             <button
@@ -147,7 +155,7 @@ function MarkdownContent({ content }: { content: string }) {
 
 export default function UpdateDialog({ open, onClose, onUpdateFound }: UpdateDialogProps) {
   const { t } = useTranslation();
-  const { runtimeInfo } = useApp();
+  const { runtimeInfo, runtimeInfoLoaded } = useApp();
   const [status, setStatus] = useState<UpdateStatus>("checking");
   const [progress, setProgress] = useState<UpdateProgress>({ downloaded: 0, total: 0 });
   const [error, setError] = useState<string>("");
@@ -158,7 +166,7 @@ export default function UpdateDialog({ open, onClose, onUpdateFound }: UpdateDia
   onUpdateFoundRef.current = onUpdateFound;
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !runtimeInfoLoaded || runtimeInfo.packageManager) return;
 
     getVersion()
       .then(setCurrentVersion)
@@ -191,10 +199,10 @@ export default function UpdateDialog({ open, onClose, onUpdateFound }: UpdateDia
     return () => {
       cancelled = true;
     };
-  }, [open, runtimeInfo.portable]);
+  }, [open, runtimeInfo.packageManager, runtimeInfo.portable, runtimeInfoLoaded]);
 
   const handleUpdate = useCallback(async () => {
-    if (isUpdating.current) return;
+    if (isUpdating.current || runtimeInfo.packageManager) return;
     isUpdating.current = true;
     setStatus("downloading");
     setError("");
@@ -209,7 +217,7 @@ export default function UpdateDialog({ open, onClose, onUpdateFound }: UpdateDia
       setStatus("error");
       isUpdating.current = false;
     }
-  }, [runtimeInfo.portable]);
+  }, [runtimeInfo.packageManager, runtimeInfo.portable]);
 
   const handleRelaunch = useCallback(async () => {
     try {

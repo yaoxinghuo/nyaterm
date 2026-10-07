@@ -15,6 +15,8 @@ function props() {
     setHost: vi.fn(),
     port: 5900,
     setPort: vi.fn(),
+    username: "pi",
+    setUsername: vi.fn(),
     passwordId: "",
     setPasswordId: vi.fn(),
     password: "",
@@ -50,11 +52,28 @@ describe("VncForm", () => {
     invokeMock.mockResolvedValue([]);
   });
 
-  it("uses the standard VNC port and explains the classic password limit", () => {
+  it("shows the RA2 username in auto mode without applying the classic password hint", () => {
     render(<VncForm {...props()} />);
 
     expect(screen.getByDisplayValue("5900")).not.toBeNull();
+    expect(screen.getByDisplayValue("pi")).not.toBeNull();
+    expect(screen.getByText("dialog.vncUsernameHint")).not.toBeNull();
+    expect(screen.queryByText("dialog.vncPasswordLimit")).toBeNull();
+  });
+
+  it("shows the 8-byte password hint only for classic VNC authentication", () => {
+    render(<VncForm {...props()} securityMode="vnc-auth" />);
+
     expect(screen.getByText("dialog.vncPasswordLimit")).not.toBeNull();
+  });
+
+  it("disables the username in None mode and hides authentication hints", () => {
+    render(<VncForm {...props()} securityMode="none" />);
+    expect((screen.getByDisplayValue("pi") as HTMLInputElement).disabled).toBe(
+      true,
+    );
+    expect(screen.queryByText("dialog.vncUsernameHint")).toBeNull();
+    expect(screen.queryByText("dialog.vncPasswordLimit")).toBeNull();
   });
 
   it("allows switching to saved password selection", () => {

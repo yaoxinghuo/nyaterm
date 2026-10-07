@@ -283,7 +283,8 @@ pub(crate) fn parse_line(line: &str) -> Option<ControlMessage> {
             })
         }
         "window-add" | "unlinked-window-add" => Some(ControlMessage::WindowAdd {
-            window: args_id(line, "%window-add").or_else(|| args_id(line, "%unlinked-window-add"))?,
+            window: args_id(line, "%window-add")
+                .or_else(|| args_id(line, "%unlinked-window-add"))?,
         }),
         "window-close" | "unlinked-window-close" => Some(ControlMessage::WindowClose {
             window: args_id(line, "%window-close")

@@ -6,7 +6,12 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { invoke } from "@/lib/invoke";
-import type { AgentStepPayload, RiskLevel } from "@/types/global";
+import type {
+  AgentApprovalReasonCode,
+  AgentStepPayload,
+  RiskLevel,
+  RiskReasonCode,
+} from "@/types/global";
 import { AnimatedStatusText } from "./AnimatedStatusText";
 
 const riskColorClass = {
@@ -23,6 +28,28 @@ function riskLabelKey(risk: RiskLevel) {
     high: "ai.riskHigh",
     critical: "ai.riskCritical",
   }[risk];
+}
+
+function approvalReasonKey(reason: AgentApprovalReasonCode) {
+  return {
+    confirmEachCommand: "ai.approvalReasons.confirmEachCommand",
+    criticalRisk: "ai.approvalReasons.criticalRisk",
+    riskExceedsThreshold: "ai.approvalReasons.riskExceedsThreshold",
+    externalAgentPermission: "ai.approvalReasons.externalAgentPermission",
+    safeAutoUnknownOrHighRisk: "ai.approvalReasons.safeAutoUnknownOrHighRisk",
+  }[reason];
+}
+
+function localRiskReasonKey(reason: RiskReasonCode) {
+  return {
+    emptyCommand: "ai.localRiskReasons.emptyCommand",
+    irreversiblePattern: "ai.localRiskReasons.irreversiblePattern",
+    unclassifiedCommand: "ai.localRiskReasons.unclassifiedCommand",
+    privilegedMutation: "ai.localRiskReasons.privilegedMutation",
+    unknownCommand: "ai.localRiskReasons.unknownCommand",
+    ordinaryWrite: "ai.localRiskReasons.ordinaryWrite",
+    readOnlyDiagnostic: "ai.localRiskReasons.readOnlyDiagnostic",
+  }[reason];
 }
 
 export function AgentStepView({
@@ -43,6 +70,12 @@ export function AgentStepView({
   const isFailed = step.status === "failed" || step.status === "rejected";
   const isRunning = step.status === "running";
   const riskLevel = step.action.riskLevel ?? null;
+  const approvalReason = step.action.approvalReasonCode
+    ? t(approvalReasonKey(step.action.approvalReasonCode))
+    : null;
+  const localRiskReason = step.action.localRiskReasonCode
+    ? t(localRiskReasonKey(step.action.localRiskReasonCode))
+    : null;
 
   const borderColor = isSuccess
     ? "border-emerald-500"
@@ -153,21 +186,48 @@ export function AgentStepView({
 
           {step.status === "needs_approval" ? (
             <div className="space-y-2 border-t border-border/40 px-2.5 py-1.5">
-              <div className="space-y-1 text-[0.625rem] leading-4 text-muted-foreground">
-                {step.action.approvalReason ? <div>{step.action.approvalReason}</div> : null}
-                {step.action.riskReason ? <div>{step.action.riskReason}</div> : null}
-                {(step.action.modelRiskLevel || step.action.localRiskLevel) && (
-                  <div>
-                    {t("ai.riskReview", {
-                      model: step.action.modelRiskLevel
-                        ? t(riskLabelKey(step.action.modelRiskLevel))
-                        : "-",
-                      local: step.action.localRiskLevel
+              <div className="grid grid-cols-[max-content_minmax(0,1fr)] gap-x-1.5 gap-y-1 text-[0.625rem] leading-4 text-muted-foreground">
+                {approvalReason ? (
+                  <>
+                    <span className="font-medium text-foreground/70">
+                      {t("ai.executionPolicyLabel")}
+                    </span>
+                    <span className="min-w-0 break-words">{approvalReason}</span>
+                  </>
+                ) : null}
+                {step.action.localRiskLevel || localRiskReason ? (
+                  <>
+                    <span className="font-medium text-foreground/70">
+                      {t("ai.localAssessmentLabel")}
+                    </span>
+                    <span className="min-w-0 break-words">
+                      {step.action.localRiskLevel
                         ? t(riskLabelKey(step.action.localRiskLevel))
-                        : "-",
-                    })}
-                  </div>
-                )}
+                        : "-"}
+                      {localRiskReason ? (
+                        <span className="text-muted-foreground/80"> · {localRiskReason}</span>
+                      ) : null}
+                    </span>
+                  </>
+                ) : null}
+                {step.action.modelRiskLevel || step.action.modelRiskReason ? (
+                  <>
+                    <span className="font-medium text-foreground/70">
+                      {t("ai.aiAssessmentLabel")}
+                    </span>
+                    <span className="min-w-0 break-words">
+                      {step.action.modelRiskLevel
+                        ? t(riskLabelKey(step.action.modelRiskLevel))
+                        : "-"}
+                      {step.action.modelRiskReason ? (
+                        <span className="text-muted-foreground/80">
+                          {" "}
+                          · {step.action.modelRiskReason}
+                        </span>
+                      ) : null}
+                    </span>
+                  </>
+                ) : null}
               </div>
               <div className="flex items-center gap-1.5">
                 <Button

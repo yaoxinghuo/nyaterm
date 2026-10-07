@@ -1,5 +1,5 @@
 import { renderHook, waitFor } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { RemoteStats } from "@/types/global";
 import {
   MAX_NETWORK_HISTORY_POINTS,
@@ -8,6 +8,38 @@ import {
 } from "./useNetworkHistory";
 
 describe("useNetworkHistory", () => {
+  it("removes closed-session history and snapshot references while retaining live history", () => {
+    const statsA = remoteStats(10, 1);
+    const statsB = remoteStats(20, 2);
+    const liveSessions = new Set(["session-a", "session-b"]);
+    const { result, rerender } = renderHook(
+      ({ sessionId, stats, liveSessionIds }) => useNetworkHistory(sessionId, stats, liveSessionIds),
+      {
+        initialProps: {
+          sessionId: "session-a",
+          stats: statsA,
+          liveSessionIds: liveSessions as ReadonlySet<string> | null,
+        },
+      },
+    );
+    rerender({ sessionId: "session-b", stats: statsB, liveSessionIds: null });
+    expect(result.current.getSeries("session-a").summary).toHaveLength(1);
+    const historyB = result.current.getSeries("session-b");
+    const listener = vi.fn();
+    const unsubscribe = result.current.subscribe(listener);
+
+    // Even if stale stats are still supplied, a closed session must stay evicted.
+    rerender({ sessionId: "session-a", stats: statsA, liveSessionIds: new Set(["session-b"]) });
+    expect(result.current.getSeries("session-a").summary).toHaveLength(0);
+    expect(result.current.getSeries("session-b")).toBe(historyB);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    // Reusing the object proves the old deduplication reference was also removed.
+    rerender({ sessionId: "session-a", stats: statsA, liveSessionIds: liveSessions });
+    expect(result.current.getSeries("session-a").summary).toHaveLength(1);
+    unsubscribe();
+  });
+
   it("appends new samples and does not duplicate the same stats object", async () => {
     const first = remoteStats(100, 10, [{ nic: "eth0", rx: 60, tx: 6 }]);
     const { result, rerender } = renderHook(

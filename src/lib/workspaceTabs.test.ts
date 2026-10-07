@@ -11,7 +11,10 @@ import {
   getReleasedSessionIds,
   getSessionRowDisplayName,
   getTabDisplayName,
+  insertTabAfter,
   replaceSessionReferences,
+  resolveFileDocumentInsertAfterTabId,
+  resolveNextActiveTabAfterFileDocumentClose,
   restoreTabFromPersistence,
   serializeTabsForPersistence,
   splitSessionPane,
@@ -92,6 +95,124 @@ describe("workspaceTabs file documents", () => {
       "session-new",
       "session-new",
     ]);
+  });
+
+  it("inserts a new file tab after the active same-session tab", () => {
+    const hostA = createWorkspaceTab(
+      createSessionPane("Host A", "SSH", "ssh-1", { sessionId: "session-a" }),
+      0,
+    );
+    const hostB = createWorkspaceTab(
+      createSessionPane("Host B", "SSH", "ssh-2", { sessionId: "session-b" }),
+      1,
+    );
+    const tabs = [hostA, hostB];
+
+    expect(
+      resolveFileDocumentInsertAfterTabId(tabs, "session-a", hostA.id),
+    ).toBe(hostA.id);
+    expect(
+      resolveFileDocumentInsertAfterTabId(tabs, "session-a", hostB.id),
+    ).toBe(hostA.id);
+
+    const editor = createWorkspaceTab(file("/srv/notes.md", "session-a"), 2);
+    expect(insertTabAfter(tabs, hostA.id, editor).map((tab) => tab.id)).toEqual([
+      hostA.id,
+      editor.id,
+      hostB.id,
+    ]);
+  });
+
+  it("inserts a later file tab after the currently open file from the same host", () => {
+    const hostA = createWorkspaceTab(
+      createSessionPane("Host A", "SSH", "ssh-1", { sessionId: "session-a" }),
+      0,
+    );
+    const hostB = createWorkspaceTab(
+      createSessionPane("Host B", "SSH", "ssh-2", { sessionId: "session-b" }),
+      1,
+    );
+    const file1 = createWorkspaceTab(file("/srv/one.md", "session-a"), 2);
+    const tabs = [hostA, file1, hostB];
+
+    expect(
+      resolveFileDocumentInsertAfterTabId(tabs, "session-a", file1.id),
+    ).toBe(file1.id);
+  });
+
+  it("returns to the host tab when closing an editor opened from that host", () => {
+    const hostA = createWorkspaceTab(
+      createSessionPane("Host A", "SSH", "ssh-1", { sessionId: "session-a" }),
+      0,
+    );
+    const hostB = createWorkspaceTab(
+      createSessionPane("Host B", "SSH", "ssh-2", { sessionId: "session-b" }),
+      1,
+    );
+    const editor = createWorkspaceTab(file("/srv/notes.md", "session-a"), 2);
+
+    expect(
+      resolveNextActiveTabAfterFileDocumentClose(
+        [hostA, hostB, editor],
+        [editor.id],
+        editor.id,
+      ),
+    ).toBe(hostA.id);
+    expect(
+      resolveNextActiveTabAfterFileDocumentClose(
+        [hostA, editor, hostB],
+        [editor.id],
+        editor.id,
+      ),
+    ).toBe(hostA.id);
+  });
+
+  it("returns to the previous same-session file tab before jumping to the host", () => {
+    const hostA = createWorkspaceTab(
+      createSessionPane("Host A", "SSH", "ssh-1", { sessionId: "session-a" }),
+      0,
+    );
+    const file1 = createWorkspaceTab(file("/srv/one.md", "session-a"), 1);
+    const file2 = createWorkspaceTab(file("/srv/two.md", "session-a"), 2);
+    const hostB = createWorkspaceTab(
+      createSessionPane("Host B", "SSH", "ssh-2", { sessionId: "session-b" }),
+      3,
+    );
+
+    expect(
+      resolveNextActiveTabAfterFileDocumentClose(
+        [hostA, file1, file2, hostB],
+        [file2.id],
+        file2.id,
+      ),
+    ).toBe(file1.id);
+  });
+
+  it("falls back to left-neighbor close when the host tab is already gone", () => {
+    const hostB = createWorkspaceTab(
+      createSessionPane("Host B", "SSH", "ssh-2", { sessionId: "session-b" }),
+      0,
+    );
+    const editor = createWorkspaceTab(file("/srv/notes.md", "session-a"), 1);
+
+    expect(
+      resolveNextActiveTabAfterFileDocumentClose([hostB, editor], [editor.id], editor.id),
+    ).toBeNull();
+  });
+
+  it("does not override close targets for ordinary session tabs", () => {
+    const hostA = createWorkspaceTab(
+      createSessionPane("Host A", "SSH", "ssh-1", { sessionId: "session-a" }),
+      0,
+    );
+    const hostB = createWorkspaceTab(
+      createSessionPane("Host B", "SSH", "ssh-2", { sessionId: "session-b" }),
+      1,
+    );
+
+    expect(
+      resolveNextActiveTabAfterFileDocumentClose([hostA, hostB], [hostB.id], hostB.id),
+    ).toBeNull();
   });
 
   it("does not persist file-only tabs and collapses file leaves out of split tabs", () => {

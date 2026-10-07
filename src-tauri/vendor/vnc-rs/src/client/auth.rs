@@ -11,6 +11,7 @@ pub(super) enum SecurityType {
     VncAuth = 2,
     RA2 = 5,
     RA2ne = 6,
+    RA2_256 = 129,
     Tight = 16,
     Ultra = 17,
     Tls = 18,
@@ -30,6 +31,7 @@ impl TryFrom<u8> for SecurityType {
             2 => Ok(Self::VncAuth),
             5 => Ok(Self::RA2),
             6 => Ok(Self::RA2ne),
+            129 => Ok(Self::RA2_256),
             16 => Ok(Self::Tight),
             17 => Ok(Self::Ultra),
             18 => Ok(Self::Tls),
@@ -108,7 +110,17 @@ impl SecurityType {
                 }
                 let mut sec_types = Vec::with_capacity(num as usize);
                 for _ in 0..num {
-                    sec_types.push(reader.read_u8().await?.try_into()?);
+                    let raw = reader.read_u8().await?;
+                    match raw.try_into() {
+                        Ok(security_type) => sec_types.push(security_type),
+                        Err(VncError::InvalidSecurityType(_)) => {
+                            tracing::trace!(
+                                raw,
+                                "Ignoring unsupported advertised VNC security type"
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 tracing::trace!("Server supported security type: {:?}", sec_types);
                 Ok(sec_types)
@@ -235,15 +247,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_unknown_security_type_and_result() {
-        let mut security = &[1_u8, 99][..];
-        let error = SecurityType::read(&mut security, &VncVersion::RFB38, &VncLimits::default())
+    async fn ignores_unknown_security_types_in_rfb38_lists_but_rejects_unknown_results() {
+        let mut security = &[3_u8, 99, 129, 2][..];
+        let types = SecurityType::read(&mut security, &VncVersion::RFB38, &VncLimits::default())
             .await
-            .unwrap_err();
-        assert!(matches!(error, VncError::InvalidSecurityType(99)));
+            .unwrap();
+        assert_eq!(types, vec![SecurityType::RA2_256, SecurityType::VncAuth]);
         assert!(matches!(
             AuthResult::try_from(7),
             Err(VncError::InvalidSecurityResult(7))
         ));
+    }
+
+    #[tokio::test]
+    async fn rfb33_keeps_unknown_single_security_type_fail_closed() {
+        let mut security = &99_u32.to_be_bytes()[..];
+        let error = SecurityType::read(&mut security, &VncVersion::RFB33, &VncLimits::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, VncError::InvalidSecurityType(99)));
     }
 }

@@ -63,6 +63,7 @@ interface TerminalFitSchedulerOptions {
   getFitAddon: () => FitAddonLike | null;
   getContainer: () => HTMLElement | null;
   isVisible: () => boolean;
+  canFocus?: () => boolean;
   onAfterFit?: (result: TerminalFitResult) => void;
   requestAnimationFrame?: (callback: FrameRequestCallback) => number;
   cancelAnimationFrame?: (handle: number) => void;
@@ -359,7 +360,7 @@ export class TerminalFitScheduler {
     if (request.refresh) {
       terminal.refresh(0, Math.max(0, terminal.rows - 1));
     }
-    if (request.focus) {
+    if (request.focus && (this.options.canFocus?.() ?? true)) {
       terminal.focus();
     }
 

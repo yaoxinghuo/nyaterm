@@ -98,7 +98,7 @@ export class KeywordHighlighter implements IDisposable {
   private lineMatchCache = new Map<number, HighlightSpan[]>();
   /** Immutable rows belonging to a logical line suppressed by a deterministic hard limit. */
   private suppressedLineCache = new Map<number, true>();
-  private writeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private writeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private scrollDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private resumeRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private resumeRefreshFrame: number | null = null;
@@ -215,9 +215,9 @@ export class KeywordHighlighter implements IDisposable {
   }
 
   private clearAllTimers(): void {
-    if (this.writeDebounceTimer) {
-      clearTimeout(this.writeDebounceTimer);
-      this.writeDebounceTimer = null;
+    if (this.writeRefreshTimer !== null) {
+      clearTimeout(this.writeRefreshTimer);
+      this.writeRefreshTimer = null;
     }
     if (this.scrollDebounceTimer) {
       clearTimeout(this.scrollDebounceTimer);
@@ -275,7 +275,7 @@ export class KeywordHighlighter implements IDisposable {
     return true;
   }
 
-  /** Debounced refresh for write/resize events (batches rapid output). */
+  /** Delayed refresh that batches writes without postponing work during continuous output. */
   private triggerWriteRefresh(reason: "write" | "resize" = "write"): void {
     if (!this.canRefresh()) return;
     if (
@@ -285,19 +285,19 @@ export class KeywordHighlighter implements IDisposable {
     ) {
       return;
     }
-    if (this.writeDebounceTimer) clearTimeout(this.writeDebounceTimer);
-    this.writeDebounceTimer = setTimeout(() => {
-      this.writeDebounceTimer = null;
+    if (this.writeRefreshTimer !== null) return;
+    this.writeRefreshTimer = setTimeout(() => {
+      this.writeRefreshTimer = null;
       this.refreshViewport(reason);
-    }, XTERM_PERFORMANCE_CONFIG.highlighting.debounceMs);
+    }, XTERM_PERFORMANCE_CONFIG.highlighting.writeRefreshIntervalMs);
   }
 
   /** Pure trailing debounce: scrolling always preempts pending highlight work. */
   private triggerScrollRefresh(): void {
     if (!this.canRefresh()) return;
-    if (this.writeDebounceTimer !== null) {
-      clearTimeout(this.writeDebounceTimer);
-      this.writeDebounceTimer = null;
+    if (this.writeRefreshTimer !== null) {
+      clearTimeout(this.writeRefreshTimer);
+      this.writeRefreshTimer = null;
     }
     this.cancelContinuationRefresh();
     this.cancelResumeRefresh();

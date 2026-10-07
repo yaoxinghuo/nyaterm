@@ -327,6 +327,24 @@ pub async fn copy_file_entry(
 }
 
 #[tauri::command]
+pub async fn move_file_entry(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<SessionManager>>,
+    request: sftp::CopyFileEntryRequest,
+) -> AppResult<sftp::CopyEntryOutcome> {
+    sftp::move_file_entry(app, state.inner().clone(), request).await
+}
+
+#[tauri::command]
+pub async fn find_missing_remote_entries(
+    state: tauri::State<'_, Arc<SessionManager>>,
+    session_id: String,
+    paths: Vec<String>,
+) -> AppResult<Vec<String>> {
+    sftp::find_missing_remote_entries(state.inner().clone(), &session_id, paths).await
+}
+
+#[tauri::command]
 pub async fn pause_transfer(app: tauri::AppHandle, transfer_id: String) -> AppResult<()> {
     sftp::pause_transfer(app, &transfer_id).await
 }

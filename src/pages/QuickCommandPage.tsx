@@ -1,18 +1,12 @@
-import { emit } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import {
-  type CSSProperties,
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { randomUUID } from "@/lib/uuid";
+import { emit } from "@/lib/backend/api";
+import { getCurrentWindow } from "@/lib/backend/platform/window";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { MdAdd, MdCheck, MdExpandMore } from "react-icons/md";
 import { QUICK_ICONS } from "@/components/icons";
 import ChildWindowHeader from "@/components/layout/ChildWindowHeader";
+import QuickCommandEditor from "@/components/quick-commands/QuickCommandEditor";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -29,7 +23,6 @@ import {
 } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
 import { getErrorMessage } from "@/lib/errors";
 import { invoke } from "@/lib/invoke";
 import {
@@ -39,7 +32,7 @@ import {
   getNextQuickCommandCategorySortOrder,
   hasQuickCommandCategorySiblingName,
 } from "@/lib/quickCommandCategories";
-import { cn, parseJsonSearchParam } from "@/lib/utils";
+import { parseJsonSearchParam } from "@/lib/utils";
 import type { QuickCommand, QuickCommandCategory } from "@/types/global";
 
 interface QuickCommandsConfig {
@@ -56,135 +49,6 @@ const COLOR_CLASSES: Record<string, string> = {
   yellow: "bg-yellow-400",
   purple: "bg-purple-400",
 };
-
-const SCRIPT_EDITOR_LINE_HEIGHT = 20;
-
-interface QuickCommandScriptEditorProps {
-  value: string;
-  placeholder: string;
-  invalid?: boolean;
-  onChange: (value: string) => void;
-}
-
-function QuickCommandScriptEditor({
-  value,
-  placeholder,
-  invalid,
-  onChange,
-}: QuickCommandScriptEditorProps) {
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const gutterRef = useRef<HTMLDivElement | null>(null);
-  const measureLineRefs = useRef<Array<HTMLDivElement | null>>([]);
-  const [lineHeights, setLineHeights] = useState<number[]>([]);
-  const lines = useMemo(() => value.split("\n"), [value]);
-  const lineRows = useMemo(() => {
-    let offset = 0;
-    return lines.map((text) => {
-      const row = { offset, text };
-      offset += text.length + 1;
-      return row;
-    });
-  }, [lines]);
-
-  const syncGutterScroll = useCallback(() => {
-    if (!textareaRef.current || !gutterRef.current) return;
-    gutterRef.current.scrollTop = textareaRef.current.scrollTop;
-  }, []);
-
-  const measureLineHeights = useCallback(() => {
-    const nextHeights = lineRows.map(
-      (_line, index) =>
-        measureLineRefs.current[index]?.offsetHeight ||
-        SCRIPT_EDITOR_LINE_HEIGHT,
-    );
-
-    setLineHeights((current) => {
-      if (
-        current.length === nextHeights.length &&
-        current.every((height, index) => height === nextHeights[index])
-      ) {
-        return current;
-      }
-      return nextHeights;
-    });
-    syncGutterScroll();
-  }, [lineRows, syncGutterScroll]);
-
-  useEffect(() => {
-    const textarea = textareaRef.current;
-    if (!textarea || typeof ResizeObserver === "undefined") return;
-
-    let animationFrame = 0;
-    const observer = new ResizeObserver(() => {
-      cancelAnimationFrame(animationFrame);
-      animationFrame = requestAnimationFrame(measureLineHeights);
-    });
-    observer.observe(textarea);
-    return () => {
-      cancelAnimationFrame(animationFrame);
-      observer.disconnect();
-    };
-  }, [measureLineHeights]);
-
-  useLayoutEffect(() => {
-    measureLineHeights();
-  }, [measureLineHeights]);
-
-  measureLineRefs.current = [];
-
-  return (
-    <div
-      className={cn(
-        "relative min-h-28 flex-1 overflow-hidden rounded-md border border-input bg-muted/30 text-sm shadow-xs transition-[color,box-shadow]",
-        "focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50",
-        invalid && "border-destructive focus-within:ring-destructive",
-      )}
-    >
-      <div
-        ref={gutterRef}
-        className="pointer-events-none absolute inset-y-0 left-0 z-20 w-10 overflow-hidden border-r border-border/40 bg-muted/40 py-2"
-        aria-hidden="true"
-      >
-        {lineRows.map((line, index) => (
-          <div
-            key={`line-number-${line.offset}`}
-            className="pr-2 text-right font-mono text-[0.6875rem] leading-5 text-muted-foreground/70"
-            style={{ height: lineHeights[index] || SCRIPT_EDITOR_LINE_HEIGHT }}
-          >
-            {index + 1}
-          </div>
-        ))}
-      </div>
-      <div
-        className="pointer-events-none invisible absolute inset-y-0 left-10 right-0 overflow-hidden px-3 py-2 font-mono text-sm leading-5 whitespace-pre-wrap break-words"
-        aria-hidden="true"
-      >
-        {lineRows.map((line, index) => (
-          <div
-            key={`line-measure-${line.offset}`}
-            ref={(node) => {
-              measureLineRefs.current[index] = node;
-            }}
-            className="min-h-5 whitespace-pre-wrap break-words"
-          >
-            {line.text || "\u200b"}
-          </div>
-        ))}
-      </div>
-      <Textarea
-        ref={textareaRef}
-        id="qc-command"
-        className="relative z-10 min-h-28 h-full flex-1 resize-none overflow-auto border-0 bg-transparent py-2 pl-[3.25rem] pr-3 font-mono text-sm leading-5 shadow-none focus-visible:border-0 focus-visible:ring-0"
-        style={{ fieldSizing: "fixed" } as CSSProperties}
-        placeholder={placeholder}
-        value={value}
-        aria-invalid={invalid || undefined}
-        onScroll={syncGutterScroll}
-        onChange={(event) => onChange(event.target.value)}
-      />
-    </div>
-  );
-}
 
 export default function QuickCommandPage() {
   const { t } = useTranslation();
@@ -335,7 +199,7 @@ export default function QuickCommandPage() {
     let finalCategoryId = categoryId === "none" ? undefined : categoryId;
     let newCategory: QuickCommandCategory | undefined;
     if (categoryId === "new" && newCategoryName.trim()) {
-      const newId = crypto.randomUUID();
+      const newId = randomUUID();
       newCategory = {
         id: newId,
         name: newCategoryName.trim(),
@@ -720,7 +584,9 @@ export default function QuickCommandPage() {
         <div className="flex min-h-32 flex-1 flex-col gap-1.5">
           <div className="flex justify-between items-center">
             <Label
+              id="qc-command-label"
               htmlFor="qc-command"
+              onClick={() => document.getElementById("qc-command")?.focus()}
               className="text-xs text-muted-foreground"
             >
               {t("quickCommands.commandScript")}
@@ -731,7 +597,7 @@ export default function QuickCommandPage() {
               </span>
             )}
           </div>
-          <QuickCommandScriptEditor
+          <QuickCommandEditor
             placeholder={t("quickCommands.commandPlaceholder")}
             value={command}
             invalid={Boolean(errors.command)}

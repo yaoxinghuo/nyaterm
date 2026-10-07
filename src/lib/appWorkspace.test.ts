@@ -9,6 +9,7 @@ import {
   getItemSide,
   getSideOpenPanels,
   getVisibleActivityIds,
+  hasVisibleActivityBarItems,
   hideActivityBarItem,
   isActivityBarItemVisible,
   isActivityItemAvailable,
@@ -133,6 +134,18 @@ function uiConfig(overrides: Partial<UiConfig> = {}): UiConfig {
 }
 
 describe("activity bar visibility state", () => {
+  it("does not keep a side visible when it only contains hidden items", () => {
+    expect(
+      hasVisibleActivityBarItems({
+        items: [],
+        bottomItems: [],
+        hiddenItems: ["fileExplorer"],
+      }),
+    ).toBe(false);
+    expect(hasVisibleActivityBarItems({ items: ["savedConnections"] })).toBe(true);
+    expect(hasVisibleActivityBarItems({ items: [], bottomItems: ["settings"] })).toBe(true);
+  });
+
   it("hides, shows, and toggles icons without changing feature availability", () => {
     const ui = uiConfig({
       show_gpu_monitor: true,

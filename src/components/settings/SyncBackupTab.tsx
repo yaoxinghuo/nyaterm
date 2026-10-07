@@ -1,5 +1,5 @@
-import { listen } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { listen } from "@/lib/backend/api";
+import { openUrl } from "@/lib/backend/platform/opener";
 import { Copy } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -16,6 +16,7 @@ import {
   formatTimestamp,
   getCloudSyncValidationErrors,
   isRemoteInconsistentConflict,
+  needsGistCapacityRecovery,
   secretInputValue,
   secretPlaceholder,
   shortValue,
@@ -122,6 +123,9 @@ export function SyncBackupTab({ onNavigateSecurity }: SyncBackupTabProps) {
   const canRunEnabledActions = canRunConfigDependentActions && committedCloudSync.enabled;
   const isBusy = loading || isSaving || runningAction !== null;
   const isRemoteInconsistent = isRemoteInconsistentConflict(status.conflict);
+  const showGistCapacityRecovery =
+    status.state === "failed" &&
+    needsGistCapacityRecovery(status.provider, status.message, status.error_code);
 
   const updateCloudSync = useCallback(
     (patch: Partial<CloudSyncSettings>) => {
@@ -481,7 +485,11 @@ export function SyncBackupTab({ onNavigateSecurity }: SyncBackupTabProps) {
   };
 
   if (loading) {
-    return <div className="py-10 text-sm text-muted-foreground">{t("common.loading")}</div>;
+    return (
+      <div className="py-10 text-sm text-muted-foreground">
+        {t("common.loading")}
+      </div>
+    );
   }
 
   return (
@@ -1069,7 +1077,24 @@ export function SyncBackupTab({ onNavigateSecurity }: SyncBackupTabProps) {
           >
             {t("settings.syncPullNow")}
           </Button>
+          {showGistCapacityRecovery ? (
+            <Button
+              onClick={() =>
+                void runAction("prune-retry-push", t("settings.syncPruneAndRetrySuccess"), () =>
+                  invoke("sync_push_now"),
+                )
+              }
+              disabled={isBusy || !canRunEnabledActions}
+            >
+              {t("settings.syncPruneAndRetry")}
+            </Button>
+          ) : null}
         </div>
+        {showGistCapacityRecovery ? (
+          <p className="text-xs leading-5 text-muted-foreground">
+            {t("settings.syncGistCapacityHint")}
+          </p>
+        ) : null}
       </SettingSection>
 
       <SettingSection

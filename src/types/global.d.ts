@@ -30,6 +30,7 @@ export type { TemporaryLinkConfig } from "@/types/temporaryConnection";
 export interface AppRuntimeInfo {
   portable: boolean;
   mode: "installed" | "portable";
+  packageManager?: string | null;
   executableDir: string;
   dataDir: string;
   configDir: string;
@@ -41,26 +42,23 @@ export interface AppRuntimeInfo {
 export interface AppSupportInfo {
   os: string;
   architecture: string;
-  runtime: "portable" | "installed";
+  runtime: "portable" | "installed" | "web";
+  packageManager?: string | null;
+  conpty?: {
+    available: boolean;
+    activeBundled: number;
+    activeSystem: number;
+    lastUsed: "bundled" | "system" | null;
+    fallback: boolean;
+    version: string;
+  };
 }
 
 /** AI Agent command execution wrapper profile. */
-export type AIExecutionProfile =
-  | "auto"
-  | "posix"
-  | "powershell"
-  | "cmd"
-  | "send_only"
-  | "disabled";
+export type AIExecutionProfile = "auto" | "posix" | "powershell" | "cmd" | "send_only" | "disabled";
 export type SshProfile = "standard" | "network_device";
 export type SshRuntimeMode = "standard" | "terminal" | "sftp";
-export type SshTerminalType =
-  | "xterm-256color"
-  | "xterm"
-  | "vt100"
-  | "vt220"
-  | "ansi"
-  | "linux";
+export type SshTerminalType = "xterm-256color" | "xterm" | "vt100" | "vt220" | "ansi" | "linux";
 
 /** A group of sessions whose terminal input is broadcast to all members. */
 export interface SyncGroup {
@@ -77,16 +75,14 @@ export interface SyncGroup {
 export type PaneSplitDirection = "horizontal" | "vertical";
 
 /** Connection type discriminator matching Rust ConnectionType. */
-export type ConnectionTypeTag =
-  | "ssh"
-  | "local_terminal"
-  | "telnet"
-  | "serial"
-  | "rdp"
-  | "vnc";
+export type ConnectionTypeTag = "ssh" | "local_terminal" | "telnet" | "serial" | "rdp" | "vnc";
 
 /** Metadata for a connected or disconnected session. */
 export interface SessionInfo {
+  /** Web session lease associated with a persisted workspace pane. */
+  workspace_pane_id?: string;
+  ready?: boolean;
+  attached?: boolean;
   id: string;
   name: string;
   session_type: WorkspaceSessionType;
@@ -196,11 +192,7 @@ export interface FileDocumentPane extends WorkspacePaneBase {
   };
 }
 
-export type SessionPane =
-  | TerminalSessionPane
-  | RdpSessionPane
-  | VncSessionPane
-  | FileDocumentPane;
+export type SessionPane = TerminalSessionPane | RdpSessionPane | VncSessionPane | FileDocumentPane;
 
 /** Split node containing two child panes. */
 export interface SplitPane {
@@ -288,9 +280,7 @@ export interface SshAgentForwardingIdentity {
   custom_endpoint_index?: number;
 }
 
-export type SshAgentForwardingEndpointErrorCode =
-  | "connect_failed"
-  | "identity_enumeration_failed";
+export type SshAgentForwardingEndpointErrorCode = "connect_failed" | "identity_enumeration_failed";
 
 export interface SshAgentForwardingEndpointError {
   custom_endpoint_index: number;
@@ -326,6 +316,7 @@ export interface Group {
 /** Managed SSH private key stored in local app storage. */
 export interface SshKey {
   id: string;
+  sort_order: number;
   name: string;
   /** Transient: plaintext private key content pasted from the UI. */
   key_data?: string;
@@ -345,15 +336,31 @@ export interface SshKey {
   passphrase?: string;
 }
 
-/** Managed password entry stored in local app storage. */
-export interface SavedPassword {
+/** Stored SSH host key metadata exposed by the known-hosts management UI. */
+export interface KnownHostEntry {
   id: string;
+  marker?: string | null;
+  hostIdentifier: string;
+  hostPatterns: string[];
+  keyType: string;
+  fingerprint?: string | null;
+}
+
+/** Managed account entry stored in local app storage. */
+export interface SavedAccount {
+  id: string;
+  sort_order: number;
   name: string;
+  username: string;
   /** True when encrypted password data exists in local storage. */
   has_password?: boolean;
   /** Plaintext password (only sent when creating/updating). */
   password?: string;
 }
+
+/** Legacy password-only name retained for RDP/VNC compatibility. */
+export type SavedPassword = SavedAccount;
+export type AccountPasswordSource = "ask" | "direct" | "account";
 
 /** Terminal credential entry used for prompt-based autofill. */
 export interface SavedCredential {
@@ -375,6 +382,11 @@ export interface SavedCredential {
 /** Auth block for SSH connections. */
 export interface ConnectionAuth {
   mode: string;
+  /** Saved account reference used by SSH and Telnet. */
+  account_id?: string;
+  /** Password material source for SSH and Telnet; absent legacy values use the account. */
+  password_source?: "account" | "connection";
+  /** Legacy saved-password reference; do not use for new SSH/Telnet configurations. */
   password_id?: string;
   /** Inline password (plaintext when saving, absent when loading). */
   password?: string;
@@ -439,7 +451,6 @@ export interface AssetMetadata {
   memory_bytes?: number;
   accelerators?: AssetAccelerator[];
   disks?: AssetDisk[];
-  tags?: string[];
   notes?: string;
   updated_at?: string;
 }
@@ -469,6 +480,7 @@ export type SftpCwdFollowMode = "off" | "shell_integration" | "rc_file";
 
 export interface SftpSettings {
   enabled: boolean;
+  compatibility_mode: boolean;
   cwd_follow_mode: SftpCwdFollowMode;
   shell_detection_timeout_ms: number;
   filename_encoding?: string;
@@ -508,6 +520,8 @@ export interface ConnectionCustomIcon {
   updated_at_ms: number;
 }
 
+export type SerialFlowControl = "none" | "software" | "hardware";
+
 /** Unified saved connection with type-discriminated config. */
 export interface SavedConnection {
   id: string;
@@ -516,6 +530,7 @@ export interface SavedConnection {
   type: ConnectionTypeTag;
   group_id?: string;
   description?: string;
+  tags?: string[];
   sort_order?: number;
   icon?: string;
   icon_auto_detect?: boolean;
@@ -551,6 +566,8 @@ export interface SavedConnection {
   data_bits?: number;
   parity?: string;
   stop_bits?: string;
+  flow_control?: SerialFlowControl;
+  modem_upload_protocol?: "xmodem" | "ymodem" | "zmodem";
   /** Backspace key mode for SSH/Telnet/Serial connections ("ctrl_h" or "del"). */
   backspace_mode?: string;
   /** Telnet-only: bypass Telnet option negotiation for embedded/raw TCP CLIs. */
@@ -595,7 +612,7 @@ export interface SavedConnection {
 
 export type RdpCertificatePolicy = "strict" | "prompt" | "accept-temporarily";
 export type RdpDisplayMode = "fit-window" | "fixed" | "native";
-export type RdpClipboardMode = "disabled" | "text-only";
+export type RdpClipboardMode = "disabled" | "text-only" | "text-and-files";
 
 export interface RdpSecuritySettings {
   use_nla: boolean;
@@ -636,12 +653,7 @@ export interface VncReconnectSettings {
 }
 
 export type RecordingMode = "transcript" | "raw";
-export type RecordingState =
-  | "starting"
-  | "recording"
-  | "degraded"
-  | "failed"
-  | "stopping";
+export type RecordingState = "starting" | "recording" | "degraded" | "failed" | "stopping";
 export type ExistingFileBehavior = "unique" | "append" | "overwrite";
 export type RotationPolicy =
   | { type: "session" }
@@ -765,11 +777,7 @@ export type RightPanelId =
   | "recording"
   | "syncBackupHistory";
 
-export type ActivityBarZone =
-  | "left_top"
-  | "left_bottom"
-  | "right_top"
-  | "right_bottom";
+export type ActivityBarZone = "left_top" | "left_bottom" | "right_top" | "right_bottom";
 
 export interface ActivityBarLayout {
   left_top: string[];
@@ -785,13 +793,7 @@ export interface ActivityBarLayout {
 /** Layout preferences: panel widths, active panels, theme. */
 export type QuickCommandViewMode = "list" | "compact" | "tile";
 export type QuickCommandSortMode = "created" | "name" | "useCount" | "custom";
-export type HeaderStatusMode =
-  | "session"
-  | "resources"
-  | "host"
-  | "datetime"
-  | "gpu"
-  | "npu";
+export type HeaderStatusMode = "session" | "resources" | "host" | "datetime" | "gpu" | "npu";
 
 export type RestorableTerminalWindowNode =
   | {
@@ -806,6 +808,8 @@ export type RestorableTerminalWindowNode =
       first: RestorableTerminalWindowNode;
       second: RestorableTerminalWindowNode;
     };
+
+export type FileExplorerViewMode = "list" | "tree";
 
 export interface UiConfig {
   open_tabs: RestorableTab[];
@@ -830,7 +834,7 @@ export interface UiConfig {
   /** Relative height weight per panel id for stacked multi-open panels. */
   panel_stack_sizes: Record<string, number>;
   network_panel_active_tab?: "tunnel" | "proxy";
-  security_auth_panel_active_tab?: "keys" | "passwords" | "otp" | "credentials";
+  security_auth_panel_active_tab?: "keys" | "passwords" | "otp" | "credentials" | "known-hosts";
   show_quick_cmd_bar: boolean;
   show_serial_send_panel: boolean;
   serial_send_height: number;
@@ -856,6 +860,7 @@ export interface UiConfig {
   asset_sort_direction?: "asc" | "desc" | null;
   recent_connection_ids: string[];
   transfer_height: number;
+  file_explorer_view_mode: FileExplorerViewMode;
   file_explorer_show_hidden_files: boolean;
   file_explorer_auto_sync_cwd_connection_ids: string[];
   file_explorer_favorite_dirs_by_connection_id: Record<string, string[]>;
@@ -1138,10 +1143,7 @@ export interface QuickCommandsConfig {
   categories: QuickCommandCategory[];
 }
 
-export type QuickCommandImportSource =
-  | "windterm_quickbar"
-  | "xshell_xts"
-  | "nyaterm_json";
+export type QuickCommandImportSource = "windterm_quickbar" | "xshell_xts" | "nyaterm_json";
 
 export interface QuickCommandImportResult {
   imported_commands: number;
@@ -1168,6 +1170,7 @@ export interface GeneralSettings {
   minimize_to_tray: boolean;
   boss_key: string | null;
   confirm_on_close: boolean;
+  rdp_client_mode: "builtin" | "windows";
 }
 
 export type BackgroundImageFit = "cover" | "contain" | "stretch" | "tile";
@@ -1178,6 +1181,7 @@ export type WindowTransparency = "none" | "transparent";
 export interface TerminalThemeColors {
   background: string;
   foreground: string;
+  foregroundIntense?: string;
   cursor: string;
   selectionBackground: string;
   lineHighlight: string;
@@ -1243,6 +1247,7 @@ export interface AppearanceSettings {
   font_size: number;
   font_weight: number;
   font_weight_bold: number;
+  bold_default_foreground_highlight: boolean;
   background_opacity: number;
   background_image_path: string | null;
   background_image_fit: BackgroundImageFit;
@@ -1419,11 +1424,24 @@ export interface ExternalMcpSettings {
 export type AIReasoningEffort =
   | "auto"
   | "none"
+  | "minimal"
   | "low"
   | "medium"
   | "high"
-  | "xhigh";
+  | "xhigh"
+  | "max"
+  | "ultra";
+export type AIModelReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
+  | "ultra";
 export type AIApiFormat = "chat_completions" | "responses";
+export type AIProviderApiProtocol = "openai_compatible" | "anthropic" | "gemini" | "ollama";
 export type AIModelSource = "rust-genai" | "manual";
 export type AIBackendKind = "genai" | "codex";
 export type CodexThreadMode = "persistent" | "ephemeral";
@@ -1450,6 +1468,7 @@ export interface AIModelConfigItem {
   enabled: boolean;
   source: AIModelSource;
   last_seen_at?: string | null;
+  supported_reasoning_efforts?: AIModelReasoningEffort[];
 }
 
 export interface CodexIntegrationSettings {
@@ -1488,6 +1507,8 @@ export interface AIProviderCredential {
   id: string;
   name: string;
   provider_kind: AIProviderKind;
+  icon_data_url?: string | null;
+  api_protocol?: AIProviderApiProtocol | null;
   api_format: AIApiFormat;
   base_url?: string | null;
   api_key?: string | null;
@@ -1501,6 +1522,16 @@ export interface AICustomActionConfig {
   enabled: boolean;
 }
 
+export interface AIProxySettings {
+  mode: "system" | "direct" | "custom";
+  protocol: "http" | "socks5";
+  host: string;
+  port: number;
+  username: string | null;
+  password: string | null;
+  no_proxy: string;
+}
+
 export interface AISettings {
   schema_version: number;
   enabled: boolean;
@@ -1510,6 +1541,7 @@ export interface AISettings {
   record_history: boolean;
   timeout_ms: number;
   request_user_agent: string;
+  proxy: AIProxySettings;
   active_profile_id: string;
   provider_profiles: AIProviderProfile[];
   default_mode: AIMode;
@@ -1569,6 +1601,16 @@ export interface McpSessionOpenCancel {
 
 export interface AIContext {
   connectionName?: string | null;
+  sessionType?: WorkspaceSessionType | null;
+  description?: string | null;
+  tags?: string[];
+  groupPath?: string[];
+  /** Configured initial local shell, which may differ from the current shell. */
+  shellPath?: string | null;
+  /** Effective runtime command wrapper; never taken from legacy saved settings. */
+  executionProfile?: AIExecutionProfile | null;
+  serialPort?: string | null;
+  baudRate?: number | null;
   host?: string | null;
   port?: number | null;
   username?: string | null;
@@ -1679,12 +1721,21 @@ export interface AIStreamEventPayload {
 }
 
 export type AgentActionKind = "execute_command" | "final_answer";
-export type AgentStepStatus =
-  | "running"
-  | "completed"
-  | "needs_approval"
-  | "rejected"
-  | "failed";
+export type AgentApprovalReasonCode =
+  | "confirmEachCommand"
+  | "criticalRisk"
+  | "riskExceedsThreshold"
+  | "externalAgentPermission"
+  | "safeAutoUnknownOrHighRisk";
+export type RiskReasonCode =
+  | "emptyCommand"
+  | "irreversiblePattern"
+  | "unclassifiedCommand"
+  | "privilegedMutation"
+  | "unknownCommand"
+  | "ordinaryWrite"
+  | "readOnlyDiagnostic";
+export type AgentStepStatus = "running" | "completed" | "needs_approval" | "rejected" | "failed";
 
 export interface AgentStepAction {
   kind: AgentActionKind;
@@ -1693,8 +1744,9 @@ export interface AgentStepAction {
   riskLevel?: RiskLevel | null;
   modelRiskLevel?: RiskLevel | null;
   localRiskLevel?: RiskLevel | null;
-  riskReason?: string | null;
-  approvalReason?: string | null;
+  modelRiskReason?: string | null;
+  localRiskReasonCode?: RiskReasonCode | null;
+  approvalReasonCode?: AgentApprovalReasonCode | null;
   answer?: string | null;
 }
 
@@ -1824,6 +1876,7 @@ export interface FileExplorerProps {
   activeConnectionId?: string | null;
   activeSessionName?: string | null;
   terminalInputEnabled?: boolean;
+  onOpenDirectoryInNewTerminal?: (sessionId: string, path: string) => void;
 }
 
 export interface WebdavSyncSettings {
@@ -1928,6 +1981,8 @@ export interface CloudSyncStatus {
   provider: string;
   state: string;
   message: string;
+  /** Stable machine-readable code for failures the UI reacts to. */
+  error_code?: string | null;
   current_operation?: string | null;
   last_checked_at_ms?: number | null;
   last_synced_at_ms?: number | null;

@@ -62,7 +62,8 @@ import {
 } from "react-icons/si";
 import type { FileEntry, RemoteStatsSystem } from "@/types/global";
 
-function createLocalSvgIcon(src: string): IconType {
+function createLocalSvgIcon(path: string): IconType {
+  const src = `${import.meta.env.BASE_URL}${path.replace(/^\//, "")}`;
   const LocalSvgIcon: IconType = ({ className, size, style, title }) => {
     const dimension = size ?? "1em";
 
@@ -173,6 +174,7 @@ export const SYSTEM_ICONS: Record<string, QuickIconDef> = {
   k8s: { icon: createLocalSvgIcon("/icons/os/K8s.svg"), color: "currentColor" },
   gentoo: { icon: createLocalSvgIcon("/icons/os/Gentoo.svg"), color: "currentColor" },
   raspberrypi: { icon: createLocalSvgIcon("/icons/os/Raspberrypi.svg"), color: "currentColor" },
+  openwrt: { icon: createLocalSvgIcon("/icons/os/OpenWrt.svg"), color: "currentColor" },
   "alibaba-cloud-linux": {
     icon: createLocalSvgIcon("/icons/os/AlibabaCloudLinux.svg"),
     color: "currentColor",
@@ -222,6 +224,7 @@ const CONNECTION_ICON_ALIASES: Record<string, string> = {
   "nix-os": "nixos",
   "open-euler": "openeuler",
   "open-suse": "opensuse",
+  "open-wrt": "openwrt",
   raspberry: "raspberrypi",
   "raspberry-pi": "raspberrypi",
   "rocky-linux": "rocky",
@@ -391,6 +394,7 @@ export function inferConnectionIconKeyFromRemoteSystem(
     [["linux mint", "linuxmint"], "mint"],
     [["nixos", "nix os"], "nixos"],
     [["open euler", "openeuler"], "openeuler"],
+    [["openwrt", "open-wrt"], "openwrt"],
     [["opensuse", "open suse", "sles", "suse"], "opensuse"],
     [["rocky"], "rocky"],
     [["tencent", "tlinux"], "tencentos"],
@@ -441,7 +445,10 @@ export const SEARCH_ICONS: Record<string, QuickIconDef> = {
 
 export type SearchIconName = keyof typeof SEARCH_ICONS;
 
-export function getFileIcon(entry: FileEntry): { icon: ElementType; color: string } {
+export function getFileIcon(entry: FileEntry): {
+  icon: ElementType;
+  color: string;
+} {
   if (entry.is_symlink) return { icon: MdLink, color: "#67e8f9" }; // cyan-300
   if (entry.is_dir) return { icon: MdFolder, color: "#fbbf24" }; // amber-400
 

@@ -136,7 +136,7 @@ fn download_completion_accepts_empty_remote_file() {
 
 #[test]
 fn directory_concurrency_uses_fast_default_without_server_limits() {
-    let concurrency = sftp_directory_concurrency(None);
+    let concurrency = sftp_directory_concurrency(None, false);
 
     assert_eq!(concurrency.session_pool_size, 2);
     assert_eq!(concurrency.small_file_concurrency, 16);
@@ -145,11 +145,44 @@ fn directory_concurrency_uses_fast_default_without_server_limits() {
 
 #[test]
 fn directory_concurrency_respects_low_server_handle_limits() {
-    let concurrency = sftp_directory_concurrency(Some(12));
+    let concurrency = sftp_directory_concurrency(Some(12), false);
 
     assert_eq!(concurrency.session_pool_size, 2);
     assert_eq!(concurrency.small_file_concurrency, 4);
     assert_eq!(concurrency.large_file_concurrency, 2);
+}
+
+#[test]
+fn compatibility_mode_serializes_directory_transfers() {
+    let concurrency = sftp_directory_concurrency(None, true);
+
+    assert_eq!(concurrency.session_pool_size, 1);
+    assert_eq!(concurrency.small_file_concurrency, 1);
+    assert_eq!(concurrency.large_file_concurrency, 1);
+}
+
+#[test]
+fn compatibility_copy_locks_use_stable_order_and_share_identical_sessions() {
+    assert_eq!(
+        sftp_session_acquire_order(Some(10), Some(20)),
+        SftpSessionAcquireOrder::SourceFirst
+    );
+    assert_eq!(
+        sftp_session_acquire_order(Some(20), Some(10)),
+        SftpSessionAcquireOrder::TargetFirst
+    );
+    assert_eq!(
+        sftp_session_acquire_order(Some(10), Some(10)),
+        SftpSessionAcquireOrder::Shared
+    );
+    assert_eq!(
+        sftp_session_acquire_order(None, Some(10)),
+        SftpSessionAcquireOrder::TargetFirst
+    );
+    assert_eq!(
+        sftp_session_acquire_order(Some(10), None),
+        SftpSessionAcquireOrder::SourceFirst
+    );
 }
 
 #[test]
@@ -182,8 +215,9 @@ fn sftp_directory_list_retry_accepts_transient_sftp_errors_on_first_failure() {
         SftpError::UnexpectedBehavior("session closed".to_string()),
     ] {
         let error = AppError::Sftp(error);
-        assert!(should_retry_sftp_directory_list(&error, 0));
-        assert!(!should_retry_sftp_directory_list(&error, 1));
+        assert!(should_retry_sftp_directory_list(&error, 0, false));
+        assert!(!should_retry_sftp_directory_list(&error, 1, false));
+        assert!(!should_retry_sftp_directory_list(&error, 0, true));
     }
 }
 
@@ -199,6 +233,7 @@ fn sftp_directory_list_retry_rejects_remote_and_protocol_failures() {
         assert!(!should_retry_sftp_directory_list(
             &AppError::Sftp(sftp_status_error(status_code)),
             0,
+            false,
         ));
     }
 
@@ -206,12 +241,30 @@ fn sftp_directory_list_retry_rejects_remote_and_protocol_failures() {
         SftpError::Limited("limit".to_string()),
         SftpError::UnexpectedPacket,
     ] {
-        assert!(!should_retry_sftp_directory_list(&AppError::Sftp(error), 0,));
+        assert!(!should_retry_sftp_directory_list(
+            &AppError::Sftp(error),
+            0,
+            false,
+        ));
     }
 
     assert!(!should_retry_sftp_directory_list(
         &AppError::Channel("SFTP session setup failed".to_string()),
         0,
+        false,
+    ));
+}
+
+#[test]
+fn sftp_stream_closed_detection_matches_only_exact_unexpected_behavior() {
+    assert!(is_sftp_stream_closed_error(&SftpError::UnexpectedBehavior(
+        "SFTP stream closed".to_string()
+    )));
+    assert!(!is_sftp_stream_closed_error(&sftp_status_error(
+        StatusCode::ConnectionLost
+    )));
+    assert!(!is_sftp_stream_closed_error(
+        &SftpError::UnexpectedBehavior("session closed".to_string())
     ));
 }
 
@@ -280,7 +333,7 @@ fn manual_pipeline_depth_is_defensively_clamped() {
 
 #[test]
 fn directory_concurrency_keeps_at_least_one_worker() {
-    let concurrency = sftp_directory_concurrency(Some(2));
+    let concurrency = sftp_directory_concurrency(Some(2), false);
 
     assert_eq!(concurrency.session_pool_size, 1);
     assert_eq!(concurrency.small_file_concurrency, 1);
@@ -380,7 +433,7 @@ fn directory_progress_accumulates_chunk_deltas_without_completion_double_count()
 
 #[test]
 fn directory_worker_count_is_bounded_by_file_count() {
-    let concurrency = sftp_directory_concurrency(None);
+    let concurrency = sftp_directory_concurrency(None, false);
 
     assert_eq!(sftp_directory_file_concurrency(0, concurrency), 1);
     assert_eq!(sftp_directory_file_concurrency(3, concurrency), 3);

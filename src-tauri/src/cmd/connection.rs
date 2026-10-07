@@ -6,7 +6,11 @@ use crate::core::{QuickCommandsImportResult, QuickCommandsImportSource, QuickCom
 use crate::error::{AppError, AppResult};
 use crate::utils::crypto;
 use base64::Engine;
-use std::collections::HashSet;
+#[cfg(test)]
+use nyaterm_core::services::{
+    normalize_connection_for_save, validate_proxy_jump_config, validate_rdp_config,
+    validate_sftp_settings_config, validate_vnc_config,
+};
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
@@ -90,7 +94,7 @@ pub fn import_connection_icon(
     Ok(icon)
 }
 
-fn import_connection_icon_data_url(path: &str) -> AppResult<String> {
+pub(crate) fn import_connection_icon_data_url(path: &str) -> AppResult<String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
         return Err(AppError::Config(
@@ -169,10 +173,6 @@ fn is_supported_connection_icon_format(format: image::ImageFormat) -> bool {
     )
 }
 
-fn normalize_connection_for_save(connection: &mut SavedConnection) {
-    config::migrate_legacy_ssh_agent_settings(connection);
-}
-
 fn validate_ssh_agent_forwarding_identity_inputs(
     forwarding_config: &config::SshAgentForwardingConfig,
 ) -> AppResult<()> {
@@ -197,67 +197,12 @@ pub async fn get_ssh_agent_forwarding_identities(
 }
 
 #[tauri::command]
-pub fn save_connection(
-    app: tauri::AppHandle,
-    mut connection: SavedConnection,
-) -> AppResult<String> {
-    let mut cfg = config::load_config(&app)?;
-
-    if connection.id.is_empty() {
-        connection.id = uuid::Uuid::new_v4().to_string();
-    }
-    let target_id = connection.id.clone();
-    let existing = cfg.connections.iter().find(|c| c.id == target_id).cloned();
-
-    normalize_connection_for_save(&mut connection);
-
-    config::validate_ssh_agent_settings(&connection.config)?;
-    validate_proxy_jump_config(&connection, &cfg.connections)?;
+pub fn save_connection(app: tauri::AppHandle, connection: SavedConnection) -> AppResult<String> {
     validate_local_terminal_config(&connection)?;
-    validate_ssh_algorithm_config(&connection)?;
-    validate_sftp_settings_config(&connection)?;
-    validate_rdp_config(&connection)?;
-    validate_vnc_config(&connection)?;
-
-    if let Some(ref mut auth) = connection.auth {
-        // password_id: Some("") means explicitly cleared, None means preserve existing
-        match auth.password_id.as_deref() {
-            Some("") => auth.password_id = None,
-            None => {
-                auth.password_id = existing
-                    .as_ref()
-                    .and_then(|e| e.auth.as_ref())
-                    .and_then(|a| a.password_id.clone());
-            }
-            _ => {}
-        }
-
-        // password: non-empty = encrypt new value, "" = explicitly clear, None = preserve
-        auth.password = match auth.password.as_deref() {
-            Some(plain) if !plain.is_empty() => Some(crypto::encrypt(plain)?),
-            Some("") => None,
-            None => existing
-                .as_ref()
-                .and_then(|e| e.auth.as_ref())
-                .and_then(|a| a.password.clone()),
-            _ => None,
-        };
-        auth.has_password = false;
-    }
-
-    if let Some(existing_connection) = existing.as_ref() {
-        connection.asset = existing_connection.asset.clone();
-    }
-
-    if let Some(ex) = cfg.connections.iter_mut().find(|c| c.id == target_id) {
-        *ex = connection;
-    } else {
-        cfg.connections.push(connection);
-    }
-    config::save_config(&app, &cfg)?;
+    let id = nyaterm_core::services::save_connection(&app, connection)?;
     let _ = app.emit("connections-changed", ());
-    schedule_cloud_sync_notify(app.clone());
-    Ok(target_id)
+    schedule_cloud_sync_notify(app);
+    Ok(id)
 }
 
 fn update_connection_icon_in_config(
@@ -413,37 +358,6 @@ pub fn update_connection_icon(
     Ok(())
 }
 
-fn validate_ssh_algorithm_config(connection: &SavedConnection) -> AppResult<()> {
-    if !matches!(connection.config, config::ConnectionType::Ssh { .. }) {
-        return Ok(());
-    }
-
-    let Some(preferences) = connection.ssh_algorithms.as_ref() else {
-        return Ok(());
-    };
-
-    crate::core::ssh::validate_ssh_algorithm_preferences(preferences)
-}
-
-fn validate_sftp_settings_config(connection: &SavedConnection) -> AppResult<()> {
-    if !matches!(connection.config, config::ConnectionType::Ssh { .. }) {
-        return Ok(());
-    }
-
-    let timeout_ms = connection.sftp.shell_detection_timeout_ms;
-    if !(config::MIN_SFTP_SHELL_DETECTION_TIMEOUT_MS..=config::MAX_SFTP_SHELL_DETECTION_TIMEOUT_MS)
-        .contains(&timeout_ms)
-    {
-        return Err(AppError::Config(format!(
-            "SFTP shell detection timeout must be between {} and {} ms",
-            config::MIN_SFTP_SHELL_DETECTION_TIMEOUT_MS,
-            config::MAX_SFTP_SHELL_DETECTION_TIMEOUT_MS
-        )));
-    }
-
-    Ok(())
-}
-
 fn validate_local_terminal_config(connection: &SavedConnection) -> AppResult<()> {
     let config::ConnectionType::LocalTerminal {
         shell_path,
@@ -471,101 +385,6 @@ fn validate_local_terminal_config(connection: &SavedConnection) -> AppResult<()>
     }
 
     crate::core::terminal_session::local::parse_shell_args(shell_args).map_err(AppError::Config)?;
-
-    Ok(())
-}
-
-fn validate_rdp_config(connection: &SavedConnection) -> AppResult<()> {
-    let config::ConnectionType::Rdp {
-        host,
-        port,
-        username,
-        security,
-        display,
-        clipboard,
-        reconnect,
-        ..
-    } = &connection.config
-    else {
-        return Ok(());
-    };
-
-    if host.trim().is_empty() {
-        return Err(AppError::Config("RDP host is required".to_string()));
-    }
-    if *port == 0 {
-        return Err(AppError::Config(
-            "RDP port must be between 1 and 65535".to_string(),
-        ));
-    }
-    if username.trim().is_empty() {
-        return Err(AppError::Config("RDP username is required".to_string()));
-    }
-    if !matches!(
-        security.certificate_policy.as_str(),
-        "strict" | "prompt" | "accept-temporarily"
-    ) {
-        return Err(AppError::Config(
-            "RDP certificate policy is invalid".to_string(),
-        ));
-    }
-    if !matches!(display.mode.as_str(), "fit-window" | "fixed" | "native") {
-        return Err(AppError::Config("RDP display mode is invalid".to_string()));
-    }
-    if !(640..=7680).contains(&display.width) || !(480..=4320).contains(&display.height) {
-        return Err(AppError::Config(
-            "RDP display size is outside the supported range".to_string(),
-        ));
-    }
-    if !matches!(display.color_depth, 16 | 24 | 32) {
-        return Err(AppError::Config("RDP color depth is invalid".to_string()));
-    }
-    if !matches!(clipboard.mode.as_str(), "disabled" | "text-only") {
-        return Err(AppError::Config(
-            "RDP clipboard mode is invalid".to_string(),
-        ));
-    }
-    if reconnect.max_attempts > 20 {
-        return Err(AppError::Config(
-            "RDP reconnect attempts must be 20 or fewer".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_vnc_config(connection: &SavedConnection) -> AppResult<()> {
-    let config::ConnectionType::Vnc {
-        host,
-        port,
-        security,
-        display,
-        reconnect,
-        ..
-    } = &connection.config
-    else {
-        return Ok(());
-    };
-
-    if host.trim().is_empty() {
-        return Err(AppError::Config("VNC host is required".to_string()));
-    }
-    if *port == 0 {
-        return Err(AppError::Config(
-            "VNC port must be between 1 and 65535".to_string(),
-        ));
-    }
-    if !matches!(security.mode.as_str(), "auto" | "vnc-auth" | "none") {
-        return Err(AppError::Config("VNC security mode is invalid".to_string()));
-    }
-    if !matches!(display.scale_mode.as_str(), "fit" | "actual" | "stretch") {
-        return Err(AppError::Config("VNC scale mode is invalid".to_string()));
-    }
-    if reconnect.max_attempts > 20 {
-        return Err(AppError::Config(
-            "VNC reconnect attempts must be 20 or fewer".to_string(),
-        ));
-    }
 
     Ok(())
 }
@@ -609,34 +428,9 @@ fn resolve_text_secret_input(
         .map_err(|e| AppError::Config(format!("failed to read {file_error_label} file: {e}")))
 }
 
-fn missing_private_key_passphrase_error(error: &russh::keys::Error) -> bool {
-    let message = error.to_string().to_lowercase();
-    message.contains("encrypted")
-        || message.contains("passphrase")
-        || message.contains("password")
-        || message.contains("cipher")
-}
-
-fn validate_private_key_content(content: &str, passphrase: Option<&str>) -> AppResult<()> {
-    let usable_passphrase = passphrase.filter(|value| !value.is_empty());
-    match russh::keys::decode_secret_key(content, usable_passphrase) {
-        Ok(_) => Ok(()),
-        Err(error)
-            if usable_passphrase.is_none() && missing_private_key_passphrase_error(&error) =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(AppError::Config(format!(
-            "invalid SSH private key: {error}"
-        ))),
-    }
-}
-
-fn validate_certificate_content(content: &str) -> AppResult<()> {
-    russh::keys::Certificate::from_openssh(content)
-        .map(|_| ())
-        .map_err(|error| AppError::Config(format!("invalid OpenSSH certificate: {error}")))
-}
+use nyaterm_core::services::{
+    derive_public_key_for_copy, validate_certificate_content, validate_private_key_content,
+};
 
 fn resolve_private_key_for_save(
     key: &SshKey,
@@ -669,103 +463,24 @@ fn resolve_certificate_for_save(
     crypto::encrypt(&content).map(Some)
 }
 
-fn validate_proxy_jump_config(
-    connection: &SavedConnection,
-    existing_connections: &[SavedConnection],
-) -> AppResult<()> {
-    let proxy_jump_id = connection
-        .network
-        .as_ref()
-        .and_then(|network| network.proxy_jump_id.as_deref());
-
-    let Some(proxy_jump_id) = proxy_jump_id else {
-        return Ok(());
-    };
-
-    if !matches!(
-        connection.config,
-        config::ConnectionType::Ssh { .. }
-            | config::ConnectionType::Rdp { .. }
-            | config::ConnectionType::Vnc { .. }
-    ) {
-        return Err(AppError::Config(
-            "ProxyJump is only supported for SSH, RDP, and VNC connections".to_string(),
-        ));
-    }
-
-    let mut visited = HashSet::new();
-    visited.insert(connection.id.as_str());
-    let mut current_jump_id = proxy_jump_id;
-
-    loop {
-        if !visited.insert(current_jump_id) {
-            if connection.id == current_jump_id {
-                return Err(AppError::Config(
-                    "A connection cannot use itself as a jump host".to_string(),
-                ));
-            }
-            return Err(AppError::Config(format!(
-                "ProxyJump chain contains a cycle at '{}'",
-                current_jump_id
-            )));
-        }
-
-        let jump_connection =
-            find_connection_for_proxy_jump(connection, existing_connections, current_jump_id)
-                .ok_or_else(|| {
-                    AppError::Config(format!("Jump host '{}' not found", current_jump_id))
-                })?;
-
-        if !matches!(jump_connection.config, config::ConnectionType::Ssh { .. }) {
-            return Err(AppError::Config(
-                "Only SSH connections can be used as jump hosts".to_string(),
-            ));
-        }
-
-        let Some(next_jump_id) = jump_connection
-            .network
-            .as_ref()
-            .and_then(|network| network.proxy_jump_id.as_deref())
-        else {
-            break;
-        };
-
-        current_jump_id = next_jump_id;
-    }
-
-    Ok(())
-}
-
-fn find_connection_for_proxy_jump<'a>(
-    edited_connection: &'a SavedConnection,
-    existing_connections: &'a [SavedConnection],
-    id: &str,
-) -> Option<&'a SavedConnection> {
-    if edited_connection.id == id {
-        return Some(edited_connection);
-    }
-
-    existing_connections
-        .iter()
-        .find(|candidate| candidate.id == id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        CONNECTION_ICON_MAX_BYTES, delete_group_from_config, import_connection_icon_data_url,
+        CONNECTION_ICON_MAX_BYTES, SavedAccountSummary, delete_group_from_config,
+        derive_public_key_for_copy, import_connection_icon_data_url,
         import_connection_icon_from_path, normalize_connection_for_save,
-        resolve_private_key_for_save, resolve_text_secret_input,
+        resolve_account_password_update, resolve_private_key_for_save, resolve_text_secret_input,
         update_connection_asset_from_monitoring_in_config, update_connection_icon_in_config,
         validate_certificate_content, validate_local_terminal_config, validate_private_key_content,
-        validate_proxy_jump_config, validate_sftp_settings_config,
+        validate_proxy_jump_config, validate_rdp_config, validate_sftp_settings_config,
         validate_ssh_agent_forwarding_identity_inputs, validate_vnc_config,
     };
     use crate::config::{
         AiExecutionProfile, AssetAccelerator, AssetAcceleratorType, AssetDisk, AssetDiskPurpose,
-        AssetMetadata, ConnectionAuth, ConnectionNetwork, ConnectionType, Group, SavedConnection,
-        SessionsConfig, SftpSettings, SshKey, VncClipboardSettings, VncDisplaySettings,
-        VncReconnectSettings, VncSecuritySettings,
+        AssetMetadata, ConnectionAuth, ConnectionNetwork, ConnectionType, Group,
+        RdpClipboardSettings, RdpDisplaySettings, RdpReconnectSettings, RdpSecuritySettings,
+        SavedConnection, SavedPassword, SessionsConfig, SftpSettings, SshKey, VncClipboardSettings,
+        VncDisplaySettings, VncReconnectSettings, VncSecuritySettings,
     };
     use base64::Engine;
     use std::fs;
@@ -785,6 +500,51 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
 7/wNsnDM0T7nLv/Q==
 -----END OPENSSH PRIVATE KEY-----";
 
+    #[test]
+    fn account_password_update_supports_preserve_replace_and_delete() {
+        crate::utils::crypto::set_master_password(None);
+        let existing = crate::utils::crypto::encrypt("old-secret").expect("encrypt existing");
+
+        assert_eq!(
+            resolve_account_password_update(None, Some(&existing)).expect("preserve"),
+            Some(existing.clone())
+        );
+
+        let replacement = resolve_account_password_update(Some("new-secret"), Some(&existing))
+            .expect("replace")
+            .expect("replacement ciphertext");
+        assert_eq!(
+            crate::utils::crypto::decrypt(&replacement).expect("decrypt replacement"),
+            "new-secret"
+        );
+
+        assert_eq!(
+            resolve_account_password_update(Some(""), Some(&existing)).expect("delete"),
+            None
+        );
+        assert_eq!(
+            resolve_account_password_update(Some(""), None).expect("empty new account"),
+            None
+        );
+    }
+
+    #[test]
+    fn saved_account_list_redacts_password_but_keeps_metadata() {
+        let summary = SavedAccountSummary::from(SavedPassword {
+            sort_order: 0,
+            id: "account-1".to_string(),
+            name: "Production".to_string(),
+            username: "admin".to_string(),
+            password: Some("encrypted-secret".to_string()),
+            has_password: true,
+        });
+        let serialized = serde_json::to_value(&summary).expect("serialize account summary");
+
+        assert_eq!(serialized["username"], "admin");
+        assert_eq!(serialized["has_password"], true);
+        assert!(serialized.get("password").is_none());
+    }
+
     fn temp_connection_icon_path(extension: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -800,6 +560,7 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
             config: ConnectionType::Vnc {
                 host: "example.com".to_string(),
                 port: 5900,
+                username: String::new(),
                 security: VncSecuritySettings::default(),
                 display: VncDisplaySettings::default(),
                 clipboard: VncClipboardSettings::default(),
@@ -809,6 +570,7 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
             },
             group_id: None,
             description: None,
+            tags: Vec::new(),
             sort_order: 0,
             icon: None,
             icon_auto_detect: None,
@@ -860,6 +622,52 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
         assert!(validate_vnc_config(&connection).is_err());
     }
 
+    #[test]
+    fn validates_rdp_file_clipboard_mode() {
+        let mut connection = SavedConnection {
+            id: "rdp-1".to_string(),
+            name: "RDP".to_string(),
+            config: ConnectionType::Rdp {
+                host: "example.com".to_string(),
+                port: 3389,
+                username: "administrator".to_string(),
+                domain: String::new(),
+                security: RdpSecuritySettings::default(),
+                display: RdpDisplaySettings::default(),
+                clipboard: RdpClipboardSettings {
+                    mode: "text-and-files".to_string(),
+                },
+                reconnect: RdpReconnectSettings::default(),
+            },
+            group_id: None,
+            description: None,
+            tags: Vec::new(),
+            sort_order: 0,
+            icon: None,
+            icon_auto_detect: None,
+            auth: None,
+            network: None,
+            post_login: None,
+            recording: None,
+            ssh_algorithms: None,
+            ssh_profile: Default::default(),
+            terminal_type: None,
+            sftp: SftpSettings::default(),
+            asset: None,
+            created_at_ms: None,
+            updated_at_ms: None,
+            last_used_at_ms: None,
+        };
+
+        assert!(validate_rdp_config(&connection).is_ok());
+        if let ConnectionType::Rdp { clipboard, .. } = &mut connection.config {
+            clipboard.mode = "files-only".to_string();
+        } else {
+            panic!("expected RDP connection");
+        }
+        assert!(validate_rdp_config(&connection).is_err());
+    }
+
     fn ssh_connection(id: &str, proxy_jump_id: Option<&str>) -> SavedConnection {
         SavedConnection {
             id: id.to_string(),
@@ -878,6 +686,7 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
             },
             group_id: None,
             description: None,
+            tags: Vec::new(),
             sort_order: 0,
             icon: None,
             icon_auto_detect: None,
@@ -921,6 +730,7 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
             },
             group_id: None,
             description: None,
+            tags: Vec::new(),
             sort_order: 0,
             icon: None,
             icon_auto_detect: None,
@@ -956,6 +766,7 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
             },
             group_id: None,
             description: None,
+            tags: Vec::new(),
             sort_order: 0,
             icon: None,
             icon_auto_detect: None,
@@ -1020,6 +831,7 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
         key_file_path: Option<&str>,
     ) -> SshKey {
         SshKey {
+            sort_order: 0,
             id: id.to_string(),
             name: format!("Key {id}"),
             key: None,
@@ -1115,6 +927,46 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
     fn encrypted_private_key_without_passphrase_is_accepted() {
         validate_private_key_content(TEST_ENCRYPTED_PRIVATE_KEY, None)
             .expect("encrypted private key can be saved without passphrase");
+    }
+
+    #[test]
+    fn derive_public_key_for_copy_matches_private_key_public_key() {
+        let private_key = russh::keys::decode_secret_key(TEST_PRIVATE_KEY, None)
+            .expect("test private key should decode");
+        let expected = private_key
+            .public_key()
+            .to_openssh()
+            .expect("test public key should encode");
+
+        let actual = derive_public_key_for_copy(TEST_PRIVATE_KEY, None)
+            .expect("public key should be derived from the private key");
+
+        ssh_key::PublicKey::from_openssh(&actual).expect("derived key should be valid OpenSSH");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn derive_public_key_for_copy_reads_encrypted_openssh_public_section() {
+        let container = ssh_key::PrivateKey::from_openssh(TEST_ENCRYPTED_PRIVATE_KEY)
+            .expect("encrypted OpenSSH container should parse without decrypting its payload");
+        let expected = container
+            .public_key()
+            .to_openssh()
+            .expect("container public key should encode");
+
+        let actual = derive_public_key_for_copy(TEST_ENCRYPTED_PRIVATE_KEY, None)
+            .expect("public key should be readable without a stored passphrase");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn derive_public_key_for_copy_rejects_invalid_private_key() {
+        let invalid = "-----BEGIN PRIVATE KEY-----\nnot-a-private-key\n-----END PRIVATE KEY-----";
+        let error = derive_public_key_for_copy(invalid, None)
+            .expect_err("invalid private-key data must not produce a public key");
+
+        assert!(!error.to_string().contains("BEGIN PRIVATE KEY"));
     }
 
     #[test]
@@ -1381,9 +1233,12 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
         let mut target = ssh_connection("target", Some("proxy"));
         target.group_id = Some("group".to_string());
         target.description = Some("keep description".to_string());
+        target.tags = vec!["preserve".to_string()];
         target.sort_order = 42;
         target.auth = Some(ConnectionAuth {
             mode: "key".to_string(),
+            account_id: None,
+            password_source: None,
             password_id: Some("password-id".to_string()),
             password: Some("encrypted".to_string()),
             has_password: true,
@@ -1421,7 +1276,6 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
                 count: Some(1),
                 purpose: Some(AssetDiskPurpose::System),
             }]),
-            tags: Some(vec!["preserve".to_string()]),
             notes: Some("preserve notes".to_string()),
             updated_at: Some("2026-08-03T01:00:00.000Z".to_string()),
             ..Default::default()
@@ -1449,7 +1303,6 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
                     count: Some(4),
                     memory_bytes: Some(80 * 1024 * 1024 * 1024),
                 }]),
-                tags: Some(vec!["ignored".to_string()]),
                 notes: Some("ignored".to_string()),
                 updated_at: Some("2026-08-03T02:00:00.000Z".to_string()),
                 ..Default::default()
@@ -1463,6 +1316,7 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
         assert_eq!(updated.config, original.config);
         assert_eq!(updated.group_id, original.group_id);
         assert_eq!(updated.description, original.description);
+        assert_eq!(updated.tags, vec!["preserve".to_string()]);
         assert_eq!(updated.sort_order, original.sort_order);
         assert_eq!(
             updated.auth.as_ref().unwrap().key_id,
@@ -1485,7 +1339,6 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
         assert_eq!(asset.cpu_model.as_deref(), Some("New CPU"));
         assert_eq!(asset.cpu_cores, Some(16));
         assert_eq!(asset.memory_bytes, Some(64 * 1024 * 1024 * 1024));
-        assert_eq!(asset.tags.as_deref(), Some(&["preserve".to_string()][..]));
         assert_eq!(asset.notes.as_deref(), Some("preserve notes"));
         assert_eq!(
             asset.updated_at.as_deref(),
@@ -1540,6 +1393,21 @@ e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
             assert!(forwarding.enabled, "mode={mode}");
             assert!(forwarding.sources.stored_keys, "mode={mode}");
         }
+    }
+
+    #[test]
+    fn save_boundary_normalizes_connection_tags() {
+        let mut connection = connection_with_auth_mode("password");
+        connection.tags = vec![
+            " production ".to_string(),
+            String::new(),
+            "production".to_string(),
+            "Production".to_string(),
+        ];
+
+        normalize_connection_for_save(&mut connection);
+
+        assert_eq!(connection.tags, vec!["production", "Production"]);
     }
 
     #[cfg(unix)]
@@ -1652,6 +1520,14 @@ pub fn get_ssh_key_private_key(app: tauri::AppHandle, id: String) -> AppResult<O
 }
 
 #[tauri::command]
+pub fn get_ssh_key_public_key(app: tauri::AppHandle, id: String) -> AppResult<String> {
+    let key = config::load_key_by_id(&app, &id)?;
+    let private_key = config::decrypt_key_pem(&key)?
+        .ok_or_else(|| AppError::Config("SSH private key data is missing".to_string()))?;
+    derive_public_key_for_copy(&private_key, key.passphrase.as_deref())
+}
+
+#[tauri::command]
 pub fn save_ssh_key(app: tauri::AppHandle, mut key: SshKey) -> AppResult<String> {
     let mut cfg = config::load_keys(&app)?;
 
@@ -1661,6 +1537,7 @@ pub fn save_ssh_key(app: tauri::AppHandle, mut key: SshKey) -> AppResult<String>
     let target_id = key.id.clone();
     let existing = cfg.keys.iter().find(|k| k.id == target_id);
 
+    key.sort_order = config::key_sort_order(&cfg, &target_id);
     key.key = resolve_private_key_for_save(&key, existing)?;
     if key.key.is_none() {
         return Err(AppError::Config("SSH private key is required".to_string()));
@@ -1691,6 +1568,21 @@ pub fn delete_ssh_key(app: tauri::AppHandle, id: String) -> AppResult<()> {
     config::save_keys(&app, &cfg)?;
     schedule_cloud_sync_notify(app.clone());
     Ok(())
+}
+
+#[tauri::command]
+pub fn get_known_hosts() -> AppResult<Vec<crate::storage::KnownHostEntry>> {
+    crate::storage::list_known_hosts()
+}
+
+#[tauri::command]
+pub fn delete_known_host(id: String) -> AppResult<()> {
+    crate::storage::delete_known_host(&id)
+}
+
+#[tauri::command]
+pub fn clear_known_hosts() -> AppResult<()> {
+    crate::storage::clear_known_hosts()
 }
 
 #[tauri::command]
@@ -1904,18 +1796,51 @@ pub fn import_quick_commands(
 
 // --- Password management ---
 
-#[tauri::command]
-pub fn get_saved_passwords(app: tauri::AppHandle) -> AppResult<Vec<SavedPassword>> {
-    let mut cfg = config::load_passwords(&app)?;
-    for p in &mut cfg.passwords {
-        p.password = None;
+#[derive(Debug, serde::Serialize)]
+pub struct SavedAccountSummary {
+    id: String,
+    sort_order: i32,
+    name: String,
+    username: String,
+    has_password: bool,
+}
+
+impl From<SavedPassword> for SavedAccountSummary {
+    fn from(entry: SavedPassword) -> Self {
+        Self {
+            id: entry.id,
+            sort_order: entry.sort_order,
+            name: entry.name,
+            username: entry.username,
+            has_password: entry.has_password,
+        }
     }
-    Ok(cfg.passwords)
+}
+
+#[tauri::command]
+pub fn get_saved_passwords(app: tauri::AppHandle) -> AppResult<Vec<SavedAccountSummary>> {
+    Ok(config::load_passwords(&app)?
+        .passwords
+        .into_iter()
+        .map(SavedAccountSummary::from)
+        .collect())
 }
 
 #[tauri::command]
 pub fn get_saved_password_value(app: tauri::AppHandle, id: String) -> AppResult<Option<String>> {
     Ok(config::load_password_by_id(&app, &id)?.password)
+}
+
+fn resolve_account_password_update(
+    incoming: Option<&str>,
+    existing_ciphertext: Option<&str>,
+) -> AppResult<Option<String>> {
+    match incoming {
+        Some(plain) if !plain.is_empty() => crypto::encrypt(plain).map(Some),
+        Some("") => Ok(None),
+        None => Ok(existing_ciphertext.map(str::to_string)),
+        _ => Ok(None),
+    }
 }
 
 #[tauri::command]
@@ -1928,10 +1853,11 @@ pub fn save_password(app: tauri::AppHandle, mut entry: SavedPassword) -> AppResu
     let target_id = entry.id.clone();
     let existing = cfg.passwords.iter().find(|p| p.id == target_id);
 
-    entry.password = match entry.password.as_deref() {
-        Some(plain) if !plain.is_empty() => Some(crypto::encrypt(plain)?),
-        _ => existing.and_then(|e| e.password.clone()),
-    };
+    entry.sort_order = config::password_sort_order(&cfg, &target_id);
+    entry.password = resolve_account_password_update(
+        entry.password.as_deref(),
+        existing.and_then(|entry| entry.password.as_deref()),
+    )?;
 
     if let Some(ex) = cfg.passwords.iter_mut().find(|p| p.id == target_id) {
         *ex = entry;
@@ -1949,5 +1875,47 @@ pub fn delete_password(app: tauri::AppHandle, id: String) -> AppResult<()> {
     cfg.passwords.retain(|p| p.id != id);
     config::save_passwords(&app, &cfg)?;
     schedule_cloud_sync_notify(app.clone());
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+pub struct SecretSortOrderUpdate {
+    pub id: String,
+    pub sort_order: i32,
+}
+
+#[tauri::command]
+pub fn reorder_passwords(
+    app: tauri::AppHandle,
+    updates: Vec<SecretSortOrderUpdate>,
+) -> AppResult<()> {
+    let mut cfg = config::load_passwords(&app)?;
+    config::reorder_passwords(
+        &mut cfg,
+        &updates
+            .into_iter()
+            .map(|update| (update.id, update.sort_order))
+            .collect::<Vec<_>>(),
+    );
+    config::save_passwords(&app, &cfg)?;
+    schedule_cloud_sync_notify(app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn reorder_ssh_keys(
+    app: tauri::AppHandle,
+    updates: Vec<SecretSortOrderUpdate>,
+) -> AppResult<()> {
+    let mut cfg = config::load_keys(&app)?;
+    config::reorder_ssh_keys(
+        &mut cfg,
+        &updates
+            .into_iter()
+            .map(|update| (update.id, update.sort_order))
+            .collect::<Vec<_>>(),
+    );
+    config::save_keys(&app, &cfg)?;
+    schedule_cloud_sync_notify(app);
     Ok(())
 }

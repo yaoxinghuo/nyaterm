@@ -21,6 +21,8 @@ interface GutterLine {
 
 interface GutterLayout {
   lines: GutterLine[];
+  maxLineNumberDigits: number;
+  sessionId?: string;
   rowHeight: number;
   topPadding: number;
   fontFamily: string;
@@ -28,11 +30,33 @@ interface GutterLayout {
   cellWidth: number;
 }
 
+function layoutsEqual(previous: GutterLayout, next: GutterLayout): boolean {
+  return (
+    previous.maxLineNumberDigits === next.maxLineNumberDigits &&
+    previous.sessionId === next.sessionId &&
+    previous.rowHeight === next.rowHeight &&
+    previous.topPadding === next.topPadding &&
+    previous.fontFamily === next.fontFamily &&
+    previous.fontSize === next.fontSize &&
+    previous.cellWidth === next.cellWidth &&
+    previous.lines.length === next.lines.length &&
+    previous.lines.every((line, index) => {
+      const nextLine = next.lines[index];
+      return (
+        line.key === nextLine.key &&
+        line.lineNumber === nextLine.lineNumber &&
+        line.timestamp === nextLine.timestamp
+      );
+    })
+  );
+}
+
 const DEFAULT_TIMESTAMP_FORMAT = "[HH:mm:ss]";
 const MAX_TIMESTAMP_FORMAT_LENGTH = 64;
 const TIMESTAMP_WIDTH_SAMPLE_MS = new Date(2099, 11, 28, 23, 59, 59, 999).getTime();
 const GUTTER_COLUMN_GAP = 12;
 const GUTTER_RIGHT_PADDING = 8;
+const MAX_TIMESTAMP_LOOKBACK_ROWS = 512;
 
 function normalizeTimestampFormat(format: string | undefined): string {
   if (!format || format.trim().length === 0) {
@@ -122,17 +146,23 @@ export default function TerminalGutter({
   sessionId,
   suspended = false,
 }: TerminalGutterProps) {
-  const rafRef = useRef(0);
+  const rafRef = useRef<number | null>(null);
   const viewportYRef = useRef(0);
+  const [alternateScreen, setAlternateScreen] = useState(
+    terminalRef.current?.buffer.active.type === "alternate",
+  );
 
   const [layout, setLayout] = useState<GutterLayout>({
     lines: [],
+    maxLineNumberDigits: 1,
+    sessionId,
     rowHeight: 18,
     topPadding: 0,
     fontFamily: "inherit",
     fontSize: 12,
     cellWidth: 8,
   });
+  const layoutRef = useRef(layout);
 
   const computeLines = useCallback(() => {
     if (suspended) return;
@@ -141,6 +171,7 @@ export default function TerminalGutter({
 
     const el = terminal.element;
     const buf = terminal.buffer.active;
+    if (buf.type === "alternate") return;
     const viewport = el.querySelector(".xterm-viewport") as HTMLElement | null;
 
     const screen = el.querySelector(".xterm-screen") as HTMLElement | null;
@@ -161,13 +192,13 @@ export default function TerminalGutter({
     const viewportY = Math.max(0, Math.min(buf.baseY, viewportYRef.current || buf.viewportY));
     const rows = terminal.rows;
     const cursorAbsoluteY = buf.baseY + buf.cursorY;
-    const lineOffset = buf.type === "alternate" ? 0 : getLineOffset();
+    const lineOffset = getLineOffset();
 
     const resolveTimestamp = (bufferLine: number): number | undefined => {
       let y = bufferLine;
 
-      while (y >= 0) {
-        const ts = buf.type === "alternate" ? undefined : lineTimestamps.get(lineOffset + y);
+      while (y >= 0 && bufferLine - y < MAX_TIMESTAMP_LOOKBACK_ROWS) {
+        const ts = lineTimestamps.get(lineOffset + y);
         if (ts) return ts;
 
         const line = buf.getLine(y);
@@ -185,7 +216,7 @@ export default function TerminalGutter({
       const line = buf.getLine(bufferLine);
       const isWrapped = line?.isWrapped ?? false;
       const hasRenderedRow = bufferLine <= cursorAbsoluteY;
-      const ts = resolveTimestamp(bufferLine);
+      const ts = showTimestamps ? resolveTimestamp(bufferLine) : undefined;
       const logicalLine = lineOffset + bufferLine;
 
       nextLines.push({
@@ -198,14 +229,29 @@ export default function TerminalGutter({
       });
     }
 
-    setLayout({
+    const visibleLineNumberDigits = nextLines.reduce(
+      (max, line) => Math.max(max, line.lineNumber.length),
+      1,
+    );
+
+    const previous = layoutRef.current;
+    const nextLayout: GutterLayout = {
       lines: nextLines,
+      maxLineNumberDigits:
+        previous.sessionId === sessionId
+          ? Math.max(previous.maxLineNumberDigits, visibleLineNumberDigits)
+          : visibleLineNumberDigits,
+      sessionId,
       rowHeight,
       topPadding,
       fontFamily: String(terminal.options.fontFamily ?? "inherit"),
       fontSize,
       cellWidth,
-    });
+    };
+    if (!layoutsEqual(previous, nextLayout)) {
+      layoutRef.current = nextLayout;
+      setLayout(nextLayout);
+    }
   }, [
     suspended,
     terminalRef,
@@ -214,55 +260,81 @@ export default function TerminalGutter({
     showLineNumbers,
     showTimestamps,
     timestampFormat,
+    sessionId,
   ]);
 
   const scheduleUpdate = useCallback(() => {
-    cancelAnimationFrame(rafRef.current);
+    if (
+      suspended ||
+      terminalRef.current?.buffer.active.type === "alternate" ||
+      rafRef.current !== null
+    ) {
+      return;
+    }
     rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
       computeLines();
     });
-  }, [computeLines]);
+  }, [computeLines, suspended, terminalRef]);
 
   useEffect(() => {
     if (suspended) {
-      cancelAnimationFrame(rafRef.current);
       return;
     }
 
     let disposed = false;
     let handleExternalRefresh: ((event: Event) => void) | null = null;
     let disposables: Array<{ dispose: () => void }> = [];
+    let bufferDisposable: { dispose: () => void } | undefined;
+    const cancelUpdate = () => {
+      if (rafRef.current !== null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+    const disposeRefreshListeners = () => {
+      disposables.forEach((d) => {
+        d.dispose();
+      });
+      disposables = [];
+    };
 
     const attach = () => {
       if (disposed) return;
 
       const terminal = terminalRef.current;
       if (!terminal) {
-        rafRef.current = requestAnimationFrame(attach);
+        rafRef.current = requestAnimationFrame(() => {
+          rafRef.current = null;
+          attach();
+        });
         return;
       }
 
-      viewportYRef.current = terminal.buffer.active.viewportY;
-      scheduleUpdate();
+      const syncBuffer = () => {
+        const isAlternate = terminal.buffer.active.type === "alternate";
+        setAlternateScreen(isAlternate);
+        disposeRefreshListeners();
+        cancelUpdate();
+        if (isAlternate) return;
 
-      disposables = [
-        terminal.onRender(() => {
+        const refresh = () => {
           viewportYRef.current = terminal.buffer.active.viewportY;
           scheduleUpdate();
-        }),
-        terminal.onWriteParsed(() => {
-          viewportYRef.current = terminal.buffer.active.viewportY;
-          scheduleUpdate();
-        }),
-        terminal.onScroll((viewportY) => {
-          viewportYRef.current = viewportY;
-          scheduleUpdate();
-        }),
-        terminal.onResize(() => {
-          viewportYRef.current = terminal.buffer.active.viewportY;
-          scheduleUpdate();
-        }),
-      ];
+        };
+        disposables = [
+          terminal.onRender(refresh),
+          terminal.onWriteParsed(refresh),
+          terminal.onScroll((viewportY) => {
+            viewportYRef.current = viewportY;
+            scheduleUpdate();
+          }),
+          terminal.onResize(refresh),
+        ];
+        refresh();
+      };
+      bufferDisposable = terminal.buffer.onBufferChange(syncBuffer);
+      syncBuffer();
 
       handleExternalRefresh = (event: Event) => {
         const customEvent = event as CustomEvent<{ sessionId?: string }>;
@@ -282,31 +354,21 @@ export default function TerminalGutter({
 
     return () => {
       disposed = true;
-      cancelAnimationFrame(rafRef.current);
-      disposables.forEach((d) => {
-        d.dispose();
-      });
+      cancelUpdate();
+      disposeRefreshListeners();
+      bufferDisposable?.dispose();
       if (handleExternalRefresh) {
         window.removeEventListener("nyaterm:refresh-gutter", handleExternalRefresh);
       }
     };
   }, [suspended, terminalRef, scheduleUpdate, sessionId]);
 
-  useEffect(() => {
-    if (suspended) return;
-    scheduleUpdate();
-  }, [scheduleUpdate, suspended]);
-
   if (suspended || (!showLineNumbers && !showTimestamps)) {
     return null;
   }
 
-  const maxVisibleLineNumber = layout.lines.reduce((max, line) => {
-    const value = Number(line.lineNumber);
-    return Number.isFinite(value) ? Math.max(max, value) : max;
-  }, 1);
   const lineNumWidth = showLineNumbers
-    ? Math.max(Math.ceil(layout.cellWidth * String(maxVisibleLineNumber).length) + 2, 24)
+    ? Math.max(Math.ceil(layout.cellWidth * layout.maxLineNumberDigits) + 2, 24)
     : 0;
   const timestampTemplate = formatTimestamp(TIMESTAMP_WIDTH_SAMPLE_MS, timestampFormat);
   const tsWidth = showTimestamps ? Math.ceil(layout.cellWidth * timestampTemplate.length) + 2 : 0;
@@ -319,6 +381,8 @@ export default function TerminalGutter({
       style={{
         boxSizing: "content-box",
         width: gutterWidth,
+        // Keep the terminal width stable while full-screen TUIs own the buffer.
+        visibility: alternateScreen ? "hidden" : undefined,
         paddingTop: layout.topPadding,
         borderColor:
           "color-mix(in srgb, var(--df-terminal-fg, var(--df-text)) 18%, var(--df-terminal-surface-bg))",

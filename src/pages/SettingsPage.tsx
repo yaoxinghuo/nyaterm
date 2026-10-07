@@ -1,4 +1,5 @@
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { supportsSettingsTab } from "@/lib/backend/runtime";
+import { getCurrentWindow } from "@/lib/backend/platform/window";
 import {
   type ComponentType,
   useCallback,
@@ -118,9 +119,16 @@ export default function SettingsPage() {
   const requestedInitialTab = params.get("tab") || "general";
   const ownerWindowLabel = params.get("owner") || "main";
   const initialTab = normalizeSettingsTab(requestedInitialTab);
-  const [activeTab, setActiveTab] = useState(initialTab);
-  const { draftSettings, isDirty, updateDraftSettings, acceptSavedSettings, discardDraftSettings } =
-    useSettingsDraftState<AppSettings>(committedSettings);
+  const [activeTab, setActiveTab] = useState(
+    supportsSettingsTab(initialTab) ? initialTab : "general",
+  );
+  const {
+    draftSettings,
+    isDirty,
+    updateDraftSettings,
+    acceptSavedSettings,
+    discardDraftSettings,
+  } = useSettingsDraftState<AppSettings>(committedSettings);
   const [isSaving, setIsSaving] = useState(false);
   const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
 
@@ -137,8 +145,13 @@ export default function SettingsPage() {
   useChildWindowCommand<{ tab: string; targetWindowLabel?: string | null }>(
     CHILD_WINDOW_COMMANDS.settingsOpenTab,
     (payload) => {
-      if (payload.targetWindowLabel && payload.targetWindowLabel !== ownerWindowLabel) return;
-      setActiveTab(normalizeSettingsTab(payload.tab));
+      if (
+        payload.targetWindowLabel &&
+        payload.targetWindowLabel !== ownerWindowLabel
+      )
+        return;
+      const tab = normalizeSettingsTab(payload.tab);
+      if (supportsSettingsTab(tab)) setActiveTab(tab);
     },
   );
 
@@ -305,7 +318,13 @@ export default function SettingsPage() {
     rules: FiBook,
   };
 
-  function DynamicIcon({ name, className }: { name: string; className?: string }) {
+  function DynamicIcon({
+    name,
+    className,
+  }: {
+    name: string;
+    className?: string;
+  }) {
     const Icon = iconMap[name];
     if (!Icon) return null;
     return <Icon className={className} />;
@@ -435,13 +454,24 @@ export default function SettingsPage() {
     await saveDraftSettings(false);
   }, [isDirty, isSaving, saveDraftSettings]);
 
+  const isDirtyRef = useRef(isDirty);
+
+  useEffect(() => {
+    isDirtyRef.current = isDirty;
+  }, [isDirty]);
+
+  // Register the close-requested listener exactly once for the page lifetime. Tauri only
+  // delivers close-requested while a JS listener exists: re-registering on isDirty churn
+  // leaves a gap where the event arrives after the old listener is gone and the fresh one
+  // is not registered yet, so the close is silently dropped until the next close() call.
   useEffect(() => {
     const currentWindow = getCurrentWindow();
     let unlisten: (() => void) | undefined;
+    let disposed = false;
 
     currentWindow
       .onCloseRequested(async (event) => {
-        if (forceCloseRef.current || !isDirty) {
+        if (forceCloseRef.current || !isDirtyRef.current) {
           await prepareForModalChildClose(currentWindow.label).catch(() => {});
           return;
         }
@@ -450,14 +480,19 @@ export default function SettingsPage() {
         setCloseConfirmOpen(true);
       })
       .then((dispose) => {
+        if (disposed) {
+          dispose();
+          return;
+        }
         unlisten = dispose;
       })
       .catch(() => {});
 
     return () => {
+      disposed = true;
       unlisten?.();
     };
-  }, [isDirty]);
+  }, []);
 
   return (
     <div
@@ -506,6 +541,7 @@ export default function SettingsPage() {
                         <Button
                           key={tabId}
                           variant="ghost"
+                          disabled={!supportsSettingsTab(tabId)}
                           onClick={() => setActiveTab(tabId)}
                           title={category.label}
                           className={`h-auto w-full justify-center gap-3 rounded-xl border px-2 py-2.5 text-sm font-semibold transition-colors sm:justify-start sm:px-3 ${
@@ -567,6 +603,7 @@ export default function SettingsPage() {
                               <Button
                                 key={tabId}
                                 variant="ghost"
+                                disabled={!supportsSettingsTab(tabId)}
                                 onClick={() => setActiveTab(tabId)}
                                 title={tabItem.label}
                                 className={`h-auto w-full justify-center gap-3 rounded-lg border px-2 py-2 text-[0.85rem] font-medium transition-colors sm:justify-start sm:px-3 ${

@@ -88,6 +88,8 @@ $env:NYATERM_GITHUB_GIST_CLIENT_ID = "your_client_id"
 pnpm tauri build
 ```
 
+Third-party distributors can set `NYATERM_PACKAGE_MANAGER` at build time to identify the package manager. The app includes this value in support information and leaves updates to the external package manager; leave it unset for ordinary development builds.
+
 ## Available Scripts
 
 | Command | Description |

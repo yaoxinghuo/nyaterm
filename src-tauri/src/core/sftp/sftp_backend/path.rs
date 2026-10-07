@@ -7,6 +7,23 @@ impl SftpBackend {
         ssh_handle: Arc<SshConnectionHandles>,
         encoding: &str,
         pipeline_depth_override: Option<u32>,
+        shell_available: bool,
+    ) -> Self {
+        Self::new_with_compatibility_session(
+            ssh_handle,
+            encoding,
+            pipeline_depth_override,
+            None,
+            shell_available,
+        )
+    }
+
+    pub(super) fn new_with_compatibility_session(
+        ssh_handle: Arc<SshConnectionHandles>,
+        encoding: &str,
+        pipeline_depth_override: Option<u32>,
+        compatibility_session: Option<Arc<CompatibilitySftpSession>>,
+        shell_available: bool,
     ) -> Self {
         Self {
             ssh_handle,
@@ -14,7 +31,13 @@ impl SftpBackend {
             path_cache: Arc::new(RwLock::new(HashMap::new())),
             encoding: encoding.to_string(),
             pipeline_depth_override,
+            compatibility_session,
+            shell_available,
         }
+    }
+
+    pub(crate) fn compatibility_mode(&self) -> bool {
+        self.compatibility_session.is_some()
     }
 
     /// Get the encoding setting for this connection

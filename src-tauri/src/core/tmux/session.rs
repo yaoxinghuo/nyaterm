@@ -103,9 +103,13 @@ struct VirtualPane {
 enum PendingKind {
     WindowsRefresh,
     PanesRefresh,
-    CapturePane { pane: String },
+    CapturePane {
+        pane: String,
+    },
     /// Cursor position query issued after a pane's capture seed.
-    SeedCursor { pane: String },
+    SeedCursor {
+        pane: String,
+    },
     /// User-typed command from the tmux bar; failures are surfaced.
     UserCommand,
     Ignore,
@@ -512,9 +516,7 @@ impl<'a> ControlSession<'a> {
             .active_window
             .as_ref()
             .and_then(|id| self.windows.get(id))
-            .and_then(|window| {
-                window.visible_layout.as_ref().or(window.layout.as_ref())
-            })
+            .and_then(|window| window.visible_layout.as_ref().or(window.layout.as_ref()))
             .and_then(|layout| self.build_ui_tree(layout));
 
         let windows = {
@@ -891,9 +893,11 @@ impl<'a> ControlSession<'a> {
                                 parts.next().map(str::parse::<u32>),
                                 parts.next().map(str::parse::<u32>),
                             ) {
-                                virtual_pane
-                                    .output
-                                    .push_owned(format!("\x1b[{};{}H", y + 1, x + 1));
+                                virtual_pane.output.push_owned(format!(
+                                    "\x1b[{};{}H",
+                                    y + 1,
+                                    x + 1
+                                ));
                             }
                         }
                     }
@@ -1048,6 +1052,9 @@ impl<'a> ControlSession<'a> {
             SessionCommand::Resize { .. } => {
                 // Pane sizes belong to the tmux layout; the local renderer's
                 // fit result is intentionally ignored.
+            }
+            SessionCommand::SerialModemUpload { .. } => {
+                // Serial-only command; unreachable on an SSH control channel.
             }
             SessionCommand::AttachConfirmed { ack } => {
                 tracing::info!(
@@ -1253,6 +1260,7 @@ pub(crate) async fn run_control_session(
                     Some(SessionCommand::Close) => {
                         session.request_detach(channel, ExitMode::Close).await;
                     }
+                    Some(SessionCommand::SerialModemUpload { .. }) => {}
                     Some(SessionCommand::AttachConfirmed { ack }) => {
                         let _ = ack.send(());
                     }

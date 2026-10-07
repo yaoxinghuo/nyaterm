@@ -19,7 +19,18 @@ use crate::runtime::AppRuntime;
 
 const PORTABLE_ROOT: &str = "NyaTerm-portable";
 const PORTABLE_EXE: &str = "NyaTerm.exe";
+const PORTABLE_MCP: &str = "nyaterm-mcp.exe";
 const PORTABLE_MARKER: &str = "portable.flag";
+const CONPTY_FILES: [&str; 6] = [
+    "conpty/x64/conpty.dll",
+    "conpty/x64/x64/OpenConsole.exe",
+    "conpty/x64/arm64/OpenConsole.exe",
+    "conpty/arm64/conpty.dll",
+    "conpty/arm64/arm64/OpenConsole.exe",
+    "conpty/LICENSE.txt",
+];
+const MCP_BACKUP_PREFIX: &str = ".nyaterm-mcp-update-backup-";
+const LEGACY_MCP_BACKUP: &str = ".nyaterm-mcp-update-backup.exe";
 const HELPER_FLAG: &str = "--nyaterm-portable-update-helper";
 const CLEANUP_ENV: &str = "NYATERM_PORTABLE_UPDATE_CLEANUP";
 const WORK_DIR_PREFIX: &str = "nyaterm-portable-update-";
@@ -47,7 +58,9 @@ struct StagedPortableUpdate {
     work_dir: PathBuf,
     helper_exe: PathBuf,
     payload_exe: PathBuf,
+    payload_mcp: PathBuf,
     payload_marker: PathBuf,
+    payload_conpty: PathBuf,
 }
 
 #[derive(Default)]
@@ -156,7 +169,11 @@ pub fn apply(
 
     if !staged.helper_exe.is_file()
         || !staged.payload_exe.is_file()
+        || !staged.payload_mcp.is_file()
         || !staged.payload_marker.is_file()
+        || CONPTY_FILES
+            .iter()
+            .any(|path| !staged.payload_conpty.parent().unwrap().join(path).is_file())
     {
         let _ = fs::remove_dir_all(&staged.work_dir);
         return Err(AppError::Config(
@@ -171,6 +188,8 @@ pub fn apply(
         .arg(&staged.payload_exe)
         .arg(&target_exe)
         .arg(&staged.work_dir)
+        .arg(&staged.payload_mcp)
+        .arg(&staged.payload_conpty)
         .spawn();
 
     if let Err(error) = spawn_result {
@@ -245,7 +264,9 @@ fn stage_verified_archive(bytes: &[u8]) -> AppResult<StagedPortableUpdate> {
 
         Ok(StagedPortableUpdate {
             payload_exe: payload_dir.join(PORTABLE_EXE),
+            payload_mcp: payload_dir.join(PORTABLE_MCP),
             payload_marker: payload_dir.join(PORTABLE_MARKER),
+            payload_conpty: payload_dir.join("conpty"),
             helper_exe,
             work_dir: work_dir.clone(),
         })
@@ -268,7 +289,9 @@ fn extract_portable_payload(bytes: &[u8], destination: &Path) -> AppResult<()> {
     }
 
     let mut found_exe = false;
+    let mut found_mcp = false;
     let mut found_marker = false;
+    let mut found_conpty = [false; CONPTY_FILES.len()];
     let mut payload_bytes = 0_u64;
 
     for index in 0..archive.len() {
@@ -314,6 +337,14 @@ fn extract_portable_payload(bytes: &[u8], destination: &Path) -> AppResult<()> {
             }
             found_exe = true;
             destination.join(PORTABLE_EXE)
+        } else if relative == Path::new(PORTABLE_MCP) {
+            if found_mcp {
+                return Err(AppError::Config(
+                    "Portable update archive contains duplicate nyaterm-mcp.exe entries".into(),
+                ));
+            }
+            found_mcp = true;
+            destination.join(PORTABLE_MCP)
         } else if relative == Path::new(PORTABLE_MARKER) {
             if found_marker {
                 return Err(AppError::Config(
@@ -322,6 +353,18 @@ fn extract_portable_payload(bytes: &[u8], destination: &Path) -> AppResult<()> {
             }
             found_marker = true;
             destination.join(PORTABLE_MARKER)
+        } else if let Some(index) = CONPTY_FILES
+            .iter()
+            .position(|allowed| relative == Path::new(allowed))
+        {
+            if found_conpty[index] {
+                return Err(AppError::Config(format!(
+                    "Portable update archive contains duplicate ConPTY file: {}",
+                    relative.display()
+                )));
+            }
+            found_conpty[index] = true;
+            destination.join(&relative)
         } else {
             return Err(AppError::Config(format!(
                 "Portable update archive contains an unexpected file: {}",
@@ -336,6 +379,9 @@ fn extract_portable_payload(bytes: &[u8], destination: &Path) -> AppResult<()> {
             ));
         }
 
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let mut file = fs::File::create(output)?;
         let copied = std::io::copy(&mut entry.take(MAX_PAYLOAD_BYTES + 1), &mut file)?;
         if copied > MAX_PAYLOAD_BYTES {
@@ -345,9 +391,9 @@ fn extract_portable_payload(bytes: &[u8], destination: &Path) -> AppResult<()> {
         }
     }
 
-    if !found_exe || !found_marker {
+    if !found_exe || !found_mcp || !found_marker || found_conpty.contains(&false) {
         return Err(AppError::Config(
-            "Portable update archive is missing NyaTerm.exe or portable.flag".into(),
+            "Portable update archive is missing a required application or ConPTY file".into(),
         ));
     }
     Ok(())
@@ -374,7 +420,7 @@ pub fn run_helper_if_requested() -> bool {
 }
 
 fn run_helper(args: &[OsString]) -> AppResult<()> {
-    if args.len() != 6 {
+    if args.len() != 8 {
         return Err(AppError::Config(
             "Invalid portable update helper arguments".into(),
         ));
@@ -386,46 +432,195 @@ fn run_helper(args: &[OsString]) -> AppResult<()> {
     let source_exe = PathBuf::from(&args[3]);
     let target_exe = PathBuf::from(&args[4]);
     let work_dir = PathBuf::from(&args[5]);
+    let source_mcp = PathBuf::from(&args[6]);
+    let source_conpty = PathBuf::from(&args[7]);
 
     wait_for_process_exit(parent_pid)?;
-    replace_executable(&source_exe, &target_exe)?;
+    replace_portable_files(&source_exe, &target_exe, &source_mcp, &source_conpty)?;
     Command::new(&target_exe)
         .env(CLEANUP_ENV, &work_dir)
         .spawn()?;
     Ok(())
 }
 
-fn replace_executable(source_exe: &Path, target_exe: &Path) -> AppResult<()> {
+fn replace_portable_files(
+    source_exe: &Path,
+    target_exe: &Path,
+    source_mcp: &Path,
+    source_conpty: &Path,
+) -> AppResult<()> {
     let target_dir = target_exe
         .parent()
         .ok_or_else(|| AppError::Config("Portable executable has no parent directory".into()))?;
+    let target_mcp = target_dir.join(PORTABLE_MCP);
     let new_exe = target_dir.join(".nyaterm-update-new.exe");
     let backup_exe = target_dir.join(".nyaterm-update-backup.exe");
+    let new_mcp = target_dir.join(".nyaterm-mcp-update-new.exe");
+    let target_conpty = target_dir.join("conpty");
+    let new_conpty = target_dir.join(".nyaterm-conpty-update-new");
+    let backup_conpty =
+        target_dir.join(format!(".nyaterm-conpty-update-backup-{}", Uuid::new_v4()));
+    cleanup_stale_mcp_backups(target_dir);
+    let backup_mcp = target_dir.join(format!("{MCP_BACKUP_PREFIX}{}.exe", Uuid::new_v4()));
     let _ = fs::remove_file(&new_exe);
     let _ = fs::remove_file(&backup_exe);
+    let _ = fs::remove_file(&new_mcp);
+    if new_conpty.exists() {
+        fs::remove_dir_all(&new_conpty)?;
+    }
     fs::copy(source_exe, &new_exe)?;
+    if let Err(error) = fs::copy(source_mcp, &new_mcp) {
+        let _ = fs::remove_file(&new_exe);
+        return Err(error.into());
+    }
+    if let Err(error) = stage_conpty_files(source_conpty, &new_conpty) {
+        let _ = fs::remove_file(&new_exe);
+        let _ = fs::remove_file(&new_mcp);
+        let _ = fs::remove_dir_all(&new_conpty);
+        return Err(error);
+    }
 
-    commit_executable(&new_exe, target_exe, &backup_exe, |from, to| {
-        fs::rename(from, to)
-    })?;
-    let _ = fs::remove_file(backup_exe);
+    if target_conpty.exists() && !target_conpty.is_dir() {
+        let _ = fs::remove_dir_all(&new_conpty);
+        return Err(AppError::Config(format!(
+            "Portable ConPTY target is not a directory: {}",
+            target_conpty.display()
+        )));
+    }
+    let had_conpty = target_conpty.is_dir();
+    if had_conpty {
+        fs::rename(&target_conpty, &backup_conpty)?;
+    }
+    if let Err(error) = fs::rename(&new_conpty, &target_conpty) {
+        if had_conpty {
+            let _ = fs::rename(&backup_conpty, &target_conpty);
+        }
+        return Err(error.into());
+    }
+
+    let result = commit_portable_files(
+        &new_exe,
+        target_exe,
+        &backup_exe,
+        &new_mcp,
+        &target_mcp,
+        &backup_mcp,
+        |from, to| fs::rename(from, to),
+    );
+    let _ = fs::remove_file(&new_exe);
+    let _ = fs::remove_file(&new_mcp);
+    if let Err(error) = &result {
+        let remove_result = fs::remove_dir_all(&target_conpty);
+        let restore_result = if had_conpty {
+            fs::rename(&backup_conpty, &target_conpty)
+        } else {
+            Ok(())
+        };
+        if remove_result.is_err() || restore_result.is_err() {
+            return Err(AppError::Config(format!(
+                "Portable update failed ({error}); ConPTY rollback failed: remove={remove_result:?}, restore={restore_result:?}"
+            )));
+        }
+    }
+    if result.is_ok() {
+        let _ = fs::remove_file(&backup_exe);
+        let _ = fs::remove_file(&backup_mcp);
+        if had_conpty {
+            let _ = fs::remove_dir_all(&backup_conpty);
+        }
+    }
+    result
+}
+
+fn stage_conpty_files(source: &Path, destination: &Path) -> AppResult<()> {
+    for path in CONPTY_FILES {
+        let relative = Path::new(path).strip_prefix("conpty").unwrap();
+        let target = destination.join(relative);
+        fs::create_dir_all(target.parent().unwrap())?;
+        fs::copy(source.join(relative), target)?;
+    }
     Ok(())
 }
 
-fn commit_executable<F>(
+fn cleanup_stale_mcp_backups(target_dir: &Path) {
+    let _ = fs::remove_file(target_dir.join(LEGACY_MCP_BACKUP));
+    let Ok(entries) = fs::read_dir(target_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with(MCP_BACKUP_PREFIX) && name.ends_with(".exe") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn commit_portable_files<F>(
     new_exe: &Path,
     target_exe: &Path,
     backup_exe: &Path,
-    move_new: F,
+    new_mcp: &Path,
+    target_mcp: &Path,
+    backup_mcp: &Path,
+    move_file: F,
 ) -> AppResult<()>
 where
-    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    F: Fn(&Path, &Path) -> std::io::Result<()>,
 {
-    fs::rename(target_exe, backup_exe)?;
-    if let Err(error) = move_new(new_exe, target_exe) {
+    move_file(target_exe, backup_exe)?;
+    let had_mcp = target_mcp.is_file();
+    if target_mcp.exists() && !had_mcp {
+        let _ = fs::rename(backup_exe, target_exe);
+        return Err(AppError::Config(format!(
+            "Portable MCP target is not a file: {}",
+            target_mcp.display()
+        )));
+    }
+
+    if had_mcp && let Err(error) = move_file(target_mcp, backup_mcp) {
         if let Err(rollback_error) = fs::rename(backup_exe, target_exe) {
             return Err(AppError::Config(format!(
-                "Failed to install the portable update ({error}) and restore the previous executable ({rollback_error})"
+                "Failed to prepare nyaterm-mcp.exe for update ({error}) and restore NyaTerm.exe ({rollback_error})"
+            )));
+        }
+        return Err(error.into());
+    }
+
+    if let Err(error) = move_file(new_exe, target_exe) {
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback_error) = fs::rename(backup_exe, target_exe) {
+            rollback_errors.push(format!("NyaTerm.exe: {rollback_error}"));
+        }
+        if had_mcp && let Err(rollback_error) = fs::rename(backup_mcp, target_mcp) {
+            rollback_errors.push(format!("nyaterm-mcp.exe: {rollback_error}"));
+        }
+        if !rollback_errors.is_empty() {
+            return Err(AppError::Config(format!(
+                "Failed to install NyaTerm.exe ({error}) and restore the previous files ({})",
+                rollback_errors.join(", ")
+            )));
+        }
+        return Err(error.into());
+    }
+
+    if let Err(error) = move_file(new_mcp, target_mcp) {
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback_error) = fs::remove_file(target_exe) {
+            rollback_errors.push(format!("remove new NyaTerm.exe: {rollback_error}"));
+        }
+        if let Err(rollback_error) = fs::rename(backup_exe, target_exe) {
+            rollback_errors.push(format!("restore NyaTerm.exe: {rollback_error}"));
+        }
+        if had_mcp && let Err(rollback_error) = fs::rename(backup_mcp, target_mcp) {
+            rollback_errors.push(format!("restore nyaterm-mcp.exe: {rollback_error}"));
+        }
+        if !rollback_errors.is_empty() {
+            return Err(AppError::Config(format!(
+                "Failed to install nyaterm-mcp.exe ({error}) and restore the previous files ({})",
+                rollback_errors.join(", ")
             )));
         }
         return Err(error.into());
@@ -548,6 +743,17 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    fn write_test_conpty(source_dir: &Path) -> PathBuf {
+        let conpty = source_dir.join("conpty");
+        for path in CONPTY_FILES {
+            let relative = Path::new(path).strip_prefix("conpty").unwrap();
+            let target = conpty.join(relative);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, b"new-conpty").unwrap();
+        }
+        conpty
+    }
+
     #[test]
     fn maps_supported_windows_architectures() {
         assert_eq!(
@@ -566,7 +772,23 @@ mod tests {
         let destination = test_dir("portable-extract");
         let bytes = archive(&[
             ("NyaTerm-portable/NyaTerm.exe", b"new-exe"),
+            ("NyaTerm-portable/nyaterm-mcp.exe", b"new-mcp"),
             ("NyaTerm-portable/portable.flag", b""),
+            ("NyaTerm-portable/conpty/x64/conpty.dll", b"x64-dll"),
+            (
+                "NyaTerm-portable/conpty/x64/x64/OpenConsole.exe",
+                b"x64-host",
+            ),
+            (
+                "NyaTerm-portable/conpty/x64/arm64/OpenConsole.exe",
+                b"arm64-host",
+            ),
+            ("NyaTerm-portable/conpty/arm64/conpty.dll", b"arm64-dll"),
+            (
+                "NyaTerm-portable/conpty/arm64/arm64/OpenConsole.exe",
+                b"arm64-host",
+            ),
+            ("NyaTerm-portable/conpty/LICENSE.txt", b"license"),
             ("NyaTerm-portable/data/.keep", b"package-data"),
         ]);
 
@@ -576,7 +798,15 @@ mod tests {
             fs::read(destination.join(PORTABLE_EXE)).unwrap(),
             b"new-exe"
         );
+        assert_eq!(
+            fs::read(destination.join(PORTABLE_MCP)).unwrap(),
+            b"new-mcp"
+        );
         assert!(destination.join(PORTABLE_MARKER).is_file());
+        assert_eq!(
+            fs::read(destination.join("conpty/x64/conpty.dll")).unwrap(),
+            b"x64-dll"
+        );
         assert!(!destination.join("data").exists());
         fs::remove_dir_all(destination).unwrap();
     }
@@ -586,37 +816,186 @@ mod tests {
         let destination = test_dir("portable-invalid");
         let unsafe_archive = archive(&[
             ("../NyaTerm.exe", b"bad"),
+            ("NyaTerm-portable/nyaterm-mcp.exe", b"new-mcp"),
             ("NyaTerm-portable/portable.flag", b""),
         ]);
         assert!(extract_portable_payload(&unsafe_archive, &destination).is_err());
 
         let nested_escape = archive(&[
             ("NyaTerm-portable/NyaTerm.exe", b"new-exe"),
+            ("NyaTerm-portable/nyaterm-mcp.exe", b"new-mcp"),
             ("NyaTerm-portable/portable.flag", b""),
             ("NyaTerm-portable/data/../../escape", b"bad"),
         ]);
         assert!(extract_portable_payload(&nested_escape, &destination).is_err());
 
-        let missing_marker = archive(&[("NyaTerm-portable/NyaTerm.exe", b"new-exe")]);
+        let missing_marker = archive(&[
+            ("NyaTerm-portable/NyaTerm.exe", b"new-exe"),
+            ("NyaTerm-portable/nyaterm-mcp.exe", b"new-mcp"),
+        ]);
         assert!(extract_portable_payload(&missing_marker, &destination).is_err());
+
+        let missing_mcp = archive(&[
+            ("NyaTerm-portable/NyaTerm.exe", b"new-exe"),
+            ("NyaTerm-portable/portable.flag", b""),
+        ]);
+        assert!(extract_portable_payload(&missing_mcp, &destination).is_err());
+        let unexpected_conpty = archive(&[("NyaTerm-portable/conpty/other.dll", b"bad")]);
+        assert!(extract_portable_payload(&unexpected_conpty, &destination).is_err());
         fs::remove_dir_all(destination).unwrap();
     }
 
     #[test]
-    fn executable_commit_rolls_back_when_final_move_fails() {
-        let directory = test_dir("portable-rollback");
-        let target = directory.join(PORTABLE_EXE);
-        let new_exe = directory.join("new.exe");
-        let backup = directory.join("backup.exe");
-        fs::write(&target, b"old").unwrap();
-        fs::write(&new_exe, b"new").unwrap();
+    fn portable_replace_installs_mcp_when_missing() {
+        let directory = test_dir("portable-replace");
+        let source_dir = directory.join("source");
+        fs::create_dir(&source_dir).unwrap();
+        let source_exe = source_dir.join(PORTABLE_EXE);
+        let source_mcp = source_dir.join(PORTABLE_MCP);
+        let target_exe = directory.join(PORTABLE_EXE);
+        let target_mcp = directory.join(PORTABLE_MCP);
+        fs::write(&source_exe, b"new-exe").unwrap();
+        fs::write(&source_mcp, b"new-mcp").unwrap();
+        fs::write(&target_exe, b"old-exe").unwrap();
+        let source_conpty = write_test_conpty(&source_dir);
 
-        let result = commit_executable(&new_exe, &target, &backup, |_, _| {
-            Err(std::io::Error::other("simulated failure"))
-        });
+        replace_portable_files(&source_exe, &target_exe, &source_mcp, &source_conpty).unwrap();
+
+        assert_eq!(fs::read(&target_exe).unwrap(), b"new-exe");
+        assert_eq!(fs::read(&target_mcp).unwrap(), b"new-mcp");
+        assert_eq!(
+            fs::read(directory.join("conpty/x64/conpty.dll")).unwrap(),
+            b"new-conpty"
+        );
+        assert!(!directory.join(".nyaterm-update-backup.exe").exists());
+        assert!(!directory.join(".nyaterm-mcp-update-backup.exe").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn portable_replace_ignores_unremovable_stale_mcp_backup() {
+        let directory = test_dir("portable-stale-mcp-backup");
+        let source_dir = directory.join("source");
+        fs::create_dir(&source_dir).unwrap();
+        let source_exe = source_dir.join(PORTABLE_EXE);
+        let source_mcp = source_dir.join(PORTABLE_MCP);
+        let target_exe = directory.join(PORTABLE_EXE);
+        let target_mcp = directory.join(PORTABLE_MCP);
+        let stale_backup = directory.join(format!("{MCP_BACKUP_PREFIX}stale.exe"));
+        fs::write(&source_exe, b"new-exe").unwrap();
+        fs::write(&source_mcp, b"new-mcp").unwrap();
+        fs::write(&target_exe, b"old-exe").unwrap();
+        fs::write(&target_mcp, b"old-mcp").unwrap();
+
+        // A directory makes remove_file fail on every platform, simulating a stale backup
+        // that Windows cannot delete while an older sidecar process still has it open.
+        fs::create_dir(&stale_backup).unwrap();
+        let source_conpty = write_test_conpty(&source_dir);
+
+        replace_portable_files(&source_exe, &target_exe, &source_mcp, &source_conpty).unwrap();
+
+        assert_eq!(fs::read(&target_exe).unwrap(), b"new-exe");
+        assert_eq!(fs::read(&target_mcp).unwrap(), b"new-mcp");
+        assert!(stale_backup.is_dir());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn portable_replace_restores_conpty_when_mcp_target_is_invalid() {
+        let directory = test_dir("portable-conpty-rollback");
+        let source_dir = directory.join("source");
+        fs::create_dir(&source_dir).unwrap();
+        let source_exe = source_dir.join(PORTABLE_EXE);
+        let source_mcp = source_dir.join(PORTABLE_MCP);
+        let target_exe = directory.join(PORTABLE_EXE);
+        fs::write(&source_exe, b"new-exe").unwrap();
+        fs::write(&source_mcp, b"new-mcp").unwrap();
+        fs::write(&target_exe, b"old-exe").unwrap();
+        fs::create_dir(directory.join(PORTABLE_MCP)).unwrap();
+        let source_conpty = write_test_conpty(&source_dir);
+        let target_conpty = directory.join("conpty");
+        fs::create_dir_all(target_conpty.join("x64")).unwrap();
+        fs::write(target_conpty.join("x64/conpty.dll"), b"old-conpty").unwrap();
+
+        assert!(
+            replace_portable_files(&source_exe, &target_exe, &source_mcp, &source_conpty).is_err()
+        );
+        assert_eq!(fs::read(&target_exe).unwrap(), b"old-exe");
+        assert_eq!(
+            fs::read(target_conpty.join("x64/conpty.dll")).unwrap(),
+            b"old-conpty"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn portable_commit_rolls_back_both_files_when_mcp_install_fails() {
+        let directory = test_dir("portable-rollback");
+        let target_exe = directory.join(PORTABLE_EXE);
+        let target_mcp = directory.join(PORTABLE_MCP);
+        let new_exe = directory.join("new.exe");
+        let new_mcp = directory.join("new-mcp.exe");
+        let backup_exe = directory.join("backup.exe");
+        let backup_mcp = directory.join("backup-mcp.exe");
+        fs::write(&target_exe, b"old-exe").unwrap();
+        fs::write(&target_mcp, b"old-mcp").unwrap();
+        fs::write(&new_exe, b"new-exe").unwrap();
+        fs::write(&new_mcp, b"new-mcp").unwrap();
+
+        let result = commit_portable_files(
+            &new_exe,
+            &target_exe,
+            &backup_exe,
+            &new_mcp,
+            &target_mcp,
+            &backup_mcp,
+            |from, to| {
+                if from == new_mcp {
+                    Err(std::io::Error::other("simulated MCP install failure"))
+                } else {
+                    fs::rename(from, to)
+                }
+            },
+        );
 
         assert!(result.is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(fs::read(&target_exe).unwrap(), b"old-exe");
+        assert_eq!(fs::read(&target_mcp).unwrap(), b"old-mcp");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn portable_commit_restores_exe_when_first_mcp_install_fails() {
+        let directory = test_dir("portable-first-mcp");
+        let target_exe = directory.join(PORTABLE_EXE);
+        let target_mcp = directory.join(PORTABLE_MCP);
+        let new_exe = directory.join("new.exe");
+        let new_mcp = directory.join("new-mcp.exe");
+        let backup_exe = directory.join("backup.exe");
+        let backup_mcp = directory.join("backup-mcp.exe");
+        fs::write(&target_exe, b"old-exe").unwrap();
+        fs::write(&new_exe, b"new-exe").unwrap();
+        fs::write(&new_mcp, b"new-mcp").unwrap();
+
+        let result = commit_portable_files(
+            &new_exe,
+            &target_exe,
+            &backup_exe,
+            &new_mcp,
+            &target_mcp,
+            &backup_mcp,
+            |from, to| {
+                if from == new_mcp {
+                    Err(std::io::Error::other("simulated MCP install failure"))
+                } else {
+                    fs::rename(from, to)
+                }
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&target_exe).unwrap(), b"old-exe");
+        assert!(!target_mcp.exists());
         fs::remove_dir_all(directory).unwrap();
     }
 }

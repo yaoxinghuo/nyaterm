@@ -1,5 +1,5 @@
-import { getName, getVersion } from "@tauri-apps/api/app";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { getName, getVersion } from "@/lib/backend/platform/app";
+import { openUrl } from "@/lib/backend/platform/opener";
 import { Check, Copy } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -71,17 +71,48 @@ export default function AboutDialog({ open, onClose }: AboutDialogProps) {
     };
   }, [open]);
 
+  const conpty = supportInfo?.conpty;
+  const bundledLabel = conpty ? t("about.conptyBundled", { version: conpty.version }) : "";
+  const systemLabel = conpty?.fallback ? t("about.conptySystemFallback") : t("about.conptySystem");
+  const conptyDisplay = !conpty
+    ? null
+    : !conpty.available
+      ? t("about.conptyUnavailable")
+      : conpty.activeBundled > 0 && conpty.activeSystem > 0
+        ? t("about.conptyMixed", { version: conpty.version })
+        : conpty.activeBundled > 0
+          ? bundledLabel
+          : conpty.activeSystem > 0
+            ? systemLabel
+            : conpty.lastUsed
+              ? t("about.conptyLastUsed", {
+                  source: conpty.lastUsed === "bundled" ? bundledLabel : systemLabel,
+                })
+              : t("about.conptyNotStarted");
+
+  const packageManagerDisplay = supportInfo?.packageManager
+    ? `${supportInfo.packageManager.charAt(0).toUpperCase()}${supportInfo.packageManager.slice(1)}`
+    : null;
+
   const copySupportInfo = async () => {
     if (!appVersion || !supportInfo) {
       return;
     }
 
+    const runtimeLabel =
+      supportInfo.runtime === "web"
+        ? "Web"
+        : supportInfo.runtime === "portable"
+          ? t("about.portable")
+          : t("about.installed");
     const text = [
       "NyaTerm Support Information",
       `Version: ${appVersion}`,
       `Operating System: ${supportInfo.os}`,
       `Application Architecture: ${supportInfo.architecture}`,
-      `Runtime: ${supportInfo.runtime === "portable" ? t("about.portable") : t("about.installed")}`,
+      `Runtime: ${runtimeLabel}`,
+      ...(packageManagerDisplay ? [`Package Manager: ${packageManagerDisplay}`] : []),
+      ...(conptyDisplay ? [`Local Terminal ConPTY: ${conptyDisplay}`] : []),
     ].join("\n");
     try {
       await writeClipboardText(text);
@@ -101,9 +132,11 @@ export default function AboutDialog({ open, onClose }: AboutDialogProps) {
   const architectureDisplay =
     supportInfo?.architecture ?? (supportInfoFailed ? t("about.unknown") : t("common.loading"));
   const runtimeDisplay = supportInfo
-    ? supportInfo.runtime === "portable"
-      ? t("about.portable")
-      : t("about.installed")
+    ? supportInfo.runtime === "web"
+      ? "Web"
+      : supportInfo.runtime === "portable"
+        ? t("about.portable")
+        : t("about.installed")
     : supportInfoFailed
       ? t("about.unknown")
       : t("common.loading");
@@ -113,6 +146,8 @@ export default function AboutDialog({ open, onClose }: AboutDialogProps) {
     [t("about.operatingSystem"), osDisplay],
     [t("about.architecture"), architectureDisplay],
     [t("about.runtime"), runtimeDisplay],
+    ...(packageManagerDisplay ? [[t("about.packageManager"), packageManagerDisplay]] : []),
+    ...(conptyDisplay ? [[t("about.conpty"), conptyDisplay]] : []),
   ];
 
   return (

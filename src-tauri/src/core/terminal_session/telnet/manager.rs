@@ -4,6 +4,7 @@ pub async fn create_telnet_session(
     config: TelnetSessionConfig,
     connection_id: Option<String>,
     owner_window_label: Option<String>,
+    cancel_rx: Option<oneshot::Receiver<()>>,
     startup_command: Option<TelnetStartupCommand>,
     session_ready_hook: Option<SessionReadyHook>,
 ) -> AppResult<String> {
@@ -26,6 +27,65 @@ pub async fn create_telnet_session(
         client_timestamp: None,
     });
     let session_id = uuid::Uuid::new_v4().to_string();
+    let stream = match await_telnet_connection(
+        async {
+            crate::core::network::open_tcp_transport(
+                &app,
+                &host,
+                port,
+                config.network.as_ref(),
+                owner_window_label.clone(),
+            )
+            .await
+            .map(|opened| opened.stream)
+            .map_err(std::io::Error::other)
+        },
+        cancel_rx,
+    )
+    .await
+    {
+        Ok(stream) => stream,
+        Err(AppError::Cancelled(message)) => {
+            log_event(StructuredLog {
+                level: StructuredLogLevel::Info,
+                domain: "session.lifecycle".to_string(),
+                event: "session.create_cancelled".to_string(),
+                message: "Telnet session creation cancelled".to_string(),
+                ids: Some(serde_json::json!({
+                    "session_id": session_id,
+                    "connection_id": connection_id,
+                })),
+                data: Some(serde_json::json!({
+                    "session_type": "Telnet",
+                    "host": host,
+                    "port": port,
+                })),
+                error: None,
+                client_timestamp: None,
+            });
+            return Err(AppError::Cancelled(message));
+        }
+        Err(error) => {
+            log_event(StructuredLog {
+                level: StructuredLogLevel::Error,
+                domain: "session.lifecycle".to_string(),
+                event: "session.connection_failed".to_string(),
+                message: "Telnet connection failed".to_string(),
+                ids: Some(serde_json::json!({
+                    "session_id": session_id,
+                    "connection_id": connection_id,
+                })),
+                data: Some(serde_json::json!({
+                    "session_type": "Telnet",
+                    "host": host,
+                    "port": port,
+                })),
+                error: Some(serde_json::json!({ "message": error.to_string() })),
+                client_timestamp: None,
+            });
+            return Err(error);
+        }
+    };
     let (cmd_tx, cmd_rx) = session_command_channel(session_id.clone());
     let output_control_tx = cmd_tx.clone();
 
@@ -78,6 +138,7 @@ pub async fn create_telnet_session(
             mgr,
             cmd_rx,
             output_control_tx,
+            stream,
             config,
             connection_id,
             encoding,
@@ -87,4 +148,21 @@ pub async fn create_telnet_session(
     });
 
     Ok(session_id)
+}
+
+async fn await_telnet_connection<F, T>(
+    connect: F,
+    cancel_rx: Option<oneshot::Receiver<()>>,
+) -> AppResult<T>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    if let Some(mut cancel_rx) = cancel_rx {
+        return tokio::select! {
+            result = connect => result.map_err(AppError::Io),
+            _ = &mut cancel_rx => Err(AppError::Cancelled("Session creation cancelled".to_string())),
+        };
+    }
+
+    connect.await.map_err(AppError::Io)
 }

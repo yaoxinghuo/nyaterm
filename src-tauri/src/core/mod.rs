@@ -14,10 +14,13 @@ pub(crate) mod input;
 pub mod mcp;
 pub mod monitoring;
 pub mod network;
+pub mod note_export;
 mod output;
+pub mod plugins;
 pub mod portable_snapshot;
 mod quick_commands;
 pub mod rdp;
+pub(crate) mod rdp_clipboard;
 pub(crate) mod rdp_keyboard_capture;
 mod recording;
 pub mod remote_desktop;
@@ -41,7 +44,7 @@ pub use quick_commands::{
 pub use rdp::RdpSessionManager;
 pub use recording::{
     ExistingFileBehavior, InputOrigin, InputSensitivity, RecordingContext, RecordingManager,
-    RecordingMode, RecordingProfile, RecordingStatus, RotationPolicy, TerminalHistorySearchRequest,
+    RecordingMode, RecordingProfile, RecordingStatus, TerminalHistorySearchRequest,
     TerminalHistorySearchResponse,
 };
 pub use session::{
@@ -53,6 +56,7 @@ pub(crate) use session::{
     SessionCwdReplacement, now_session_started_at, replace_cwd_state, session_command_channel,
     update_cwd_if_changed,
 };
+pub(crate) use terminal_session::local::default_local_shell_path;
 pub use terminal_session::local::{LocalSessionConfig, create_local_session};
 pub use terminal_session::serial::{SerialConfig, create_serial_session, list_serial_ports};
 pub use terminal_session::telnet::{

@@ -1,3 +1,4 @@
+import { randomUUID } from "@/lib/uuid";
 import type {
   FileDocumentBackend,
   FileDocumentPane,
@@ -414,6 +415,71 @@ export function findOpenFileDocument(
   return null;
 }
 
+export function isFileDocumentOnlyTab(tab: Tab): boolean {
+  const panes = collectSessionPanes(tab.root);
+  return panes.length > 0 && panes.every((pane) => pane.paneKind === "file");
+}
+
+function tabHasSessionId(tab: Tab, sessionId: string): boolean {
+  return !!findSessionPaneBySessionId(tab.root, sessionId);
+}
+
+function findHostTabForSession(tabs: Tab[], sessionId: string): Tab | undefined {
+  return tabs.find((tab) =>
+    collectSessionPanes(tab.root).some(
+      (pane) => pane.sessionId === sessionId && pane.paneKind !== "file",
+    ),
+  );
+}
+
+export function getFileDocumentOnlyTabSessionId(tab: Tab): string | null {
+  if (!isFileDocumentOnlyTab(tab)) return null;
+  const active = getActivePane(tab);
+  if (active?.paneKind === "file") return active.sessionId;
+  return collectSessionPanes(tab.root)[0]?.sessionId ?? null;
+}
+
+/** Insert a new file tab after the current same-session tab, else the host tab. */
+export function resolveFileDocumentInsertAfterTabId(
+  tabs: Tab[],
+  sessionId: string,
+  activeTabId?: string | null,
+): string | null {
+  if (activeTabId) {
+    const active = tabs.find((tab) => tab.id === activeTabId);
+    if (active && tabHasSessionId(active, sessionId)) return active.id;
+  }
+  return findHostTabForSession(tabs, sessionId)?.id ?? activeTabId ?? null;
+}
+
+/**
+ * When closing a file-only tab, prefer the left neighbor if it belongs to the
+ * same session, otherwise any remaining tab that still holds that session.
+ */
+export function resolveNextActiveTabAfterFileDocumentClose(
+  tabs: Tab[],
+  closingTabIds: Iterable<string>,
+  currentActiveTabId: string | null,
+): string | null {
+  if (!currentActiveTabId) return null;
+  const closing = closingTabIds instanceof Set ? closingTabIds : new Set(closingTabIds);
+  if (!closing.has(currentActiveTabId)) return null;
+
+  const closingTab = tabs.find((tab) => tab.id === currentActiveTabId);
+  if (!closingTab) return null;
+  const sessionId = getFileDocumentOnlyTabSessionId(closingTab);
+  if (!sessionId) return null;
+
+  const remaining = tabs.filter((tab) => !closing.has(tab.id));
+  const index = tabs.findIndex((tab) => tab.id === currentActiveTabId);
+  const leftNeighbor = index > 0 ? tabs[index - 1] : undefined;
+  if (leftNeighbor && !closing.has(leftNeighbor.id) && tabHasSessionId(leftNeighbor, sessionId)) {
+    return leftNeighbor.id;
+  }
+
+  return remaining.find((tab) => tabHasSessionId(tab, sessionId))?.id ?? null;
+}
+
 function collectSessionReferenceCounts(tabs: Tab[]) {
   const counts = new Map<string, number>();
   for (const tab of tabs) {
@@ -571,7 +637,7 @@ function restorePane(node: RestorablePaneNode): PaneNode | null {
           }
         : undefined,
       connecting: true,
-      createRequestId: crypto.randomUUID(),
+      createRequestId: randomUUID(),
     } as SessionPane;
   }
 

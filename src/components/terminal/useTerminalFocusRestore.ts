@@ -6,6 +6,7 @@ interface UseTerminalFocusRestoreParams {
   pendingFocusRestoreRef: RefObject<boolean>;
   activeRef: RefObject<boolean>;
   visibleRef: RefObject<boolean>;
+  appLocked: boolean;
   terminalReady: boolean;
   restoringSnapshot: boolean;
   hibernated: boolean;
@@ -30,13 +31,14 @@ export function useTerminalFocusRestore({
   pendingFocusRestoreRef,
   activeRef,
   visibleRef,
+  appLocked,
   terminalReady,
   restoringSnapshot,
   hibernated,
 }: UseTerminalFocusRestoreParams) {
   // biome-ignore lint/correctness/useExhaustiveDependencies: refs are intentionally read once per ready/reveal transition.
   useEffect(() => {
-    if (!terminalReady || restoringSnapshot || hibernated) return;
+    if (appLocked || !terminalReady || restoringSnapshot || hibernated) return;
     pendingFocusRestoreRef.current = false;
     if (!visibleRef.current || !activeRef.current) return;
     const activeElement = document.activeElement;
@@ -44,5 +46,5 @@ export function useTerminalFocusRestore({
     // being rebuilt (e.g. the user clicked another pane or an input).
     if (activeElement && activeElement !== document.body) return;
     terminalRef.current?.focus();
-  }, [terminalReady, restoringSnapshot, hibernated]);
+  }, [appLocked, terminalReady, restoringSnapshot, hibernated]);
 }

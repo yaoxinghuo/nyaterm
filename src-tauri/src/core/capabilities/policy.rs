@@ -9,10 +9,14 @@ pub enum PolicyDecision {
     Deny,
 }
 
+pub use nyaterm_core::core::capabilities::RiskReasonCode;
+
 #[derive(Debug, Clone)]
 pub struct RiskAssessment {
     pub level: RiskLevel,
+    #[allow(dead_code)]
     pub reason: String,
+    pub reason_code: Option<RiskReasonCode>,
     pub auto_executable: bool,
 }
 
@@ -56,31 +60,48 @@ pub fn decide_policy(
 pub fn assess_command_risk(command: &str) -> RiskAssessment {
     let normalized = command.trim().replace("\r\n", "\n").replace('\r', "\n");
     if normalized.is_empty() {
-        return risk(RiskLevel::Medium, "empty command", false);
+        return risk_with_code(
+            RiskLevel::Medium,
+            RiskReasonCode::EmptyCommand,
+            "empty command",
+            false,
+        );
     }
     if normalized
         .split_whitespace()
         .collect::<String>()
         .contains(":(){:|:&};:")
     {
-        return risk(
+        return risk_with_code(
             RiskLevel::Critical,
+            RiskReasonCode::IrreversiblePattern,
             "matches irreversible or system-disruptive command pattern",
             false,
         );
     }
     let tokens = tokenize_shell(&normalized.to_ascii_lowercase());
     if tokens.is_empty() {
-        return risk(RiskLevel::Medium, "command could not be classified", false);
+        return risk_with_code(
+            RiskLevel::Medium,
+            RiskReasonCode::UnclassifiedCommand,
+            "command could not be classified",
+            false,
+        );
     }
     let stages = command_stages(&tokens);
     if stages.is_empty() {
-        return risk(RiskLevel::Medium, "command could not be classified", false);
+        return risk_with_code(
+            RiskLevel::Medium,
+            RiskReasonCode::UnclassifiedCommand,
+            "command could not be classified",
+            false,
+        );
     }
 
     if stages.iter().any(|stage| is_critical_stage(stage)) {
-        return risk(
+        return risk_with_code(
             RiskLevel::Critical,
+            RiskReasonCode::IrreversiblePattern,
             "matches irreversible or system-disruptive command pattern",
             false,
         );
@@ -89,8 +110,9 @@ pub fn assess_command_risk(command: &str) -> RiskAssessment {
         || has_sensitive_write_redirection(&tokens)
         || stages.iter().any(|stage| is_high_risk_stage(stage))
     {
-        return risk(
+        return risk_with_code(
             RiskLevel::High,
+            RiskReasonCode::PrivilegedMutation,
             "matches privileged or high-impact mutation pattern",
             false,
         );
@@ -105,8 +127,9 @@ pub fn assess_command_risk(command: &str) -> RiskAssessment {
             StageClass::ReadOnly => {}
             StageClass::Write => saw_write = true,
             StageClass::Unknown => {
-                return risk(
+                return risk_with_code(
                     RiskLevel::Medium,
+                    RiskReasonCode::UnknownCommand,
                     "command is not explicitly classified as safe for automatic execution",
                     false,
                 );
@@ -114,14 +137,16 @@ pub fn assess_command_risk(command: &str) -> RiskAssessment {
         }
     }
     if saw_write {
-        risk(
+        risk_with_code(
             RiskLevel::Medium,
+            RiskReasonCode::OrdinaryWrite,
             "matches a known ordinary state-changing command pattern",
             true,
         )
     } else {
-        risk(
+        risk_with_code(
             RiskLevel::Low,
+            RiskReasonCode::ReadOnlyDiagnostic,
             "matches read-only diagnostic command patterns",
             true,
         )
@@ -553,6 +578,21 @@ pub(crate) fn risk(level: RiskLevel, reason: &str, auto_executable: bool) -> Ris
     RiskAssessment {
         level,
         reason: reason.to_string(),
+        reason_code: None,
+        auto_executable,
+    }
+}
+
+fn risk_with_code(
+    level: RiskLevel,
+    reason_code: RiskReasonCode,
+    reason: &str,
+    auto_executable: bool,
+) -> RiskAssessment {
+    RiskAssessment {
+        level,
+        reason: reason.to_string(),
+        reason_code: Some(reason_code),
         auto_executable,
     }
 }

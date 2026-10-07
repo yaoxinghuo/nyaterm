@@ -1,5 +1,6 @@
-import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { randomUUID } from "@/lib/uuid";
+import { listen } from "@/lib/backend/api";
+import { getCurrentWindow } from "@/lib/backend/platform/window";
 import {
   type ReactNode,
   useCallback,
@@ -46,6 +47,7 @@ const DEFAULT_APP_SETTINGS: AppSettings = {
     minimize_to_tray: false,
     boss_key: null,
     confirm_on_close: true,
+    rdp_client_mode: "builtin",
   },
   appearance: {
     theme: "github-dark",
@@ -56,6 +58,7 @@ const DEFAULT_APP_SETTINGS: AppSettings = {
     font_size: DEFAULT_TERMINAL_FONT_SIZE,
     font_weight: 400,
     font_weight_bold: 700,
+    bold_default_foreground_highlight: false,
     background_opacity: 1.0,
     background_image_path: null,
     background_image_fit: "cover",
@@ -218,6 +221,7 @@ const DEFAULT_APP_SETTINGS: AppSettings = {
     asset_sort_direction: null,
     recent_connection_ids: [],
     transfer_height: 180,
+    file_explorer_view_mode: "list",
     file_explorer_show_hidden_files: true,
     file_explorer_auto_sync_cwd_connection_ids: [],
     file_explorer_favorite_dirs_by_connection_id: {},
@@ -231,6 +235,7 @@ const DEFAULT_APP_SETTINGS: AppSettings = {
 const DEFAULT_RUNTIME_INFO: AppRuntimeInfo = {
   portable: false,
   mode: "installed",
+  packageManager: null,
   executableDir: "",
   dataDir: "",
   configDir: "",
@@ -385,7 +390,7 @@ export function ChildAppProvider({ children }: { children: ReactNode }) {
   const noop = useCallback(() => {}, []);
   const noopString = useCallback(() => "", []);
   const noopPendingTab = useCallback(
-    () => ({ tabId: "", createRequestId: crypto.randomUUID() }),
+    () => ({ tabId: "", paneId: "", createRequestId: randomUUID() }),
     [],
   );
   const noopPaneConnecting = useCallback(() => null, []);

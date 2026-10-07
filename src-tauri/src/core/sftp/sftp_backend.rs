@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 
 mod attrs;
 mod config;
@@ -53,6 +53,9 @@ pub(crate) struct SftpBackend {
     encoding: String,
     /// Optional per-session override for single-file SFTP request pipelining.
     pipeline_depth_override: Option<u32>,
+    /// Retained probe session used by compatibility mode.
+    compatibility_session: Option<Arc<CompatibilitySftpSession>>,
+    shell_available: bool,
 }
 
 #[derive(Default)]

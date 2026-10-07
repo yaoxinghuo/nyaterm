@@ -1,7 +1,7 @@
 use crate::core::portable_snapshot::{
     DecodedPortableSnapshot, PortableSnapshot, encode_portable_snapshot,
 };
-use crate::error::{AppResult, CloudSyncError};
+use crate::error::{AppError, AppResult, CloudSyncError};
 
 use super::crypto::encrypt_snapshot_bytes;
 use super::operator::CloudRemote;
@@ -54,7 +54,17 @@ pub(super) async fn verify_uploaded_sync_snapshot(
     remote_root: &str,
     pointer: &RemoteSyncPointer,
 ) -> AppResult<PortableSnapshot> {
-    read_snapshot_for_pointer(remote, remote_root, pointer).await
+    match read_snapshot_for_pointer(remote, remote_root, pointer).await {
+        Ok(snapshot) => Ok(snapshot),
+        Err(AppError::CloudSync(CloudSyncError::SnapshotMissing { revision })) => {
+            tracing::warn!(
+                revision = %revision,
+                "Uploaded sync snapshot is missing on remote; latest pointer was not changed"
+            );
+            Err(CloudSyncError::SnapshotNotAccepted { revision }.into())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) async fn read_snapshot_for_pointer(
@@ -251,10 +261,13 @@ mod tests {
         PortableAppSettings, PortableSnapshotKind, calculate_payload_hash,
         calculate_v3_raw_payload_hash, encode_v3_raw_snapshot_redb_for_test,
     };
-    use crate::error::AppError;
+    use crate::error::{AppError, CloudSyncError};
     use crate::utils::crypto::set_master_password;
 
-    use super::super::migration::{RemoteSnapshotResolution, resolve_remote_snapshot};
+    use super::super::gc::prune_gist_snapshots_best_effort;
+    use super::super::migration::{
+        RemoteSnapshotResolution, recover_current_remote_snapshot, resolve_remote_snapshot,
+    };
     use super::super::operator::MemoryRemote;
     use super::super::remote::{load_sync_pointer, remote_path};
     use super::*;
@@ -483,6 +496,307 @@ mod tests {
         set_master_password(None);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn verify_uploaded_missing_snapshot_maps_to_not_accepted() {
+        let _guard = MASTER_PASSWORD_TEST_LOCK.lock().expect("lock password");
+        set_master_password(Some("secret".to_string()));
+        let (memory, remote) = memory_remote();
+        let old_pointer = write_committed_snapshot(&remote, "r1").await;
+        let new_snapshot = sample_snapshot("r2", 2);
+        let new_pointer = pointer_from_snapshot(&new_snapshot);
+        memory.drop_next_write_containing("snapshots/r2");
+
+        upload_sync_snapshot(&remote, "nyaterm", &new_snapshot)
+            .await
+            .expect("upload reports success even when silently dropped");
+        let result = verify_uploaded_sync_snapshot(&remote, "nyaterm", &new_pointer).await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::CloudSync(CloudSyncError::SnapshotNotAccepted { revision }))
+                if revision == "r2"
+        ));
+        let latest = load_sync_pointer(&remote, "nyaterm")
+            .await
+            .expect("load latest")
+            .expect("latest");
+        assert_eq!(latest.revision_id, old_pointer.revision_id);
+        set_master_password(None);
+    }
+
+    fn encrypted_snapshot_file(snapshot: &PortableSnapshot) -> Vec<u8> {
+        encrypt_snapshot_bytes(&encode_portable_snapshot(snapshot).expect("encode snapshot"))
+            .expect("encrypt snapshot")
+    }
+
+    /// A gist at its file limit: latest pointer + current snapshot + 8 generations.
+    /// The fake remote silently drops new files from then on, like Gitee does.
+    fn full_gist_remote(with_capacity_handling: bool) -> (MemoryRemote, CloudRemote) {
+        let mut files = HashMap::new();
+        for index in 1..=8u64 {
+            let revision = format!("r{index}");
+            files.insert(
+                sync_snapshot_path("nyaterm", &revision),
+                encrypted_snapshot_file(&sample_snapshot(&revision, index)),
+            );
+        }
+        files.insert(
+            remote_path("nyaterm", SYNC_CURRENT_FILE),
+            encrypted_snapshot_file(&sample_snapshot("r-new", 100)),
+        );
+
+        let memory = MemoryRemote::with_files(files);
+        if with_capacity_handling {
+            memory.mark_gist_backend();
+            memory.set_file_capacity_limit(10);
+        }
+        memory.drop_new_writes_when_file_count_reaches(10);
+        let remote = CloudRemote::Memory(memory.clone());
+        (memory, remote)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_fails_on_a_full_gist_without_capacity_handling() {
+        let _guard = MASTER_PASSWORD_TEST_LOCK.lock().expect("lock password");
+        set_master_password(Some("secret".to_string()));
+        let (memory, remote) = full_gist_remote(false);
+        let latest = pointer_from_snapshot(&sample_snapshot("r8", 8));
+        commit_sync_pointer(&remote, "nyaterm", &latest)
+            .await
+            .expect("seed pointer");
+        assert_eq!(memory.file_count(), 10);
+
+        let result = recover_current_remote_snapshot(&remote, "nyaterm").await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::CloudSync(CloudSyncError::SnapshotNotAccepted { revision }))
+                if revision == "r-new"
+        ));
+        set_master_password(None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_frees_one_slot_for_missing_candidate_snapshot() {
+        let _guard = MASTER_PASSWORD_TEST_LOCK.lock().expect("lock password");
+        set_master_password(Some("secret".to_string()));
+        let (memory, remote) = full_gist_remote(true);
+        let latest = pointer_from_snapshot(&sample_snapshot("r1", 1));
+        commit_sync_pointer(&remote, "nyaterm", &latest)
+            .await
+            .expect("seed pointer");
+        assert_eq!(memory.file_count(), 10);
+
+        assert!(
+            memory
+                .file(&sync_snapshot_path("nyaterm", "r-new"))
+                .is_none()
+        );
+
+        let recovered = recover_current_remote_snapshot(&remote, "nyaterm")
+            .await
+            .expect("recover from a full gist");
+
+        assert_eq!(recovered.revision_id, "r-new");
+        assert_eq!(memory.file_count(), 10);
+        assert!(memory.file(&sync_snapshot_path("nyaterm", "r1")).is_some());
+        assert!(memory.file(&sync_snapshot_path("nyaterm", "r2")).is_none());
+        for index in 3..=8 {
+            assert!(
+                memory
+                    .file(&sync_snapshot_path("nyaterm", &format!("r{index}")))
+                    .is_some()
+            );
+        }
+        let pointer = load_sync_pointer(&remote, "nyaterm")
+            .await
+            .expect("load pointer")
+            .expect("pointer");
+        assert_eq!(pointer.revision_id, "r-new");
+        set_master_password(None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_prune_keeps_expected_and_current_heads_with_clock_skew() {
+        let _guard = MASTER_PASSWORD_TEST_LOCK.lock().expect("lock password");
+        set_master_password(Some("secret".to_string()));
+        let (memory, remote) = full_gist_remote(true);
+        let expected = pointer_from_snapshot(&sample_snapshot("r8", 8));
+        commit_sync_pointer(&remote, "nyaterm", &expected)
+            .await
+            .expect("seed expected head");
+        // Another device commits r9 with a timestamp older than every other snapshot.
+        remote
+            .delete(&sync_snapshot_path("nyaterm", "r1"))
+            .await
+            .expect("free competing upload slot");
+        let competing_snapshot = sample_snapshot("r9", 1);
+        let current = pointer_from_snapshot(&competing_snapshot);
+        upload_sync_snapshot(&remote, "nyaterm", &competing_snapshot)
+            .await
+            .expect("upload competing snapshot");
+        commit_sync_pointer(&remote, "nyaterm", &current)
+            .await
+            .expect("commit competing head");
+        assert_eq!(memory.file_count(), 10);
+
+        prune_gist_snapshots_best_effort(&remote, "nyaterm", Some(&expected), "r10").await;
+
+        assert!(memory.file(&sync_snapshot_path("nyaterm", "r2")).is_none());
+        read_snapshot_for_pointer(&remote, "nyaterm", &expected)
+            .await
+            .expect("expected head survives pruning");
+        read_snapshot_for_pointer(&remote, "nyaterm", &current)
+            .await
+            .expect("current head survives pruning despite clock skew");
+
+        let next_snapshot = sample_snapshot("r10", 10);
+        let next_pointer = pointer_from_snapshot(&next_snapshot);
+        upload_sync_snapshot(&remote, "nyaterm", &next_snapshot)
+            .await
+            .expect("upload after pruning");
+        verify_uploaded_sync_snapshot(&remote, "nyaterm", &next_pointer)
+            .await
+            .expect("verify upload");
+        assert!(matches!(
+            ensure_remote_head_unchanged(&remote, "nyaterm", Some(&expected)).await,
+            Err(AppError::CloudSync(CloudSyncError::ConcurrentUpdate { .. }))
+        ));
+        let latest = load_sync_pointer(&remote, "nyaterm")
+            .await
+            .expect("load latest")
+            .expect("latest");
+        assert_eq!(latest.revision_id, "r9");
+        read_snapshot_for_pointer(&remote, "nyaterm", &latest)
+            .await
+            .expect("concurrent update leaves the remote head readable");
+        set_master_password(None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_overwrite_failure_preserves_all_snapshots_at_capacity() {
+        let _guard = MASTER_PASSWORD_TEST_LOCK.lock().expect("lock password");
+        set_master_password(Some("secret".to_string()));
+        let (memory, remote) = full_gist_remote(true);
+        let candidate = sample_snapshot("r1", 1);
+        let candidate_pointer = pointer_from_snapshot(&candidate);
+        write_current_sync_snapshot_compat(&remote, "nyaterm", &candidate)
+            .await
+            .expect("seed recovery candidate");
+        let current = pointer_from_snapshot(&sample_snapshot("r2", 2));
+        commit_sync_pointer(&remote, "nyaterm", &current)
+            .await
+            .expect("seed current head");
+        assert_eq!(memory.file_count(), 10);
+        let snapshots_before: Vec<_> = (1..=8)
+            .map(|index| {
+                let path = sync_snapshot_path("nyaterm", &format!("r{index}"));
+                let content = memory.file(&path).expect("existing snapshot");
+                (path, content)
+            })
+            .collect();
+        memory.fail_next_write_containing("snapshots/r1");
+
+        assert!(matches!(
+            recover_current_remote_snapshot(&remote, "nyaterm").await,
+            Err(AppError::Io(_))
+        ));
+
+        assert_eq!(memory.file_count(), 10);
+        for (path, content) in snapshots_before {
+            assert_eq!(memory.file(&path), Some(content), "{path}");
+        }
+        read_snapshot_for_pointer(&remote, "nyaterm", &candidate_pointer)
+            .await
+            .expect("recovery candidate survives pruning");
+        read_snapshot_for_pointer(&remote, "nyaterm", &current)
+            .await
+            .expect("current remote head survives failed recovery");
+        let latest = load_sync_pointer(&remote, "nyaterm")
+            .await
+            .expect("load latest")
+            .expect("latest");
+        assert_eq!(latest.revision_id, "r2");
+        set_master_password(None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn migration_prunes_only_when_target_snapshot_is_missing() {
+        let _guard = MASTER_PASSWORD_TEST_LOCK.lock().expect("lock password");
+        set_master_password(Some("secret".to_string()));
+        for target_exists in [true, false] {
+            let (memory, remote) = full_gist_remote(true);
+            let revision = if target_exists { "r1" } else { "r-missing" };
+            let snapshot = sample_snapshot(revision, 100);
+            let pointer = pointer_from_snapshot(&snapshot);
+            write_current_sync_snapshot_compat(&remote, "nyaterm", &snapshot)
+                .await
+                .expect("seed compatible current snapshot");
+            commit_sync_pointer(&remote, "nyaterm", &pointer)
+                .await
+                .expect("seed pointer");
+            if target_exists {
+                write_raw_snapshot_file(&remote, "nyaterm", revision, b"corrupt snapshot".to_vec())
+                    .await;
+            }
+            assert_eq!(memory.file_count(), 10);
+            let history_before: Vec<_> = (2..=8)
+                .map(|index| {
+                    let path = sync_snapshot_path("nyaterm", &format!("r{index}"));
+                    let content = memory.file(&path).expect("existing history");
+                    (path, content)
+                })
+                .collect();
+
+            let resolution = resolve_remote_snapshot(&remote, "nyaterm", &pointer)
+                .await
+                .expect("migrate snapshot at capacity");
+
+            assert!(matches!(
+                resolution,
+                RemoteSnapshotResolution::LegacyMigrated(_)
+            ));
+            assert_eq!(memory.file_count(), 10);
+            for (path, content) in history_before {
+                assert_eq!(memory.file(&path), Some(content), "{path}");
+            }
+            assert_eq!(
+                memory.file(&sync_snapshot_path("nyaterm", "r1")).is_some(),
+                target_exists
+            );
+            read_snapshot_for_pointer(&remote, "nyaterm", &pointer)
+                .await
+                .expect("migrated snapshot is readable");
+        }
+        set_master_password(None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capacity_prune_skips_deletion_when_current_head_is_unreadable() {
+        let _guard = MASTER_PASSWORD_TEST_LOCK.lock().expect("lock password");
+        set_master_password(Some("secret".to_string()));
+        let (memory, remote) = full_gist_remote(true);
+        let expected = pointer_from_snapshot(&sample_snapshot("r8", 8));
+        remote
+            .write(
+                &remote_path("nyaterm", super::super::remote::SYNC_LATEST_FILE),
+                b"corrupt pointer".to_vec(),
+            )
+            .await
+            .expect("seed unreadable current head");
+
+        prune_gist_snapshots_best_effort(&remote, "nyaterm", Some(&expected), "r-new").await;
+
+        assert_eq!(memory.file_count(), 10);
+        for index in 1..=8 {
+            assert!(
+                memory
+                    .file(&sync_snapshot_path("nyaterm", &format!("r{index}")))
+                    .is_some()
+            );
+        }
+        set_master_password(None);
+    }
     #[tokio::test(flavor = "current_thread")]
     async fn pointer_write_failure_keeps_old_revision_readable() {
         let _guard = MASTER_PASSWORD_TEST_LOCK.lock().expect("lock password");

@@ -57,6 +57,7 @@ describe("useTerminalRefreshEffects", () => {
         },
         active: true,
         visible: true,
+        appLocked: false,
         terminalReady: true,
         performanceMode: "normal",
         sessionId: "session-1",
@@ -87,6 +88,7 @@ describe("useTerminalRefreshEffects", () => {
         },
         active: true,
         visible: true,
+        appLocked: false,
         terminalReady: true,
         performanceMode: "normal",
         sessionId: "session-1",
@@ -113,6 +115,7 @@ describe("useTerminalRefreshEffects", () => {
         },
         active: true,
         visible: true,
+        appLocked: false,
         terminalReady: true,
         performanceMode: "normal",
         sessionId: "session-1",
@@ -144,6 +147,7 @@ describe("useTerminalRefreshEffects", () => {
         },
         active: true,
         visible: true,
+        appLocked: false,
         terminalReady: true,
         performanceMode: "normal",
         sessionId: "session-1",
@@ -175,6 +179,49 @@ describe("useTerminalRefreshEffects", () => {
     );
   });
 
+  it("does not reclaim terminal focus when the app locks while the native window is blurred", async () => {
+    const schedule = vi.fn();
+    const focus = vi.fn();
+    const textarea = document.createElement("textarea");
+    document.body.append(textarea);
+    textarea.focus();
+    const { terminal } = createTerminal();
+    Object.assign(terminal, { textarea, focus });
+    const terminalRef = { current: terminal };
+    const fitSchedulerRef = {
+      current: { schedule } as unknown as TerminalFitScheduler,
+    };
+    const { rerender } = renderHook(
+      ({ appLocked }) =>
+        useTerminalRefreshEffects({
+          terminalRef,
+          fitSchedulerRef,
+          active: true,
+          visible: true,
+          appLocked,
+          terminalReady: true,
+          performanceMode: "normal",
+          sessionId: "session-1",
+          showGutter: false,
+          showContentPadding: false,
+        }),
+      { initialProps: { appLocked: false } },
+    );
+    await waitFor(() => expect(windowMocks.focusChanged).toBeTypeOf("function"));
+    schedule.mockClear();
+    const hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    textarea.dispatchEvent(new FocusEvent("blur", { relatedTarget: null }));
+
+    rerender({ appLocked: true });
+    hasFocus.mockReturnValue(true);
+    windowMocks.focusChanged?.({ payload: true });
+
+    expect(schedule).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "window-focus", focus: false }),
+    );
+    expect(focus).not.toHaveBeenCalled();
+  });
+
   it("does not reclaim focus after another in-app control owns DOM focus", async () => {
     const schedule = vi.fn();
     const focus = vi.fn();
@@ -194,6 +241,7 @@ describe("useTerminalRefreshEffects", () => {
         },
         active: true,
         visible: true,
+        appLocked: false,
         terminalReady: true,
         performanceMode: "normal",
         sessionId: "session-1",
@@ -236,6 +284,7 @@ describe("useTerminalRefreshEffects", () => {
           fitSchedulerRef,
           active,
           visible,
+          appLocked: false,
           terminalReady: true,
           performanceMode: "normal",
           sessionId: "session-1",
@@ -269,6 +318,7 @@ describe("useTerminalRefreshEffects", () => {
         },
         active: true,
         visible: true,
+        appLocked: false,
         terminalReady: true,
         performanceMode: "normal",
         sessionId: "session-1",
@@ -303,6 +353,7 @@ describe("useTerminalRefreshEffects", () => {
         },
         active: true,
         visible: true,
+        appLocked: false,
         terminalReady: true,
         performanceMode: "normal",
         sessionId: "session-1",

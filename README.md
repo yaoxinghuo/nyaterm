@@ -100,7 +100,7 @@ NyaTerm is built for people who move between servers, local commands, devices, a
 
 - SSH, Local Terminal, Telnet, Serial, RDP, and VNC session support
 - Multi-tab workspace with horizontal and vertical pane splits, tab drag docking, and layout restoration
-- RDP and VNC remote desktop panes; VNC currently supports direct TCP, None / classic VNC Auth, Raw / ZRLE / Tight / Tight JPEG framebuffer updates, window scaling, bounded reconnects, and text clipboard exchange for Latin-1 text
+- RDP and VNC remote desktop panes; VNC supports direct TCP, None / classic VNC Auth, RA2_256 in Auto mode with server-key TOFU verification, Raw / ZRLE / Tight / Tight JPEG framebuffer updates, window scaling, bounded reconnects, and text clipboard exchange for Latin-1 text
 - Saved connections with folders, icons, metadata, duplication, keyboard copy, reconnect, and import flows
 - Command Palette and session quick switcher for finding actions, open sessions, saved connections, and new-session entry points
 - Main-window `Background Image` customization with `cover` / `contain` / `stretch` / `tile` sizing and adjustable `Background Content Opacity`
@@ -125,7 +125,7 @@ NyaTerm is built for people who move between servers, local commands, devices, a
 - AI shortcuts for explaining recent output, plus inline Agent command output with configurable `Terminal Output Lines`
 - Large-output protection, configurable scrollback, SSH keep-alive, and session recording
 - Online search and translation from selected terminal text
-- Zmodem file transfer support directly from the terminal, surfaced in the transfer queue
+- ZMODEM file transfer support directly from the terminal, plus Serial XMODEM/YMODEM/ZMODEM drag-and-drop uploads surfaced in the transfer queue
 - Confirmation dialog before closing all sessions
 - Customizable keyboard shortcuts for terminal and UI actions, including `Backspace Mode` selection for Telnet and Serial sessions
 
@@ -260,7 +260,7 @@ Download installers from [nyaterm.app](https://nyaterm.app) or the [Releases](ht
 | SSH | Linux / Unix remote servers | Supports SFTP, OTP, resource / GPU / process / Docker monitoring, proxy, jump host, tunnels, and per-connection algorithm preferences |
 | Local Terminal | Local shell workflows | Uses your local shell path and working directory |
 | Telnet | Legacy network devices or lab systems | Lightweight terminal session without SSH-only features, with `Backspace Mode` for `Ctrl+H (BS)` or `DEL (0x7F)` |
-| Serial | Routers, boards, embedded devices | Configurable port, baud rate, data bits, parity, stop bits, and `Backspace Mode` |
+| Serial | Routers, boards, embedded devices | Configurable port, baud rate, data bits, parity, stop bits, `Backspace Mode`, and XMODEM/YMODEM/ZMODEM drag-and-drop upload protocol |
 
 ---
 
@@ -322,6 +322,10 @@ AUR package: [`nyaterm-bin`](https://aur.archlinux.org/packages/nyaterm-bin)
 > `nyaterm-bin` is a community-maintained binary AUR package. If the AUR package has not yet caught up with the latest release, download the official package from [Releases](https://github.com/nyakang/nyaterm/releases).
 
 
+## Web / Docker Deployment
+
+The Web Beta serves the browser interface and API from a single container for one trusted administrator. See [deploy/web/](./deploy/web/README.md) for build and Compose commands, and the [deployment guide](./docs/web-deployment.md) for configuration and supported capabilities.
+
 ## Prerequisites for Development
 
 - Node.js 18+
@@ -351,6 +355,7 @@ pnpm tauri dev
 │   ├── src/core/           # SSH, SFTP, PTY, Telnet, Serial, AI, backup logic
 │   ├── src/config/         # Persistent config models
 │   └── crates/otp/         # Local OTP implementation
+├── deploy/web/             # Web Dockerfile, Compose, and deployment entry point
 ├── docs-site/              # Docusaurus documentation site
 ├── public/                 # Static assets
 └── scripts/                # Checks, version sync, and demo helper scripts

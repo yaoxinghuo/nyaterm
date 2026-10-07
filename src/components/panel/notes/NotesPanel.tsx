@@ -1,3 +1,6 @@
+import { open } from "@/lib/backend/platform/dialog";
+import { runtime } from "@/lib/backend/runtime";
+import { downloadJson } from "@/lib/backend/browserArtifacts";
 import {
   type DragEvent,
   type KeyboardEvent,
@@ -8,6 +11,7 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { MdAdd, MdCreateNewFolder, MdDescription } from "react-icons/md";
+import { toast } from "sonner";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -20,8 +24,11 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { useNotesTree } from "@/hooks/useNotesTree";
+import { getErrorMessage } from "@/lib/errors";
+import { invoke } from "@/lib/invoke";
+import { logger } from "@/lib/logger";
 import { openNoteEditor } from "@/lib/windowManager";
-import type { NoteTreeNode } from "@/types/notes";
+import type { NoteExportResult, NoteTreeNode } from "@/types/notes";
 import NotesPanelHeader from "./NotesPanelHeader";
 import NoteTree from "./NoteTree";
 import {
@@ -100,6 +107,32 @@ export default function NotesPanel() {
     expandAll: t("notes.expandAll"),
     collapseAll: t("notes.collapseAll"),
     more: t("common.more"),
+    export: t("notes.export"),
+  };
+
+  const exportNotes = async () => {
+    try {
+      if (runtime === "web") {
+        const snapshot = await invoke<{ notes: unknown[]; folders: unknown[] }>("get_notes_export");
+        downloadJson("nyaterm-notes.json", snapshot);
+        toast.success(t("notes.exportSuccess", { count: snapshot.notes.length }));
+        return;
+      }
+      const destination = await open({ directory: true, multiple: false });
+      if (!destination) return;
+      const result = await invoke<NoteExportResult>("export_notes", {
+        destination,
+      });
+      toast.success(t("notes.exportSuccess", { count: result.noteCount }));
+    } catch (err) {
+      toast.error(getErrorMessage(err));
+      logger.error({
+        domain: "ui.error",
+        event: "notes.export_failed",
+        message: "Failed to export notes",
+        error: err,
+      });
+    }
   };
 
   const creationParentId = () => {
@@ -137,7 +170,10 @@ export default function NotesPanel() {
   const submitRename = (node: NoteTreeNode, name: string) => {
     const validation = validateNoteInputName(
       name,
-      collectSiblingNames(folders, notes, node.parentId, { id: node.id, kind: node.kind }),
+      collectSiblingNames(folders, notes, node.parentId, {
+        id: node.id,
+        kind: node.kind,
+      }),
     );
     if (validation) return;
     setEditingNodeId(null);
@@ -238,6 +274,7 @@ export default function NotesPanel() {
         onExpandAll={() => setExpandedFolderIds(new Set(folders.map((folder) => folder.id)))}
         onCollapseAll={() => setExpandedFolderIds(new Set())}
         onRefresh={() => void refresh()}
+        onExport={() => void exportNotes()}
         labels={labels}
       />
       <div className="min-h-0 flex-1" role="tree" tabIndex={0} onKeyDown={handleKeyDown}>

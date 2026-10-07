@@ -3,11 +3,12 @@ use super::client::{
 };
 use crate::config::SftpCwdFollowMode;
 use crate::core::capture::OutputCaptureProcessor;
-use crate::core::input::remap_del_to_bs;
 use crate::core::monitoring::stats::RemoteStatsSampler;
 use crate::core::ssh::osc::{self, OscStripper, ShellKind};
 use crate::core::terminal_session::local::split_startup_passthrough;
-use crate::core::terminal_session::{TerminalOutputDecoder, encode_terminal_input};
+use crate::core::terminal_session::{
+    TerminalOutputDecoder, encode_terminal_input, prepare_terminal_write_input,
+};
 use crate::core::tmux::{self, TmuxControlDetector, TmuxFeed};
 use crate::core::zmodem::{
     ZmodemAction, ZmodemDetectResult, ZmodemDetector, ZmodemDirection, ZmodemDownloadOoDrain,
@@ -288,42 +289,7 @@ async fn install_remote_shell_integration<H: client::Handler>(
         .map(|_| ())
 }
 
-const CHANNEL_REQUEST_REPLY_TIMEOUT_MS: u64 = 10_000;
-
-async fn wait_channel_request_reply(
-    channel: &mut russh::Channel<client::Msg>,
-    request_name: &str,
-) -> AppResult<()> {
-    let reply = timeout(
-        Duration::from_millis(CHANNEL_REQUEST_REPLY_TIMEOUT_MS),
-        async {
-            loop {
-                match channel.wait().await {
-                    Some(ChannelMsg::Success) => return Ok(()),
-                    Some(ChannelMsg::Failure) => {
-                        return Err(AppError::Channel(format!(
-                            "{request_name} request rejected by server"
-                        )));
-                    }
-                    Some(ChannelMsg::Close | ChannelMsg::Eof) | None => {
-                        return Err(AppError::Channel(format!(
-                            "SSH channel closed before {request_name} request completed"
-                        )));
-                    }
-                    Some(_) => {}
-                }
-            }
-        },
-    )
-    .await;
-
-    match reply {
-        Ok(result) => result,
-        Err(_) => Err(AppError::Channel(format!(
-            "{request_name} request timed out"
-        ))),
-    }
-}
+use nyaterm_core::ssh::protocol::wait_channel_request_reply;
 
 async fn close_failed_interactive_channel(
     channel: &russh::Channel<client::Msg>,
@@ -1330,7 +1296,7 @@ pub(super) async fn ssh_io_loop(
                     Some(SessionCommand::DetachRenderer) => {
                         output.detach();
                     }
-                    Some(SessionCommand::Write { mut data, origin, .. }) => {
+                    Some(SessionCommand::Write { data, raw, origin, .. }) => {
                         if zmodem_transfer.is_some()
                             || zmodem_upload_drain.should_suppress(std::time::Instant::now())
                         {
@@ -1346,17 +1312,14 @@ pub(super) async fn ssh_io_loop(
                             &mut post_login_deadline,
                         )
                         .await;
-                        if backspace_as_bs {
-                            remap_del_to_bs(&mut data);
-                        }
-                        let send_data = encode_terminal_input(&data, &encoding);
+                        let send_data = prepare_terminal_write_input(data, &encoding, raw, backspace_as_bs);
                         if phase == IoPhase::Suppressing {
                             suppression_diagnostics.record_pre_ready_write(send_data.len());
                         }
-                        let _ = channel.data(&send_data[..]).await;
+                        let _ = nyaterm_core::ssh::terminal::write(&channel, &send_data[..]).await;
                     }
                     Some(SessionCommand::Resize { cols, rows }) => {
-                        let _ = channel.window_change(cols, rows, 0, 0).await;
+                        let _ = nyaterm_core::ssh::terminal::resize(&channel, cols, rows).await;
                     }
                     Some(SessionCommand::PauseOutput) => {
                         output_paused = true;
@@ -1429,6 +1392,11 @@ pub(super) async fn ssh_io_loop(
                             handle_zmodem_actions(&app, &zmodem_event_name, &mut channel, actions).await;
                         }
                         zmodem_transfer = None;
+                    }
+                    Some(SessionCommand::SerialModemUpload { result_tx, .. }) => {
+                        let _ = result_tx.send(Err(
+                            "Direct modem upload is only available for Serial sessions".to_string(),
+                        ));
                     }
                     None => {
                         let _ = channel.close().await;
@@ -1775,7 +1743,7 @@ pub(super) async fn ssh_io_loop(
     output.close();
 
     if let Some(ref recorder) = recording_mgr {
-        recorder.cleanup_session(&session_id);
+        recorder.disconnect_session(&session_id);
     }
 
     manager.remove_session(&session_id).await;
@@ -1828,6 +1796,11 @@ async fn run_sftp_only_session_commands(
                 }
                 Some(SessionCommand::CaptureExec { result_tx, .. }) => {
                     drop(result_tx);
+                }
+                Some(SessionCommand::SerialModemUpload { result_tx, .. }) => {
+                    let _ = result_tx.send(Err(
+                        "Direct modem upload is only available for Serial sessions".to_string(),
+                    ));
                 }
                 Some(SessionCommand::Close) => break "local-close-request",
                 Some(

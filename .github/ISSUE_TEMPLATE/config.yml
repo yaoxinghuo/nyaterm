@@ -1,11 +1,11 @@
 blank_issues_enabled: false
 contact_links:
-  - name: ✋ I have a question or need support
+  - name: ✋ 提问或寻求帮助 / Question or support
     url: https://github.com/nyakang/nyaterm/discussions/new?category=q-a
-    about: Please use our GitHub Discussion for asking questions and getting support.
-  - name: 💬 I just want to chat
+    about: 请前往 GitHub Discussions 提问或寻求帮助。 / Please use GitHub Discussions for questions and support.
+  - name: 💬 交流讨论 / General discussion
     url: https://github.com/nyakang/nyaterm/discussions/new?category=general
-    about: Please use our GitHub Discussion for general discussions.
-  - name: 📖 Documentation
+    about: 一般交流请使用 GitHub Discussions。 / Please use GitHub Discussions for general discussions.
+  - name: 📖 文档 / Documentation
     url: https://nyaterm.app/docs/
-    about: Please visit our documentation site for more information.
+    about: 请访问 NyaTerm 文档站点了解更多信息。 / Please visit the NyaTerm documentation site for more information.

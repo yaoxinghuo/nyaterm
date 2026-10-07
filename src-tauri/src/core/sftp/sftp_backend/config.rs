@@ -23,6 +23,7 @@ pub(super) const SFTP_LARGE_FILE_CONCURRENCY: usize = 2;
 pub(super) const SFTP_HANDLE_RESERVE: usize = 8;
 pub(super) const SFTP_DIRECTORY_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 pub(super) const SFTP_SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const SFTP_EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 pub(super) const SFTP_DIRECTORY_LIST_MAX_RETRIES: usize = 1;
 pub(super) const SFTP_CHANNEL_OPEN_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(50),
@@ -67,6 +68,36 @@ pub(super) fn is_sftp_not_found(error: &SftpError) -> bool {
     )
 }
 
+impl SftpBackend {
+    pub(crate) fn client_config_for_settings(
+        transfer_settings: &crate::config::TransferSettings,
+        pipeline_depth_override: Option<u32>,
+    ) -> SftpClientConfig {
+        let (request_kib, _, max_concurrent_writes) =
+            sftp_pipeline_config(transfer_settings, pipeline_depth_override);
+        sftp_client_config(request_kib, max_concurrent_writes)
+    }
+}
+
+pub(super) fn is_sftp_stream_closed_error(error: &SftpError) -> bool {
+    matches!(
+        error,
+        SftpError::UnexpectedBehavior(message) if message == "SFTP stream closed"
+    )
+}
+
+pub(super) fn is_sftp_stream_closed_app_error(error: &AppError) -> bool {
+    match error {
+        AppError::Sftp(error) => is_sftp_stream_closed_error(error),
+        AppError::Channel(message) => message.contains("SFTP stream closed"),
+        AppError::Io(error) => error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<SftpError>())
+            .is_some_and(is_sftp_stream_closed_error),
+        _ => false,
+    }
+}
+
 #[allow(dead_code)]
 pub(super) fn ignore_sftp_not_found(result: Result<(), SftpError>) -> AppResult<()> {
     match result {
@@ -85,7 +116,14 @@ pub(super) fn is_retryable_sftp_channel_open_error(error: &russh::Error) -> bool
     )
 }
 
-pub(super) fn should_retry_sftp_directory_list(error: &AppError, retries_used: usize) -> bool {
+pub(super) fn should_retry_sftp_directory_list(
+    error: &AppError,
+    retries_used: usize,
+    compatibility_mode: bool,
+) -> bool {
+    if compatibility_mode {
+        return false;
+    }
     if retries_used >= SFTP_DIRECTORY_LIST_MAX_RETRIES {
         return false;
     }
@@ -126,7 +164,16 @@ pub(super) struct SftpDirectoryConcurrency {
 
 pub(super) fn sftp_directory_concurrency(
     max_open_handles: Option<u64>,
+    compatibility_mode: bool,
 ) -> SftpDirectoryConcurrency {
+    if compatibility_mode {
+        return SftpDirectoryConcurrency {
+            session_pool_size: 1,
+            small_file_concurrency: 1,
+            large_file_concurrency: 1,
+        };
+    }
+
     let server_limit = max_open_handles
         .map(|handles| handles.saturating_sub(SFTP_HANDLE_RESERVE as u64) as usize)
         .unwrap_or(SFTP_DEFAULT_SMALL_FILE_CONCURRENCY)

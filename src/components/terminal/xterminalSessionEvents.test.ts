@@ -36,6 +36,7 @@ function params(overrides: Record<string, unknown> = {}) {
     alternateScreenTrackerRef: { current: { ingest: vi.fn() } },
     hibernationPhaseRef: { current: "waking" },
     detachedHibernateEpochRef: { current: 1 },
+    appLockedRef: { current: false },
     onConnectionErrorRef: { current: undefined },
     tRef: { current: (key: string) => key },
     isTerminalAlive: () => true,
@@ -56,6 +57,7 @@ function params(overrides: Record<string, unknown> = {}) {
     updateOutputDrainMode: vi.fn(),
     logHibernation: vi.fn(),
     zmodemHandler: { handle: vi.fn() },
+    serialModemHandler: { handle: vi.fn() },
     replayPendingWakeEvents: vi.fn(),
     settleOutputAfterAttach: vi.fn().mockResolvedValue(true),
     flushPendingDynamicTitle: vi.fn(),
@@ -223,6 +225,28 @@ describe("xterminalSessionEvents setup lifecycle", () => {
 
     expect(getDynamicTitle("ssh-1")).toBe("Production · After wake");
     wakeEvents.dispose();
+  });
+
+  it("does not focus from a session event while the app is locked", async () => {
+    const listeners = new Map<string, (event: unknown) => void>();
+    mocks.listen.mockImplementation(
+      async (eventName: string, callback: (event: unknown) => void) => {
+        listeners.set(eventName, callback);
+        return vi.fn();
+      },
+    );
+    const options = params({ appLockedRef: { current: true } });
+    const events = createXTerminalSessionEvents(options as never);
+    await events.setup();
+
+    listeners.get("focus-terminal-ssh-1")?.({ payload: undefined });
+    expect(options.requestWake).toHaveBeenCalledWith("focus");
+    expect(options.terminal.focus).not.toHaveBeenCalled();
+
+    options.appLockedRef.current = false;
+    listeners.get("focus-terminal-ssh-1")?.({ payload: undefined });
+    expect(options.terminal.focus).toHaveBeenCalledOnce();
+    events.dispose();
   });
 });
 

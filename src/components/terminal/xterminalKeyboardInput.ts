@@ -4,6 +4,13 @@ const LEGACY_CTRL_KEYS = new Set([" ", "@", "[", "\\", "]", "^", "_", "?"]);
 
 export type XTerminalDataOrigin = "keyboard" | "terminal_response";
 
+export function shouldBlockXTerminalData(
+  appLocked: boolean,
+  origin: XTerminalDataOrigin,
+): boolean {
+  return appLocked && origin !== "terminal_response";
+}
+
 export function resolveXTerminalDataOrigin(
   trackedOrigin: XTerminalDataOrigin,
   data: string,

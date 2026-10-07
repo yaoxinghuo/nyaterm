@@ -146,6 +146,8 @@ $env:NYATERM_GITHUB_GIST_CLIENT_ID = "your_client_id"
 pnpm tauri build
 ```
 
+第三方发行包可以在构建时设置 `NYATERM_PACKAGE_MANAGER` 标识包管理器。应用会将该值写入支持信息，并把应用内更新交由外部包管理器处理；普通开发构建应保持未设置。
+
 ## 文档开发提示
 
 如果你在修改 README 或 `docs-site/docs/` / `docs-site/i18n/en/` 下的文档，建议至少执行：

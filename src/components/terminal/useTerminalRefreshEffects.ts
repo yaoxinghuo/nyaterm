@@ -1,6 +1,6 @@
 import type { Terminal } from "@xterm/xterm";
-import { type RefObject, useEffect } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { type RefObject, useEffect, useRef } from "react";
+import { getCurrentWindow } from "@/lib/backend/platform/window";
 import { logger } from "@/lib/logger";
 import { sendTerminalClearInput } from "@/lib/terminalControlInput";
 import type { TerminalFitScheduler } from "./terminalFitScheduler";
@@ -11,6 +11,7 @@ interface UseTerminalRefreshEffectsParams {
   fitSchedulerRef: RefObject<TerminalFitScheduler | null>;
   active: boolean;
   visible: boolean;
+  appLocked: boolean;
   terminalReady: boolean;
   performanceMode: PerformanceMode;
   sessionId: string;
@@ -25,6 +26,7 @@ export function useTerminalRefreshEffects({
   fitSchedulerRef,
   active,
   visible,
+  appLocked,
   terminalReady,
   performanceMode,
   sessionId,
@@ -33,6 +35,9 @@ export function useTerminalRefreshEffects({
   workspacePaddingSetting,
   snapshotRestoringRef,
 }: UseTerminalRefreshEffectsParams) {
+  const appLockedRef = useRef(appLocked);
+  appLockedRef.current = appLocked;
+
   useEffect(() => {
     if (terminalReady && fitSchedulerRef.current && terminalRef.current) {
       fitSchedulerRef.current.schedule({
@@ -94,7 +99,7 @@ export function useTerminalRefreshEffects({
         reason: "active",
         force: true,
         refresh: true,
-        focus: true,
+        focus: !appLocked,
         onComplete: (result) => {
           if (
             result.applied &&
@@ -106,7 +111,7 @@ export function useTerminalRefreshEffects({
         },
       });
     }
-  }, [active, fitSchedulerRef, terminalReady, terminalRef, visible]);
+  }, [active, appLocked, fitSchedulerRef, terminalReady, terminalRef, visible]);
 
   useEffect(() => {
     const handleRefresh = () => {
@@ -122,7 +127,7 @@ export function useTerminalRefreshEffects({
         reason: "global-refresh",
         force: true,
         refresh: true,
-        focus: active,
+        focus: !appLockedRef.current && active,
       });
     };
 
@@ -146,7 +151,11 @@ export function useTerminalRefreshEffects({
     let lastDevicePixelRatio = window.devicePixelRatio || 1;
 
     const scheduleWindowFit = (
-      reason: "window-resized" | "window-moved" | "window-focus" | "scale-factor",
+      reason:
+        | "window-resized"
+        | "window-moved"
+        | "window-focus"
+        | "scale-factor",
       force = false,
       scaleFactor?: number,
     ) => {
@@ -179,7 +188,10 @@ export function useTerminalRefreshEffects({
         force: force || isScaleChange,
         refresh: true,
         clearTextureAtlas: isScaleChange,
-        focus: reason === "window-focus" ? false : active && visible,
+        focus:
+          reason === "window-focus"
+            ? false
+            : !appLockedRef.current && active && visible,
       });
     };
 
@@ -230,7 +242,12 @@ export function useTerminalRefreshEffects({
       .onFocusChanged(({ payload }) => {
         if (disposed || !payload || snapshotRestoringRef?.current) return;
         scheduleWindowFit("window-focus", true);
-        if (terminalOwnedInputFocus && active && visible) {
+        if (
+          !appLockedRef.current &&
+          terminalOwnedInputFocus &&
+          active &&
+          visible
+        ) {
           terminalRef.current?.focus();
         }
       })
@@ -270,7 +287,7 @@ export function useTerminalRefreshEffects({
   useEffect(() => {
     const handleClear = () => {
       const terminal = terminalRef.current;
-      if (!active || !terminal) return;
+      if (appLockedRef.current || !active || !terminal) return;
       sendTerminalClearInput(terminal, { focus: active });
     };
 

@@ -1,5 +1,4 @@
-import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
-import { KeyRound } from "lucide-react";
+import { Copy, GripVertical, KeyRound } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { MdAdd, MdDelete, MdEdit } from "react-icons/md";
@@ -13,10 +12,15 @@ import { PrivateKeyViewDialog } from "@/components/dialog/security-auth/PrivateK
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { pickBrowserFile } from "@/lib/backend/browserArtifacts";
+import { open as openFileDialog } from "@/lib/backend/platform/dialog";
+import { runtime } from "@/lib/backend/runtime";
+import { writeClipboardText } from "@/lib/clipboard";
 import { getErrorMessage } from "@/lib/errors";
 import { invoke } from "@/lib/invoke";
 import type { SshKey } from "@/types/global";
 import { SecretUnlockFooter } from "./SecretUnlockFooter";
+import { useSecretListSorting } from "./useSecretListSorting";
 
 interface KeyManagementTabProps {
   onCountChange?: (count: number) => void;
@@ -63,6 +67,7 @@ export function KeyManagementTab({
   const [privateKeyValue, setPrivateKeyValue] = useState("");
   const [privateKeyLoading, setPrivateKeyLoading] = useState(false);
   const [privateKeyError, setPrivateKeyError] = useState(false);
+  const [publicKeyLoadingId, setPublicKeyLoadingId] = useState<string | null>(null);
   const [unlockRequestNonce, setUnlockRequestNonce] = useState(0);
   const editRequestRef = useRef(0);
   const pendingUnlockedActionRef = useRef<(() => void | Promise<void>) | null>(null);
@@ -250,7 +255,9 @@ export function KeyManagementTab({
     setPrivateKeyError(false);
     setPrivateKeyLoading(true);
     try {
-      const value = await invoke<string | null>("get_ssh_key_private_key", { id: key.id });
+      const value = await invoke<string | null>("get_ssh_key_private_key", {
+        id: key.id,
+      });
       setPrivateKeyValue(value ?? "");
     } catch {
       setPrivateKeyError(true);
@@ -259,30 +266,77 @@ export function KeyManagementTab({
     }
   }, []);
 
+  const handleCopyPublicKey = useCallback(
+    async (key: SshKey) => {
+      setPublicKeyLoadingId(key.id);
+      try {
+        const value = await invoke<string>("get_ssh_key_public_key", {
+          id: key.id,
+        });
+        await writeClipboardText(value);
+        toast.success(t("settings.copyPublicKeySuccess"));
+      } catch (error) {
+        toast.error(getErrorMessage(error));
+      } finally {
+        setPublicKeyLoadingId((current) => (current === key.id ? null : current));
+      }
+    },
+    [t],
+  );
+
   const handlePickFile = async () => {
-    const selected = await openFileDialog({
-      multiple: false,
-      title: t("settings.selectKeyFileTitle"),
-    });
-    if (selected) {
-      setEditKeyInputMode("file");
-      setEditKeyData("");
-      setEditKeyFilePath(selected);
-      setEditKeyFileName(getPathFileName(selected));
+    try {
+      if (runtime === "web") {
+        const file = await pickBrowserFile("");
+        if (!file) return;
+        if (file.size > 1024 * 1024) throw new Error("Key file exceeds 1 MiB");
+        setEditKeyInputMode("content");
+        setEditKeyData(await file.text());
+        setEditKeyFilePath("");
+        setEditKeyFileName(file.name);
+        return;
+      }
+      const selected = await openFileDialog({
+        multiple: false,
+        title: t("settings.selectKeyFileTitle"),
+      });
+      if (selected) {
+        setEditKeyInputMode("file");
+        setEditKeyData("");
+        setEditKeyFilePath(selected);
+        setEditKeyFileName(getPathFileName(selected));
+      }
+    } catch (error) {
+      toast.error(getErrorMessage(error));
     }
   };
 
   const handlePickCertFile = async () => {
-    const selected = await openFileDialog({
-      multiple: false,
-      title: t("settings.selectCertFileTitle"),
-    });
-    if (selected) {
-      setEditCertExpanded(true);
-      setEditCertInputMode("file");
-      setEditCertData("");
-      setEditCertFilePath(selected);
-      setEditCertFileName(getPathFileName(selected));
+    try {
+      if (runtime === "web") {
+        const file = await pickBrowserFile("");
+        if (!file) return;
+        if (file.size > 1024 * 1024) throw new Error("Certificate file exceeds 1 MiB");
+        setEditCertExpanded(true);
+        setEditCertInputMode("content");
+        setEditCertData(await file.text());
+        setEditCertFilePath("");
+        setEditCertFileName(file.name);
+        return;
+      }
+      const selected = await openFileDialog({
+        multiple: false,
+        title: t("settings.selectCertFileTitle"),
+      });
+      if (selected) {
+        setEditCertExpanded(true);
+        setEditCertInputMode("file");
+        setEditCertData("");
+        setEditCertFilePath(selected);
+        setEditCertFileName(getPathFileName(selected));
+      }
+    } catch (error) {
+      toast.error(getErrorMessage(error));
     }
   };
 
@@ -334,6 +388,15 @@ export function KeyManagementTab({
     }
   };
 
+  const { actionsDisabled, reordering, handleProps, rowProps } = useSecretListSorting(
+    keys,
+    setKeys,
+    loadKeys,
+    editingId !== null,
+    "reorder_ssh_keys",
+    "settings.keyReorderFailed",
+  );
+
   const lockedHint = !secretsUnlocked ? t("secretUnlock.lockedActionHint") : undefined;
   const hasResolvedKeySource =
     editKeyData.trim().length > 0 ||
@@ -351,7 +414,7 @@ export function KeyManagementTab({
               size="sm"
               className="h-7 shrink-0 px-2 text-xs text-primary"
               onClick={handleAdd}
-              disabled={editingId !== null}
+              disabled={actionsDisabled}
             >
               <MdAdd className="text-base mr-1" /> {t("settings.addKey")}
             </Button>
@@ -361,8 +424,27 @@ export function KeyManagementTab({
             {keys.map((key) => (
               <div
                 key={key.id}
+                {...rowProps(key.id)}
                 className="security-auth-action-row flex flex-wrap items-start gap-2 border-b px-3 py-2.5 transition-colors last:border-0 hover:bg-accent"
               >
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="inline-flex shrink-0">
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        className="cursor-grab text-muted-foreground hover:text-foreground active:cursor-grabbing"
+                        {...handleProps(key.id)}
+                        aria-label={t("settings.keyDragToSort")}
+                      >
+                        <GripVertical className="h-4 w-4" />
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    {t(reordering ? "settings.keyReordering" : "settings.keyDragToSort")}
+                  </TooltipContent>
+                </Tooltip>
                 <span className="min-w-24 flex-1 truncate text-xs leading-8">{key.name}</span>
                 <div className="security-auth-row-actions flex shrink-0 items-center">
                   <Tooltip>
@@ -372,9 +454,27 @@ export function KeyManagementTab({
                           variant="ghost"
                           size="icon-sm"
                           onClick={() => {
+                            void handleCopyPublicKey(key);
+                          }}
+                          disabled={actionsDisabled || publicKeyLoadingId === key.id}
+                          aria-label={t("settings.copyPublicKey")}
+                        >
+                          <Copy className="h-4 w-4" />
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent side="top">{t("settings.copyPublicKey")}</TooltipContent>
+                  </Tooltip>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span className="inline-flex">
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => {
                             runUnlockedAction(() => handleViewPrivateKey(key));
                           }}
-                          disabled={editingId !== null || privateKeyLoading}
+                          disabled={actionsDisabled || privateKeyLoading}
                           aria-label={t("settings.viewPrivateKey")}
                         >
                           <KeyRound className="h-4 w-4" />
@@ -391,7 +491,8 @@ export function KeyManagementTab({
                     onClick={() => {
                       void handleEdit(key);
                     }}
-                    disabled={editingId !== null}
+                    disabled={actionsDisabled}
+                    aria-label={t("common.edit")}
                   >
                     <MdEdit className="text-base" />
                   </Button>
@@ -400,7 +501,8 @@ export function KeyManagementTab({
                     size="icon-sm"
                     className="text-destructive hover:bg-destructive/10"
                     onClick={() => setDeletingKey(key)}
-                    disabled={editingId !== null}
+                    disabled={actionsDisabled}
+                    aria-label={t("common.delete")}
                   >
                     <MdDelete className="text-base" />
                   </Button>

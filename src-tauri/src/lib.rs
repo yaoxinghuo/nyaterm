@@ -37,8 +37,11 @@ use crate::core::{
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    platform::prepare_appimage_wayland_backend();
     portable_updater::schedule_cleanup_from_environment();
     let runtime = runtime::resolve().expect("failed to resolve runtime paths");
+    #[cfg(windows)]
+    platform::windows_conpty::configure(&runtime);
     runtime::prepare_webview_environment(&runtime);
 
     let session_manager = Arc::new(SessionManager::new());
@@ -66,8 +69,12 @@ pub fn run() {
         runtime.config_dir().to_path_buf(),
         runtime.executable_dir().to_path_buf(),
     );
+    let plugin_manager = core::plugins::PluginManager::new(
+        runtime.config_dir().join("plugins"),
+        env!("CARGO_PKG_VERSION").into(),
+    );
 
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().invoke_system(core::plugins::guarded_invoke_script());
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
         if external_open::handle_external_open_args(
@@ -114,6 +121,7 @@ pub fn run() {
         .manage(docker_sudo_manager.clone())
         .manage(remote_stats_sampler.clone())
         .manage(mcp_manager.clone())
+        .manage(plugin_manager)
         .manage(app_lock_state)
         .manage(external_open_state)
         .manage(portable_update_state)
@@ -136,7 +144,40 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(app::on_window_event)
+        .register_asynchronous_uri_scheme_protocol(
+            "nyaterm-plugin",
+            |context, request, responder| {
+                let app = context.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    responder.respond(
+                        core::plugins::serve_asset(&app, &request.uri().to_string()).await,
+                    );
+                });
+            },
+        )
         .invoke_handler(tauri::generate_handler![
+            cmd::plugins::subscribe_plugin_monitor,
+            cmd::plugins::unsubscribe_plugin_monitor,
+            cmd::plugins::refresh_plugin_monitor,
+            cmd::plugins::get_plugin_probe_scripts,
+            cmd::plugins::get_plugin_diagnostics,
+            cmd::plugins::clear_plugin_logs,
+            cmd::plugins::stop_plugin_backend,
+            cmd::plugins::list_plugins,
+            cmd::plugins::get_plugin_marketplace,
+            cmd::plugins::inspect_marketplace_plugin,
+            cmd::plugins::install_marketplace_plugin,
+            cmd::plugins::cancel_marketplace_plugin_review,
+            cmd::plugins::inspect_plugin_package,
+            cmd::plugins::install_plugin_package,
+            cmd::plugins::configure_plugin,
+            cmd::plugins::activate_plugin_version,
+            cmd::plugins::uninstall_plugin,
+            cmd::plugins::create_plugin_scope,
+            cmd::plugins::close_plugin_scope,
+            cmd::plugins::plugin_host_call,
+            cmd::plugins::plugin_backend_call,
+            cmd::plugins::respond_plugin_approval,
             cmd::app::quit_application,
             cmd::app::hide_main_window,
             cmd::app::open_download_dir,
@@ -147,6 +188,7 @@ pub fn run() {
             cmd::app::set_app_lock_state,
             cmd::app::open_child_window,
             cmd::app::open_transfer_target_directory,
+            cmd::app::resolve_local_directory_children,
             cmd::app::resolve_local_drop_paths,
             cmd::app::read_background_image_data_url,
             cmd::macos_menu::set_macos_app_menu,
@@ -155,8 +197,12 @@ pub fn run() {
             cmd::updater::download_portable_update,
             cmd::updater::apply_portable_update,
             cmd::ai::start_ai_chat_stream,
+            cmd::ai::import_ai_provider_icon,
             cmd::ai::list_ai_model_names,
             cmd::ai::refresh_ai_model_settings,
+            cmd::ai::test_ai_provider_connection,
+            cmd::ai::test_ai_model_connection,
+            cmd::ai::reveal_ai_provider_api_key,
             cmd::ai::cancel_ai_chat_stream,
             cmd::ai::detect_codex_cli,
             cmd::ai::get_codex_account_status,
@@ -183,10 +229,12 @@ pub fn run() {
             cmd::clipboard::read_clipboard_text,
             cmd::clipboard::write_clipboard_text,
             cmd::clipboard::read_clipboard_path_payload,
+            cmd::file_clipboard::read_clipboard_file_paths,
             cmd::clipboard::upload_clipboard_image_to_ssh,
             cmd::log::append_frontend_logs,
             cmd::log::export_diagnostics,
             cmd::note::list_note_tree,
+            cmd::note::export_notes,
             cmd::note::get_note,
             cmd::note::create_note_folder,
             cmd::note::create_note,
@@ -208,10 +256,12 @@ pub fn run() {
             cmd::session::create_ssh_session,
             cmd::session::create_temporary_ssh_session,
             cmd::session::create_multiplexed_ssh_session,
+            cmd::session::get_default_local_shell,
             cmd::session::create_local_session,
             cmd::session::create_telnet_session,
             cmd::session::create_serial_session,
             cmd::rdp::create_rdp_session,
+            cmd::rdp::launch_windows_rdp,
             cmd::rdp::rdp_attach_frame_channel,
             cmd::rdp::rdp_input_batch,
             cmd::rdp::rdp_set_keyboard_capture,
@@ -222,13 +272,16 @@ pub fn run() {
             cmd::rdp::respond_rdp_certificate,
             cmd::vnc::create_vnc_session,
             cmd::vnc::vnc_attach_frame_channel,
+            cmd::vnc::vnc_detach_frame_channel,
             cmd::vnc::vnc_input_batch,
             cmd::vnc::vnc_set_clipboard_text,
             cmd::vnc::vnc_reconnect,
+            cmd::vnc::respond_vnc_server_key,
             cmd::vnc::close_vnc_session,
             cmd::session::cancel_session_creation,
             cmd::session::list_serial_ports,
             cmd::session::write_to_session,
+            cmd::session::write_bytes_to_session,
             cmd::session::set_session_output_paused,
             cmd::session::ack_session_output,
             cmd::session::resize_session,
@@ -249,6 +302,7 @@ pub fn run() {
             cmd::session::fuzzy_search_candidates,
             cmd::session::start_recording,
             cmd::session::stop_recording,
+            cmd::session::finish_recording_scope,
             cmd::session::is_recording,
             cmd::session::save_session_transcript,
             cmd::session::terminal_history_search,
@@ -270,6 +324,7 @@ pub fn run() {
             cmd::session::zmodem_accept_download,
             cmd::session::zmodem_accept_upload,
             cmd::session::zmodem_cancel,
+            cmd::session::serial_modem_upload,
             cmd::sftp::get_home_dir,
             cmd::sftp::list_remote_dir,
             cmd::sftp::list_remote_child_directories,
@@ -292,6 +347,8 @@ pub fn run() {
             cmd::sftp::download_remote_directory,
             cmd::sftp::upload_local_directory,
             cmd::sftp::copy_file_entry,
+            cmd::sftp::move_file_entry,
+            cmd::sftp::find_missing_remote_entries,
             cmd::sftp::pause_transfer,
             cmd::sftp::resume_transfer,
             cmd::sftp::cancel_transfer,
@@ -323,8 +380,12 @@ pub fn run() {
             cmd::connection::get_ssh_keys,
             cmd::connection::get_ssh_key_passphrase,
             cmd::connection::get_ssh_key_private_key,
+            cmd::connection::get_ssh_key_public_key,
             cmd::connection::save_ssh_key,
             cmd::connection::delete_ssh_key,
+            cmd::connection::get_known_hosts,
+            cmd::connection::delete_known_host,
+            cmd::connection::clear_known_hosts,
             cmd::connection::get_groups,
             cmd::connection::save_group,
             cmd::connection::delete_group,
@@ -344,6 +405,8 @@ pub fn run() {
             cmd::credential::save_credential,
             cmd::credential::delete_credential,
             cmd::credential::reorder_credentials,
+            cmd::connection::reorder_passwords,
+            cmd::connection::reorder_ssh_keys,
             cmd::settings::get_app_settings,
             cmd::settings::save_app_settings,
             cmd::settings::save_app_language,
@@ -425,6 +488,14 @@ pub fn run() {
                 _event,
                 tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
             ) {
+                if matches!(_event, tauri::RunEvent::Exit) {
+                    if let Some(manager) = _app.try_state::<Arc<core::plugins::PluginManager>>() {
+                        tauri::async_runtime::block_on(manager.revoke_all());
+                    }
+                    if let Some(manager) = _app.try_state::<Arc<RecordingManager>>() {
+                        manager.finish_all_scopes();
+                    }
+                }
                 if let Some(manager) = _app.try_state::<Arc<McpManager>>() {
                     manager.shutdown_cleanup();
                 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +29,10 @@ use super::remote::remote_path;
 const GITEE_REMOTE_FILE_PREFIX: &str = "nyaterm-";
 const GITEE_REMOTE_FILE_SUFFIX: &str = ".blob";
 const GITEE_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Gitee stops storing new snippet files once the snippet holds this many files.
+/// Observed empirically (the API answers 200 and silently drops the new file);
+/// Gitee does not document the limit, so keep the value in one place.
+const GITEE_GIST_FILE_LIMIT: usize = 10;
 const GITHUB_GIST_API_ENDPOINT: &str = "https://api.github.com";
 const GITHUB_GIST_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 const GITHUB_GIST_CONFLICT_RETRY_DELAY: Duration = Duration::from_millis(750);
@@ -66,18 +70,7 @@ impl CloudRemote {
 
     pub(super) async fn read_if_exists(&self, path: &str) -> AppResult<Option<Vec<u8>>> {
         match self {
-            Self::OpenDal(operator) => {
-                if !operator.exists(path).await.map_err(map_storage_error)? {
-                    return Ok(None);
-                }
-                Ok(Some(
-                    operator
-                        .read(path)
-                        .await
-                        .map_err(map_storage_error)?
-                        .to_vec(),
-                ))
-            }
+            Self::OpenDal(operator) => map_optional_read(operator.read(path).await),
             Self::GiteeSnippet(remote) => remote.read_if_exists(path).await,
             Self::GithubGist(remote) => remote.read_if_exists(path).await,
             #[cfg(test)]
@@ -132,6 +125,55 @@ impl CloudRemote {
             Self::Memory(remote) => remote.list_files(path),
         }
     }
+
+    /// Gist-style remotes keep every sync object in one flat file list, which is
+    /// subject to provider file-count limits.
+    pub(super) fn is_gist_backend(&self) -> bool {
+        match self {
+            Self::GiteeSnippet(_) | Self::GithubGist(_) => true,
+            Self::OpenDal(_) => false,
+            #[cfg(test)]
+            Self::Memory(remote) => remote.is_gist_backend(),
+        }
+    }
+
+    /// Hard file-count limit of the underlying gist, if it has one.
+    ///
+    /// `None` means capacity pruning is skipped and only the regular retention
+    /// cleanup applies: GitHub gists have no per-gist file cap, so the value must
+    /// not be forced on them.
+    pub(super) fn file_capacity_limit(&self) -> Option<usize> {
+        match self {
+            Self::GiteeSnippet(_) => Some(GITEE_GIST_FILE_LIMIT),
+            Self::GithubGist(_) | Self::OpenDal(_) => None,
+            #[cfg(test)]
+            Self::Memory(remote) => remote.file_capacity_limit(),
+        }
+    }
+
+    /// Number of files the gist holds, including files the sync layer does not
+    /// manage.
+    ///
+    /// [`Self::list_files`] only reports decodable `nyaterm-*.blob` entries, which
+    /// would under-count the snippet and make capacity math too optimistic.
+    /// `None` for backends without a flat gist file list.
+    pub(super) async fn gist_file_count(&self) -> AppResult<Option<usize>> {
+        match self {
+            Self::GiteeSnippet(remote) => remote.file_count().await.map(Some),
+            Self::GithubGist(remote) => remote.file_count().await.map(Some),
+            Self::OpenDal(_) => Ok(None),
+            #[cfg(test)]
+            Self::Memory(remote) => Ok(Some(remote.file_count())),
+        }
+    }
+}
+
+fn map_optional_read(result: Result<Buffer, Error>) -> AppResult<Option<Vec<u8>>> {
+    match result {
+        Ok(content) => Ok(Some(content.to_vec())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(map_storage_error(error)),
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +181,11 @@ impl CloudRemote {
 pub(super) struct MemoryRemote {
     files: Arc<StdMutex<HashMap<String, Vec<u8>>>>,
     fail_writes: Arc<StdMutex<Vec<String>>>,
+    drop_writes: Arc<StdMutex<Vec<String>>>,
+    fail_lists: Arc<StdMutex<Vec<String>>>,
+    drop_new_writes_at_file_count: Arc<StdMutex<Option<usize>>>,
+    gist_backend: Arc<StdMutex<bool>>,
+    capacity_limit: Arc<StdMutex<Option<usize>>>,
 }
 
 #[cfg(test)]
@@ -147,7 +194,30 @@ impl MemoryRemote {
         Self {
             files: Arc::new(StdMutex::new(files)),
             fail_writes: Arc::new(StdMutex::new(Vec::new())),
+            drop_writes: Arc::new(StdMutex::new(Vec::new())),
+            fail_lists: Arc::new(StdMutex::new(Vec::new())),
+            drop_new_writes_at_file_count: Arc::new(StdMutex::new(None)),
+            gist_backend: Arc::new(StdMutex::new(false)),
+            capacity_limit: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    /// Mark this fake remote as a gist-style backend so capacity handling applies.
+    pub(super) fn mark_gist_backend(&self) {
+        *self.gist_backend.lock().expect("lock gist backend") = true;
+    }
+
+    pub(super) fn is_gist_backend(&self) -> bool {
+        *self.gist_backend.lock().expect("lock gist backend")
+    }
+
+    /// Give the fake gist a hard file-count limit, like Gitee snippets have.
+    pub(super) fn set_file_capacity_limit(&self, limit: usize) {
+        *self.capacity_limit.lock().expect("lock capacity limit") = Some(limit);
+    }
+
+    pub(super) fn file_capacity_limit(&self) -> Option<usize> {
+        *self.capacity_limit.lock().expect("lock capacity limit")
     }
 
     pub(super) fn fail_next_write_containing(&self, needle: &str) {
@@ -155,6 +225,34 @@ impl MemoryRemote {
             .lock()
             .expect("lock fail writes")
             .push(needle.to_string());
+    }
+
+    pub(super) fn drop_next_write_containing(&self, needle: &str) {
+        self.drop_writes
+            .lock()
+            .expect("lock drop writes")
+            .push(needle.to_string());
+    }
+
+    pub(super) fn fail_next_list_containing(&self, needle: &str) {
+        self.fail_lists
+            .lock()
+            .expect("lock fail lists")
+            .push(needle.to_string());
+    }
+
+    /// Mimic gist providers that answer a PATCH with HTTP 200 but never store a
+    /// *new* file once the file-count limit is reached. Updates to existing files
+    /// keep working, exactly like the real snippet API.
+    pub(super) fn drop_new_writes_when_file_count_reaches(&self, limit: usize) {
+        *self
+            .drop_new_writes_at_file_count
+            .lock()
+            .expect("lock drop-new-writes limit") = Some(limit);
+    }
+
+    pub(super) fn file_count(&self) -> usize {
+        self.files.lock().expect("lock files").len()
     }
 
     pub(super) fn file(&self, path: &str) -> Option<Vec<u8>> {
@@ -186,6 +284,28 @@ impl MemoryRemote {
             )));
         }
         drop(fail_writes);
+
+        let mut drop_writes = self.drop_writes.lock().expect("lock drop writes");
+        if let Some(index) = drop_writes
+            .iter()
+            .position(|needle| path.contains(needle.as_str()))
+        {
+            drop_writes.remove(index);
+            return Ok(());
+        }
+        drop(drop_writes);
+
+        let drop_new_writes_at_file_count = *self
+            .drop_new_writes_at_file_count
+            .lock()
+            .expect("lock drop-new-writes limit");
+        if let Some(limit) = drop_new_writes_at_file_count {
+            let files = self.files.lock().expect("lock files");
+            if !files.contains_key(path) && files.len() >= limit {
+                return Ok(());
+            }
+        }
+
         self.files
             .lock()
             .expect("lock files")
@@ -199,6 +319,19 @@ impl MemoryRemote {
     }
 
     fn list_files(&self, path: &str) -> AppResult<Vec<String>> {
+        let mut fail_lists = self.fail_lists.lock().expect("lock fail lists");
+        if let Some(index) = fail_lists
+            .iter()
+            .position(|needle| path.contains(needle.as_str()))
+        {
+            fail_lists.remove(index);
+            return Err(AppError::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!("injected memory list failure for {path}"),
+            )));
+        }
+        drop(fail_lists);
+
         Ok(self
             .files
             .lock()
@@ -523,8 +656,10 @@ pub(super) struct GiteeSnippetRemote {
 
 #[derive(Debug, serde::Deserialize)]
 struct GiteeSnippet {
+    /// `None` when the payload carries no `files` map at all, which must stay
+    /// distinguishable from an empty map (there the file really is absent).
     #[serde(default)]
-    files: HashMap<String, GiteeSnippetFile>,
+    files: Option<HashMap<String, GiteeSnippetFile>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -533,6 +668,8 @@ struct GiteeSnippetFile {
     content: Option<String>,
     #[serde(default)]
     raw_url: Option<String>,
+    #[serde(default)]
+    truncated: bool,
 }
 
 impl GiteeSnippetRemote {
@@ -572,7 +709,10 @@ impl GiteeSnippetRemote {
 
     async fn exists(&self, path: &str) -> AppResult<bool> {
         let snippet = self.fetch_snippet().await?;
-        Ok(snippet.files.contains_key(&gitee_remote_filename(path)))
+        Ok(snippet
+            .files
+            .as_ref()
+            .is_some_and(|files| files.contains_key(&gitee_remote_filename(path))))
     }
 
     async fn read_if_exists(&self, path: &str) -> AppResult<Option<Vec<u8>>> {
@@ -582,16 +722,24 @@ impl GiteeSnippetRemote {
         }
 
         let snippet = self.fetch_snippet().await?;
-        let Some(file) = snippet.files.get(&filename) else {
+        let Some(file) = snippet
+            .files
+            .as_ref()
+            .and_then(|files| files.get(&filename))
+        else {
             return Ok(None);
         };
-        let content = match file
-            .content
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            Some(content) => content.to_string(),
-            None => self.fetch_raw_file(&filename, file).await?,
+        let content = if file.truncated {
+            self.fetch_raw_file(&filename, file).await?
+        } else {
+            match file
+                .content
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                Some(content) => content.to_string(),
+                None => self.fetch_raw_file(&filename, file).await?,
+            }
         };
         decode_gitee_file_content(&content).map(Some)
     }
@@ -610,10 +758,21 @@ impl GiteeSnippetRemote {
         let prefix = path.trim_start_matches('/');
         Ok(snippet
             .files
-            .keys()
-            .filter_map(|filename| gitee_remote_path(filename))
-            .filter(|remote_path| remote_path.starts_with(prefix))
-            .collect())
+            .as_ref()
+            .map(|files| {
+                files
+                    .keys()
+                    .filter_map(|filename| gitee_remote_path(filename))
+                    .filter(|remote_path| remote_path.starts_with(prefix))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Every file in the snippet, including entries the sync layer does not manage.
+    async fn file_count(&self) -> AppResult<usize> {
+        let snippet = self.fetch_snippet().await?;
+        Ok(snippet.files.as_ref().map_or(0, HashMap::len))
     }
 
     async fn fetch_snippet(&self) -> AppResult<GiteeSnippet> {
@@ -678,7 +837,7 @@ impl GiteeSnippetRemote {
         &self,
         files: serde_json::Map<String, serde_json::Value>,
     ) -> AppResult<()> {
-        let body = gitee_patch_body(self.access_token.as_str(), files);
+        let body = gitee_patch_body(self.access_token.as_str(), files.clone());
         let url = format!("{}/gists/{}", self.api_endpoint, self.gist_id);
         let response = self
             .client
@@ -687,7 +846,12 @@ impl GiteeSnippetRemote {
             .send()
             .await
             .map_err(map_gitee_client_error)?;
-        let _: serde_json::Value = decode_gitee_response(response).await?;
+        let snippet: GiteeSnippet = decode_gitee_response(response).await?;
+        let response_files = snippet
+            .files
+            .as_ref()
+            .map(|files| files.keys().cloned().collect::<HashSet<String>>());
+        ensure_gist_patch_accepted(&files, response_files.as_ref())?;
         Ok(())
     }
 }
@@ -717,6 +881,38 @@ fn gitee_patch_body(
         "access_token": access_token,
         "files": files,
     })
+}
+
+/// Verify that the gist update really applied what we asked for.
+///
+/// `response_filenames` is `None` when the provider answered without a `files`
+/// map at all; that must not be mistaken for "every requested file is missing",
+/// otherwise every write would be reported as rejected.
+fn ensure_gist_patch_accepted(
+    requested: &serde_json::Map<String, serde_json::Value>,
+    response_filenames: Option<&HashSet<String>>,
+) -> AppResult<()> {
+    let Some(response_filenames) = response_filenames else {
+        tracing::warn!("Gist update response carried no files map; skipping write verification");
+        return Ok(());
+    };
+
+    for (filename, value) in requested {
+        let should_exist = !value.is_null();
+        let exists = response_filenames.contains(filename);
+        if should_exist && !exists {
+            return Err(crate::error::CloudSyncError::RemoteFileRejected {
+                filename: filename.clone(),
+            }
+            .into());
+        }
+        if !should_exist && exists {
+            return Err(AppError::Config(format!(
+                "Remote gist still contains deleted file '{filename}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn decode_gitee_file_content(content: &str) -> AppResult<Vec<u8>> {
@@ -764,8 +960,9 @@ pub(super) struct GithubGistRemote {
 
 #[derive(Debug, serde::Deserialize)]
 struct GithubGist {
+    /// `None` when the payload carries no `files` map at all; see [`GiteeSnippet`].
     #[serde(default)]
-    files: HashMap<String, GithubGistFile>,
+    files: Option<HashMap<String, GithubGistFile>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -805,13 +1002,16 @@ impl GithubGistRemote {
 
     async fn exists(&self, path: &str) -> AppResult<bool> {
         let gist = self.fetch_gist().await?;
-        Ok(gist.files.contains_key(&github_gist_remote_filename(path)))
+        Ok(gist
+            .files
+            .as_ref()
+            .is_some_and(|files| files.contains_key(&github_gist_remote_filename(path))))
     }
 
     async fn read_if_exists(&self, path: &str) -> AppResult<Option<Vec<u8>>> {
         let filename = github_gist_remote_filename(path);
         let gist = self.fetch_gist().await?;
-        let Some(file) = gist.files.get(&filename) else {
+        let Some(file) = gist.files.as_ref().and_then(|files| files.get(&filename)) else {
             return Ok(None);
         };
         let content = if file.truncated {
@@ -844,10 +1044,21 @@ impl GithubGistRemote {
         let prefix = path.trim_start_matches('/');
         Ok(gist
             .files
-            .keys()
-            .filter_map(|filename| github_gist_remote_path(filename))
-            .filter(|remote_path| remote_path.starts_with(prefix))
-            .collect())
+            .as_ref()
+            .map(|files| {
+                files
+                    .keys()
+                    .filter_map(|filename| github_gist_remote_path(filename))
+                    .filter(|remote_path| remote_path.starts_with(prefix))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Every file in the gist, including entries the sync layer does not manage.
+    async fn file_count(&self) -> AppResult<usize> {
+        let gist = self.fetch_gist().await?;
+        Ok(gist.files.as_ref().map_or(0, HashMap::len))
     }
 
     async fn fetch_gist(&self) -> AppResult<GithubGist> {
@@ -923,7 +1134,12 @@ impl GithubGistRemote {
             .send()
             .await
             .map_err(map_github_gist_client_error)?;
-        let _: serde_json::Value = decode_github_gist_response(response).await?;
+        let gist: GithubGist = decode_github_gist_response(response).await?;
+        let response_files = gist
+            .files
+            .as_ref()
+            .map(|files| files.keys().cloned().collect::<HashSet<String>>());
+        ensure_gist_patch_accepted(files, response_files.as_ref())?;
         Ok(())
     }
 }
@@ -1270,6 +1486,56 @@ mod tests {
     }
 
     #[test]
+    fn gist_patch_requires_written_files_in_response() {
+        let mut requested = serde_json::Map::new();
+        requested.insert(
+            "nyaterm-new.blob".to_string(),
+            serde_json::json!({ "content": "abc" }),
+        );
+        let response = HashSet::from(["nyaterm-old.blob".to_string()]);
+        let err =
+            ensure_gist_patch_accepted(&requested, Some(&response)).expect_err("missing file");
+        assert!(matches!(
+            err,
+            AppError::CloudSync(crate::error::CloudSyncError::RemoteFileRejected { filename })
+                if filename == "nyaterm-new.blob"
+        ));
+    }
+
+    #[test]
+    fn gist_patch_accepts_when_response_contains_file() {
+        let mut requested = serde_json::Map::new();
+        requested.insert(
+            "nyaterm-new.blob".to_string(),
+            serde_json::json!({ "content": "abc" }),
+        );
+        let response = HashSet::from(["nyaterm-new.blob".to_string()]);
+        ensure_gist_patch_accepted(&requested, Some(&response)).expect("accepted");
+    }
+
+    #[test]
+    fn gist_patch_without_files_map_is_not_a_rejection() {
+        let mut requested = serde_json::Map::new();
+        requested.insert(
+            "nyaterm-new.blob".to_string(),
+            serde_json::json!({ "content": "abc" }),
+        );
+
+        ensure_gist_patch_accepted(&requested, None)
+            .expect("a response without a files map must not fail the write");
+    }
+
+    #[test]
+    fn gist_patch_detects_ignored_deletion() {
+        let mut requested = serde_json::Map::new();
+        requested.insert("nyaterm-old.blob".to_string(), serde_json::Value::Null);
+        let response = HashSet::from(["nyaterm-old.blob".to_string()]);
+        let err = ensure_gist_patch_accepted(&requested, Some(&response))
+            .expect_err("deleted file still present");
+        assert!(matches!(err, AppError::Config(message) if message.contains("still contains")));
+    }
+
+    #[test]
     fn webdav_remote_layout_paths_support_empty_and_nested_roots() {
         let webdav = webdav_remote();
 
@@ -1406,12 +1672,64 @@ mod tests {
         assert_eq!(github_gist_remote_path(&filename).as_deref(), Some(path));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn gist_file_count_includes_files_nyaterm_does_not_manage() {
+        let memory = MemoryRemote::with_files(HashMap::from([
+            ("nyaterm/sync/latest.redb".to_string(), vec![1u8]),
+            ("notes.txt".to_string(), vec![2u8]),
+        ]));
+        let remote = CloudRemote::Memory(memory);
+
+        assert_eq!(remote.gist_file_count().await.expect("count"), Some(2));
+        assert!(
+            remote
+                .list_files("nyaterm/sync/snapshots/")
+                .await
+                .expect("list")
+                .is_empty(),
+            "the prefix listing still only reports managed sync documents"
+        );
+    }
+
+    #[test]
+    fn gist_capacity_limit_is_gitee_only() {
+        let mut settings = CloudSyncSettings {
+            provider: "gitee_snippet".to_string(),
+            ..CloudSyncSettings::default()
+        };
+        settings.gitee_snippet.api_endpoint = "https://gitee.com/api/v5".to_string();
+        settings.gitee_snippet.gist_id = "abc".to_string();
+        settings.gitee_snippet.access_token = Some("token".to_string());
+        let gitee = build_remote(&settings).expect("build gitee remote");
+        assert_eq!(gitee.file_capacity_limit(), Some(GITEE_GIST_FILE_LIMIT));
+
+        settings.provider = "github_gist".to_string();
+        settings.github_gist.gist_id = "abc".to_string();
+        settings.github_gist.access_token = Some("token".to_string());
+        let github = build_remote(&settings).expect("build github remote");
+        assert_eq!(
+            github.file_capacity_limit(),
+            None,
+            "GitHub gists have no documented per-gist file cap"
+        );
+    }
+
     #[test]
     fn github_gist_file_deserializes_truncated_flag() {
         let file: GithubGistFile = serde_json::from_str(
             r#"{"content":"partial","raw_url":"https://gist.githubusercontent.com/raw","truncated":true}"#,
         )
         .expect("deserialize gist file");
+
+        assert!(file.truncated);
+    }
+
+    #[test]
+    fn gitee_snippet_file_deserializes_truncated_flag() {
+        let file: GiteeSnippetFile = serde_json::from_str(
+            r#"{"content":"partial","raw_url":"https://gitee.com/raw","truncated":true}"#,
+        )
+        .expect("deserialize gitee file");
 
         assert!(file.truncated);
     }
@@ -1456,6 +1774,20 @@ mod tests {
             AppError::Io(error) => assert_eq!(error.kind(), io::ErrorKind::TimedOut),
             other => panic!("expected timeout IO error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn optional_read_treats_not_found_as_missing() {
+        let result = map_optional_read(Err(Error::new(ErrorKind::NotFound, "missing")))
+            .expect("not found should not fail");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn optional_read_preserves_non_not_found_errors() {
+        let error = map_optional_read(Err(Error::new(ErrorKind::PermissionDenied, "denied")))
+            .expect_err("permission error should be preserved");
+        assert!(matches!(error, AppError::Config(_)));
     }
 
     #[test]

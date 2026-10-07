@@ -11,6 +11,7 @@ function createHarness(options?: {
   terminalReady?: boolean;
   restoringSnapshot?: boolean;
   hibernated?: boolean;
+  appLocked?: boolean;
   pendingFocusRestore?: boolean;
 }) {
   const focus = vi.fn();
@@ -26,19 +27,28 @@ function createHarness(options?: {
   };
 
   const utils = renderHook(
-    (props: { terminalReady: boolean; restoringSnapshot: boolean; hibernated: boolean }) =>
+    (props: {
+      terminalReady: boolean;
+      restoringSnapshot: boolean;
+      hibernated: boolean;
+      appLocked?: boolean;
+    }) =>
       useTerminalFocusRestore({
         terminalRef: harness.terminalRef,
         pendingFocusRestoreRef: harness.pendingFocusRestoreRef,
         activeRef: harness.activeRef,
         visibleRef: harness.visibleRef,
-        ...props,
+        terminalReady: props.terminalReady,
+        restoringSnapshot: props.restoringSnapshot,
+        hibernated: props.hibernated,
+        appLocked: props.appLocked ?? false,
       }),
     {
       initialProps: {
         terminalReady: options?.terminalReady ?? false,
         restoringSnapshot: options?.restoringSnapshot ?? false,
         hibernated: options?.hibernated ?? false,
+        appLocked: options?.appLocked,
       },
     },
   );
@@ -65,6 +75,7 @@ describe("useTerminalFocusRestore", () => {
       terminalReady: true,
       restoringSnapshot: true,
       hibernated: false,
+      appLocked: false,
     });
     expect(harness.focus).not.toHaveBeenCalled();
     expect(harness.pendingFocusRestoreRef.current).toBe(true);
@@ -74,6 +85,7 @@ describe("useTerminalFocusRestore", () => {
       terminalReady: true,
       restoringSnapshot: false,
       hibernated: false,
+      appLocked: false,
     });
     expect(harness.focus).toHaveBeenCalledTimes(1);
     expect(harness.pendingFocusRestoreRef.current).toBe(false);
@@ -93,6 +105,7 @@ describe("useTerminalFocusRestore", () => {
       terminalReady: true,
       restoringSnapshot: true,
       hibernated: false,
+      appLocked: false,
     });
     expect(harness.focus).not.toHaveBeenCalled();
 
@@ -100,6 +113,7 @@ describe("useTerminalFocusRestore", () => {
       terminalReady: true,
       restoringSnapshot: false,
       hibernated: false,
+      appLocked: false,
     });
     expect(harness.focus).toHaveBeenCalledTimes(1);
   });
@@ -116,6 +130,7 @@ describe("useTerminalFocusRestore", () => {
       terminalReady: true,
       restoringSnapshot: false,
       hibernated: true,
+      appLocked: false,
     });
     expect(harness.focus).not.toHaveBeenCalled();
     expect(harness.pendingFocusRestoreRef.current).toBe(true);
@@ -124,6 +139,7 @@ describe("useTerminalFocusRestore", () => {
       terminalReady: true,
       restoringSnapshot: false,
       hibernated: false,
+      appLocked: false,
     });
     expect(harness.focus).toHaveBeenCalledTimes(1);
   });
@@ -158,6 +174,7 @@ describe("useTerminalFocusRestore", () => {
       terminalReady: true,
       restoringSnapshot: false,
       hibernated: false,
+      appLocked: false,
     });
 
     expect(harness.focus).not.toHaveBeenCalled();
@@ -195,7 +212,29 @@ describe("useTerminalFocusRestore", () => {
       terminalReady: true,
       restoringSnapshot: false,
       hibernated: false,
+      appLocked: false,
     });
     expect(harness.focus).toHaveBeenCalledTimes(1);
+  });
+
+  it("defers rebuild focus restoration until the app is unlocked", () => {
+    const harness = createHarness({
+      terminalReady: true,
+      appLocked: true,
+      pendingFocusRestore: true,
+    });
+
+    expect(harness.focus).not.toHaveBeenCalled();
+    expect(harness.pendingFocusRestoreRef.current).toBe(true);
+
+    harness.rerender({
+      terminalReady: true,
+      restoringSnapshot: false,
+      hibernated: false,
+      appLocked: false,
+    });
+
+    expect(harness.focus).toHaveBeenCalledTimes(1);
+    expect(harness.pendingFocusRestoreRef.current).toBe(false);
   });
 });

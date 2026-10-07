@@ -1593,7 +1593,7 @@ mod tests {
         assert!(
             init.find("]2;").unwrap()
                 < init
-                    .find("& $global:__nyaterm_local_prev_prompt")
+                    .find("& $__nt_original_prompt")
                     .unwrap()
         );
         assert!(init.contains("ReferenceEquals"));
@@ -1672,6 +1672,76 @@ mod tests {
             combined
                 .windows(b"SUBSCRIBERS=2".len())
                 .any(|window| window == b"SUBSCRIBERS=2"),
+            "{}",
+            String::from_utf8_lossy(&combined)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_powershell_venv_prompt_survives_idle_repair_and_deactivation() {
+        use std::process::Command;
+
+        let init = build_local_startup_script("powershell.exe", &ready_marker(), true, true)
+            .pwsh_init_args
+            .expect("PowerShell init args")
+            .pop()
+            .expect("PowerShell init script");
+        // Match Activate.ps1's saved prompt and named invocation, and bound the
+        // prefix count so a regression fails instead of overflowing the stack.
+        let harness = format!(
+            r#"$ErrorActionPreference = 'Stop'
+function global:prompt {{ 'USER> ' }}
+{init}
+$global:prefix_count = 0
+function global:activate_test_venv {{
+    function global:_OLD_VIRTUAL_PROMPT {{ '' }}
+    Copy-Item Function:prompt Function:_OLD_VIRTUAL_PROMPT
+    function global:prompt {{
+        $global:prefix_count++
+        if ($global:prefix_count -gt 8) {{ throw 'recursive venv prompt' }}
+        '(venv) ' + (_OLD_VIRTUAL_PROMPT)
+    }}
+}}
+function repair_test_prompt {{
+    $null = New-Event -SourceIdentifier PowerShell.OnIdle
+    for ($i = 0; $i -lt 50; $i++) {{
+        if ([object]::ReferenceEquals($function:prompt, $global:__nyaterm_local_prompt_wrapper)) {{ return }}
+        Start-Sleep -Milliseconds 10
+    }}
+    throw 'idle prompt repair did not run'
+}}
+for ($cycle = 0; $cycle -lt 3; $cycle++) {{
+    activate_test_venv
+    repair_test_prompt
+    for ($i = 0; $i -lt 2; $i++) {{
+        $value = prompt
+        if ($value -cne '(venv) USER> ') {{ throw ('unexpected active prompt: ' + $value) }}
+    }}
+    Copy-Item Function:_OLD_VIRTUAL_PROMPT Function:global:prompt
+    Remove-Item Function:_OLD_VIRTUAL_PROMPT
+    repair_test_prompt
+    if ((prompt) -cne 'USER> ') {{ throw 'deactivation did not restore prompt' }}
+}}
+if ($global:prefix_count -ne 6) {{ throw ('unexpected prefix count: ' + $global:prefix_count) }}
+Write-Output 'VENV_PROMPT_OK'
+"#
+        );
+        let output = Command::new("powershell.exe")
+            .args(["-NoLogo", "-NoProfile", "-Command", &harness])
+            .output()
+            .expect("run Windows PowerShell venv prompt regression");
+        let mut combined = output.stdout;
+        combined.extend_from_slice(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&combined)
+        );
+        assert!(
+            combined
+                .windows(b"VENV_PROMPT_OK".len())
+                .any(|window| window == b"VENV_PROMPT_OK"),
             "{}",
             String::from_utf8_lossy(&combined)
         );

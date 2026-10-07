@@ -4,7 +4,9 @@ import { SelectItem } from "@/components/ui/select";
 import { useApp } from "@/context/AppContext";
 import { useConfigTransfer } from "@/hooks/useConfigTransfer";
 import { AVAILABLE_LANGUAGES } from "@/i18n";
+import { runtime, supports } from "@/lib/backend/runtime";
 import { HEADER_STATUS_MODES, normalizeHeaderStatusMode } from "@/lib/headerStatus";
+import { isWindows } from "@/lib/platform";
 import {
   SettingFieldGrid,
   SettingRow,
@@ -18,7 +20,7 @@ const HIDDEN_HEADER_STATUS_VALUE = "hidden";
 export function GeneralTab() {
   const { t, i18n } = useTranslation();
   const { appSettings, updateAppSettings, updateUi } = useApp();
-  const { handleExportDiagnostics, handleOpenLogs } = useConfigTransfer();
+  const { handleExportDiagnostics, handleOpenLogs, transferBusy } = useConfigTransfer();
   const headerStatusSettingValue =
     appSettings.ui.header_status_visible === false
       ? HIDDEN_HEADER_STATUS_VALUE
@@ -69,6 +71,29 @@ export function GeneralTab() {
       </SettingSection>
 
       <SettingSection contentClassName="space-y-4">
+        {isWindows && (
+          <SettingSelect
+            label={t("settings.rdpClient")}
+            desc={t("settings.rdpClientDesc")}
+            value={appSettings.general.rdp_client_mode ?? "builtin"}
+            onValueChange={(value) =>
+              updateAppSettings({
+                general: {
+                  ...appSettings.general,
+                  rdp_client_mode: value === "windows" ? "windows" : "builtin",
+                },
+              })
+            }
+          >
+            <SelectItem value="builtin">
+              {t("settings.rdpClientBuiltin")}
+            </SelectItem>
+            <SelectItem value="windows">
+              {t("settings.rdpClientWindows")}
+            </SelectItem>
+          </SettingSelect>
+        )}
+
         <SettingRow label={t("settings.startupRestore")} desc={t("settings.startupRestoreDesc")}>
           <SettingSwitch
             checked={appSettings.general.startup_restore}
@@ -98,6 +123,7 @@ export function GeneralTab() {
 
         <SettingRow label={t("settings.minimizeToTray")} desc={t("settings.minimizeToTrayDesc")}>
           <SettingSwitch
+            disabled={!supports("tray")}
             checked={appSettings.general.minimize_to_tray}
             onChange={(v) =>
               updateAppSettings({ general: { ...appSettings.general, minimize_to_tray: v } })
@@ -160,17 +186,19 @@ export function GeneralTab() {
           </SettingSelect>
         </SettingFieldGrid>
 
-        <SettingRow label={t("settings.openLogs")} desc={t("settings.openLogsDesc")}>
-          <Button variant="outline" size="sm" onClick={handleOpenLogs}>
-            {t("settings.openLogs")}
-          </Button>
-        </SettingRow>
+        {runtime === "desktop" && (
+          <SettingRow label={t("settings.openLogs")} desc={t("settings.openLogsDesc")}>
+            <Button variant="outline" size="sm" onClick={handleOpenLogs}>
+              {t("settings.openLogs")}
+            </Button>
+          </SettingRow>
+        )}
 
         <SettingRow
           label={t("settings.exportDiagnostics")}
           desc={t("settings.exportDiagnosticsDesc")}
         >
-          <Button size="sm" onClick={handleExportDiagnostics}>
+          <Button size="sm" disabled={transferBusy} onClick={handleExportDiagnostics}>
             {t("settings.exportDiagnostics")}
           </Button>
         </SettingRow>

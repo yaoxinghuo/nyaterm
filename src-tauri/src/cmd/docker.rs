@@ -104,6 +104,21 @@ enum DockerCommandMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockerComposeBackend {
+    Plugin,
+    Standalone,
+}
+
+impl DockerComposeBackend {
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Plugin => "NYATERM_COMPOSE_BACKEND\tplugin",
+            Self::Standalone => "NYATERM_COMPOSE_BACKEND\tstandalone",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DockerOutputClassification {
     Success,
     DockerSocketPermissionDenied,
@@ -597,23 +612,34 @@ pub async fn prepare_docker_compose_service_logs_command(
     service_name: String,
     tail: u32,
 ) -> AppResult<PreparedDockerTerminalCommand> {
-    let mode = run_docker_command(
+    let result = run_docker_command(
         &app,
         state.inner(),
         sudo_state.inner(),
         &session_id,
         |docker| {
-            let base = build_compose_base_command(docker, &project_name, config_files.as_deref());
-            format!("{base} ps --all --format json {}", sh_quote(&service_name))
+            build_compose_with_fallback(docker, |compose, backend| {
+                let base =
+                    build_compose_base_command(compose, &project_name, config_files.as_deref());
+                format!(
+                    "{base} ps --all --format json {} && printf '\\n{}\\n'",
+                    sh_quote(&service_name),
+                    backend.marker()
+                )
+            })
         },
         "Docker compose service probe failed",
         DOCKER_TIMEOUT,
     )
-    .await?
-    .mode;
+    .await?;
+    let backend = parse_compose_backend(&result.output.stdout).ok_or_else(|| {
+        AppError::Channel("Docker compose backend probe returned no backend marker".to_string())
+    })?;
+    let mode = result.mode;
     let tail = tail.clamp(10, 2000);
     Ok(prepare_terminal_command(mode, |docker| {
-        let base = build_compose_base_command(docker, &project_name, config_files.as_deref());
+        let compose = compose_command_for_backend(docker, backend);
+        let base = build_compose_base_command(&compose, &project_name, config_files.as_deref());
         format!("{base} logs -f --tail {tail} {}", sh_quote(&service_name))
     }))
 }
@@ -981,12 +1007,50 @@ async fn docker_session_prompt_context(
     ))
 }
 
-fn build_compose_base_command(
+fn standalone_compose_command(docker: &str) -> String {
+    docker
+        .strip_suffix("docker")
+        .map(|prefix| format!("{prefix}docker-compose"))
+        .unwrap_or_else(|| "docker-compose".to_string())
+}
+
+fn compose_command_for_backend(docker: &str, backend: DockerComposeBackend) -> String {
+    match backend {
+        DockerComposeBackend::Plugin => format!("{docker} compose"),
+        DockerComposeBackend::Standalone => standalone_compose_command(docker),
+    }
+}
+
+fn build_compose_with_fallback(
     docker: &str,
+    build: impl Fn(&str, DockerComposeBackend) -> String,
+) -> String {
+    let plugin = compose_command_for_backend(docker, DockerComposeBackend::Plugin);
+    let standalone = compose_command_for_backend(docker, DockerComposeBackend::Standalone);
+    let plugin_command = build(&plugin, DockerComposeBackend::Plugin);
+    let standalone_command = build(&standalone, DockerComposeBackend::Standalone);
+
+    format!(
+        "if {plugin} version >/dev/null 2>&1; then {plugin_command}; else \
+         compose_version=$({standalone} version --short 2>/dev/null || true); \
+         case \"$compose_version\" in 2.*|v2.*) {standalone_command} ;; *) exit 127 ;; esac; fi"
+    )
+}
+
+fn parse_compose_backend(output: &str) -> Option<DockerComposeBackend> {
+    output.lines().rev().find_map(|line| match line.trim() {
+        "NYATERM_COMPOSE_BACKEND\tplugin" => Some(DockerComposeBackend::Plugin),
+        "NYATERM_COMPOSE_BACKEND\tstandalone" => Some(DockerComposeBackend::Standalone),
+        _ => None,
+    })
+}
+
+fn build_compose_base_command(
+    compose: &str,
     project_name: &str,
     config_files: Option<&str>,
 ) -> String {
-    let mut command = format!("{docker} compose");
+    let mut command = compose.to_string();
 
     if let Some(config_files) = config_files.filter(|value| !value.trim().is_empty()) {
         for file in config_files
@@ -1017,13 +1081,15 @@ fn build_compose_action_command(
     config_files: Option<&str>,
     action: &str,
 ) -> String {
-    let mut command = build_compose_base_command(docker, project_name, config_files);
-    command.push(' ');
-    command.push_str(action);
-    if action == "up" {
-        command.push_str(" -d");
-    }
-    command
+    build_compose_with_fallback(docker, |compose, _| {
+        let mut command = build_compose_base_command(compose, project_name, config_files);
+        command.push(' ');
+        command.push_str(action);
+        if action == "up" {
+            command.push_str(" -d");
+        }
+        command
+    })
 }
 
 fn build_compose_services_command(
@@ -1031,14 +1097,16 @@ fn build_compose_services_command(
     project_name: &str,
     config_files: Option<&str>,
 ) -> String {
-    let base = build_compose_base_command(docker, project_name, config_files);
-    format!(
-        "services_output=$({base} config --services) || exit $?; \
-         printf '%s\\n' \"$services_output\"; \
-         printf '\\n{COMPOSE_PS_JSON_BEGIN}\\n'; \
-         {base} ps --all --format json || true; \
-         printf '\\n{COMPOSE_PS_JSON_END}\\n'"
-    )
+    build_compose_with_fallback(docker, |compose, _| {
+        let base = build_compose_base_command(compose, project_name, config_files);
+        format!(
+            "services_output=$({base} config --services) || exit $?; \
+             printf '%s\\n' \"$services_output\"; \
+             printf '\\n{COMPOSE_PS_JSON_BEGIN}\\n'; \
+             {base} ps --all --format json || true; \
+             printf '\\n{COMPOSE_PS_JSON_END}\\n'"
+        )
+    })
 }
 
 fn build_compose_service_action_command(
@@ -1048,10 +1116,17 @@ fn build_compose_service_action_command(
     service_name: &str,
     action: &str,
 ) -> String {
-    let mut command = build_compose_action_command(docker, project_name, config_files, action);
-    command.push(' ');
-    command.push_str(&sh_quote(service_name));
-    command
+    build_compose_with_fallback(docker, |compose, _| {
+        let mut command = build_compose_base_command(compose, project_name, config_files);
+        command.push(' ');
+        command.push_str(action);
+        if action == "up" {
+            command.push_str(" -d");
+        }
+        command.push(' ');
+        command.push_str(&sh_quote(service_name));
+        command
+    })
 }
 
 fn split_compose_services_output(output: &str) -> (String, String) {
@@ -1451,10 +1526,49 @@ mod tests {
             "web api",
             "restart",
         );
-        assert_eq!(
-            command,
+        assert!(command.contains(
             "sudo -n docker compose -f '/srv/demo/docker-compose.yml' -f '/srv/demo/it'\"'\"'s.yml' -p 'demo prod' restart 'web api'"
+        ));
+        assert!(command.contains(
+            "sudo -n docker-compose -f '/srv/demo/docker-compose.yml' -f '/srv/demo/it'\"'\"'s.yml' -p 'demo prod' restart 'web api'"
+        ));
+        assert!(command.contains("sudo -n docker-compose version --short"));
+    }
+
+    #[test]
+    fn parses_compose_backend_probe_marker() {
+        assert_eq!(
+            parse_compose_backend("[]\nNYATERM_COMPOSE_BACKEND\tstandalone\n"),
+            Some(DockerComposeBackend::Standalone)
         );
+        assert_eq!(
+            parse_compose_backend("[]\nNYATERM_COMPOSE_BACKEND\tplugin\n"),
+            Some(DockerComposeBackend::Plugin)
+        );
+    }
+
+    #[test]
+    fn prepared_compose_terminal_command_uses_detected_standalone_backend() {
+        let prepared = prepare_terminal_command(
+            DockerCommandMode::SudoPassword {
+                password: "secret".to_string(),
+            },
+            |docker| {
+                let compose = compose_command_for_backend(docker, DockerComposeBackend::Standalone);
+                let base = build_compose_base_command(&compose, "demo", Some("/srv/compose.yml"));
+                format!("{base} logs -f --tail 200 'web'")
+            },
+        );
+
+        assert_eq!(
+            prepared.command,
+            format!(
+                "{}docker-compose -f '/srv/compose.yml' -p 'demo' logs -f --tail 200 'web'",
+                DOCKER_SUDO_STDIN_TERMINAL.strip_suffix("docker").unwrap()
+            )
+        );
+        assert_eq!(prepared.stdin.as_deref(), Some("secret\n"));
+        assert!(!prepared.command.contains("secret"));
     }
 
     #[test]

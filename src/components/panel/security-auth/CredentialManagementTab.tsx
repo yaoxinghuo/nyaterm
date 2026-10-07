@@ -195,11 +195,26 @@ export function CredentialManagementTab({
   const saveDisabled =
     passwordLoading || !editEntry.name?.trim() || (isNew && !editEntry.password) || !regexValid;
 
+  const invalidatePasswordCache = useCallback((id: string) => {
+    setPasswordCache((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setRevealedIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+  }, []);
+
   const handleSave = useCallback(async () => {
     if (saveDisabled) return;
 
     try {
-      await invoke("save_credential", {
+      const savedId = await invoke<string>("save_credential", {
         entry: {
           enabled: editEntry.enabled ?? true,
           id: isNew ? "" : editingId,
@@ -211,23 +226,35 @@ export function CredentialManagementTab({
           username_prompt_regex: editEntry.username_prompt_regex?.trim() || null,
         },
       });
+      // The saved ciphertext may have changed; drop any cached plaintext so the
+      // eye toggle re-fetches the current value instead of showing a stale one.
+      invalidatePasswordCache(savedId);
       resetEdit();
       await loadCredentials();
     } catch {
       /* ignore */
     }
-  }, [editEntry, editingId, isNew, loadCredentials, resetEdit, saveDisabled]);
+  }, [
+    editEntry,
+    editingId,
+    invalidatePasswordCache,
+    isNew,
+    loadCredentials,
+    resetEdit,
+    saveDisabled,
+  ]);
 
   const handleDeleteConfirm = useCallback(async () => {
     if (!deletingEntry) return;
     try {
       await invoke("delete_credential", { id: deletingEntry.id });
+      invalidatePasswordCache(deletingEntry.id);
       await loadCredentials();
     } catch {
       /* ignore */
     }
     setDeletingEntry(null);
-  }, [deletingEntry, loadCredentials]);
+  }, [deletingEntry, invalidatePasswordCache, loadCredentials]);
 
   const runUnlockedAction = useCallback(
     (action: () => void | Promise<void>) => {

@@ -38,46 +38,14 @@ async fn telnet_session_task(
     manager: Arc<SessionManager>,
     mut cmd_rx: SessionCommandReceiver,
     output_control_tx: SessionCommandSender,
+    stream: crate::core::network::BoxedTransportStream,
     config: TelnetSessionConfig,
     connection_id: Option<String>,
     encoding: String,
     startup_command: Option<TelnetStartupCommand>,
 ) {
     let backspace_as_bs = config.backspace_mode == "ctrl_h";
-    let host = config.host.clone();
-    let port = config.port;
-    let addr = format!("{}:{}", host, port);
-    let stream = match TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            log_event(StructuredLog {
-                level: StructuredLogLevel::Error,
-                domain: "session.lifecycle".to_string(),
-                event: "session.connection_failed".to_string(),
-                message: "Telnet connection failed".to_string(),
-                ids: Some(serde_json::json!({
-                    "session_id": session_id.clone(),
-                    "connection_id": connection_id.clone(),
-                })),
-                data: Some(serde_json::json!({
-                    "session_type": "Telnet",
-                    "host": host,
-                    "port": port,
-                })),
-                error: Some(serde_json::json!({ "message": e.to_string() })),
-                client_timestamp: None,
-            });
-            let _ = app.emit(
-                &format!("session-error-{}", session_id),
-                format!("Connection failed: {}", e),
-            );
-            let _ = app.emit(&format!("session-closed-{}", session_id), ());
-            manager.remove_session(&session_id).await;
-            return;
-        }
-    };
-
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = tokio::io::split(stream);
     let output_event = format!("terminal-output-{}", session_id);
     let closed_event = format!("session-closed-{}", session_id);
     let recording_mgr: Option<Arc<RecordingManager>> = app
@@ -127,6 +95,7 @@ async fn telnet_session_task(
         let mut buf = [0u8; 4096];
         let mut zmodem_detector = ZmodemDetector::new();
         let mut output_decoder = TerminalOutputDecoder::new(&encoding_reader);
+        let mut telnet_decoder = TelnetDecoder::default();
         'reader: loop {
             while *pause_rx.borrow() {
                 if pause_rx.changed().await.is_err() {
@@ -137,10 +106,10 @@ async fn telnet_session_task(
                 Ok(0) => break,
                 Ok(n) => {
                     let visible = if reader_config.raw_tcp_cli {
-                        unescape_iac_iac(&buf[..n])
+                        buf[..n].to_vec()
                     } else {
                         let neg_tx = negotiate_tx.clone();
-                        strip_telnet_commands(&buf[..n], &mut |cmd, opt| {
+                        telnet_decoder.decode(&buf[..n], &mut |cmd, opt| {
                             let resp = negotiate_response(
                                 cmd,
                                 opt,
@@ -203,9 +172,7 @@ async fn telnet_session_task(
 
                     let visible = if zmodem_download_oo_drain_reader.lock().await.is_active() {
                         let mut drain = zmodem_download_oo_drain_reader.lock().await;
-                        drain
-                            .filter(&visible, std::time::Instant::now())
-                            .to_vec()
+                        drain.filter(&visible, std::time::Instant::now()).to_vec()
                     } else {
                         visible
                     };
@@ -275,9 +242,7 @@ async fn telnet_session_task(
                         {
                             let mut auto = auto_login_for_reader.lock().await;
                             if let Some(auto) = auto.as_mut() {
-                                for action in
-                                    auto.handle_text(&text, std::time::Instant::now())
-                                {
+                                for action in auto.handle_text(&text, std::time::Instant::now()) {
                                     let _ = auto_login_tx.send(action);
                                 }
                             }
@@ -407,7 +372,7 @@ async fn telnet_session_task(
                     Some(SessionCommand::DetachRenderer) => {
                         output.detach();
                     }
-                    Some(SessionCommand::Write { mut data, automated, .. }) => {
+                    Some(SessionCommand::Write { mut data, raw, automated, .. }) => {
                         if !automated {
                             let mut auto = auto_login.lock().await;
                             if let Some(auto) = auto.as_mut() {
@@ -430,7 +395,13 @@ async fn telnet_session_task(
                         }
 
                         let mut write_failed = None;
-                        if line_edit_active {
+                        if raw {
+                            let send_data = prepare_terminal_write_input(data, &encoding, true, false);
+                            let send_data = escape_telnet_application_data(&send_data, config.raw_tcp_cli);
+                            if let Err(e) = writer.write_all(&send_data).await {
+                                write_failed = Some(e);
+                            }
+                        } else if line_edit_active {
                             let edit_result = line_editor.process(&data, config.enter_mode);
                             if !edit_result.display.is_empty() {
                                 output.push_owned(edit_result.display);
@@ -454,7 +425,7 @@ async fn telnet_session_task(
                                     output.push_owned(echoed);
                                 }
                             }
-                            let send_data = encode_terminal_input(&data, &encoding);
+                            let send_data = prepare_terminal_write_input(data, &encoding, false, false);
                             for chunk in split_write_chunks(&send_data, config.force_character_at_a_time) {
                                 if let Err(e) = writer.write_all(&chunk).await {
                                     write_failed = Some(e);
@@ -555,6 +526,11 @@ async fn telnet_session_task(
                         }
                         *zm = None;
                     }
+                    Some(SessionCommand::SerialModemUpload { result_tx, .. }) => {
+                        let _ = result_tx.send(Err(
+                            "Direct modem upload is only available for Serial sessions".to_string(),
+                        ));
+                    }
                     Some(SessionCommand::TmuxCommand { .. } | SessionCommand::TmuxDetach) => {}
                     Some(SessionCommand::Close) | None => {
                         break;
@@ -567,7 +543,7 @@ async fn telnet_session_task(
     output.close();
     reader_handle.abort();
     if let Some(ref recorder) = recording_mgr {
-        recorder.cleanup_session(&session_id);
+        recorder.disconnect_session(&session_id);
     }
     manager.remove_session(&session_id).await;
     let _ = app.emit(&closed_event, ());

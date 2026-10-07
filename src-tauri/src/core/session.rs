@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
@@ -245,6 +245,7 @@ pub enum SessionCommand {
     /// Input to send to the terminal.
     Write {
         data: Vec<u8>,
+        raw: bool,
         automated: bool,
         origin: InputOrigin,
         sensitivity: InputSensitivity,
@@ -277,6 +278,13 @@ pub enum SessionCommand {
     },
     /// ZMODEM: user cancelled the ZMODEM transfer.
     ZmodemCancel,
+    /// Serial: start the saved connection's direct modem upload protocol.
+    SerialModemUpload {
+        files: Vec<std::path::PathBuf>,
+        conflict_mode: ZmodemUploadConflictMode,
+        preserve_timestamps: bool,
+        result_tx: oneshot::Sender<Result<(), String>>,
+    },
     /// tmux control mode: write one raw command line to the control channel
     /// (used by the tmux bar for `select-window`, `split-window`, ...).
     TmuxCommand { line: String },
@@ -315,18 +323,8 @@ impl SessionCommandQueueMetrics {
     }
 
     fn reserve_enqueue(&self) -> usize {
-        self.queued_commands
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_add(1))
-            })
-            .unwrap_or(u64::MAX);
-        let previous = self
-            .current_pending
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_add(1))
-            })
-            .unwrap_or(usize::MAX);
-        previous.saturating_add(1)
+        saturating_atomic_add_u64(&self.queued_commands, 1);
+        saturating_atomic_add_usize(&self.current_pending, 1)
     }
 
     fn commit_enqueue(&self, pending: usize) {
@@ -352,11 +350,7 @@ impl SessionCommandQueueMetrics {
     }
 
     fn mark_processed(&self) {
-        self.processed_commands
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_add(1))
-            })
-            .ok();
+        saturating_atomic_add_u64(&self.processed_commands, 1);
         let pending = saturating_atomic_sub_usize(&self.current_pending, 1);
         self.relax_pressure_tier(pending);
     }
@@ -425,22 +419,49 @@ impl SessionCommandQueueMetrics {
     }
 }
 
+// Use compare-exchange loops to retain Rust 1.94 compatibility: try_update is newer.
+fn saturating_atomic_add_usize(value: &AtomicUsize, amount: usize) -> usize {
+    let mut current = value.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(amount);
+        match value.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn saturating_atomic_add_u64(value: &AtomicU64, amount: u64) -> u64 {
+    let mut current = value.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(amount);
+        match value.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 fn saturating_atomic_sub_usize(value: &AtomicUsize, amount: usize) -> usize {
-    value
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_sub(amount))
-        })
-        .map(|previous| previous.saturating_sub(amount))
-        .unwrap_or(0)
+    let mut current = value.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(amount);
+        match value.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 fn saturating_atomic_sub_u64(value: &AtomicU64, amount: u64) -> u64 {
-    value
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_sub(amount))
-        })
-        .map(|previous| previous.saturating_sub(amount))
-        .unwrap_or(0)
+    let mut current = value.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(amount);
+        match value.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 pub struct SessionCommandSender {
@@ -781,6 +802,10 @@ impl SessionManager {
         let _ = self.app_handle.set(app);
     }
 
+    pub(crate) fn app_handle(&self) -> Option<&tauri::AppHandle> {
+        self.app_handle.get()
+    }
+
     pub fn set_recording_manager(&self, recording_manager: Arc<RecordingManager>) {
         let _ = self.recording_manager.set(recording_manager);
     }
@@ -842,6 +867,9 @@ impl SessionManager {
         }
         if removed {
             if let Some(app) = self.app_handle.get() {
+                if let Some(plugins) = app.try_state::<Arc<super::plugins::PluginManager>>() {
+                    plugins.revoke_session(id).await;
+                }
                 let _ = app.emit("sessions-changed", ());
                 crate::tray::schedule_refresh(app);
             }
@@ -855,6 +883,22 @@ impl SessionManager {
         session_id: &str,
     ) -> Option<ZmodemPreparedUpload> {
         self.pending_zmodem_uploads.lock().await.remove(session_id)
+    }
+
+    /// Stores a direct Serial ZMODEM upload until the remote receiver sends ZRINIT.
+    pub async fn prepare_zmodem_upload(
+        &self,
+        session_id: &str,
+        upload: ZmodemPreparedUpload,
+    ) -> AppResult<()> {
+        let mut pending = self.pending_zmodem_uploads.lock().await;
+        if pending.contains_key(session_id) {
+            return Err(AppError::Config(
+                "A ZMODEM upload is already waiting for the receiver".to_string(),
+            ));
+        }
+        pending.insert(session_id.to_string(), upload);
+        Ok(())
     }
 
     /// Clears prepared ZMODEM upload paths without starting a transfer.
@@ -1453,6 +1497,7 @@ mod tests {
                 "sftp-only",
                 SessionCommand::Write {
                     data: b"ignored".to_vec(),
+                    raw: false,
                     automated: false,
                     origin: InputOrigin::Keyboard,
                     sensitivity: crate::core::InputSensitivity::Normal,
@@ -1546,6 +1591,7 @@ mod tests {
                 "local-startup",
                 SessionCommand::Write {
                     data: b"x".to_vec(),
+                    raw: false,
                     automated: false,
                     origin: InputOrigin::Keyboard,
                     sensitivity: super::InputSensitivity::Normal,
@@ -1795,6 +1841,36 @@ mod tests {
                 max_pending_observed: 1001,
             }
         );
+    }
+
+    #[test]
+    fn command_queue_metrics_saturate_at_counter_limits() {
+        let metrics = super::SessionCommandQueueMetrics::new("queue-limits".to_string());
+        metrics
+            .queued_commands
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        metrics
+            .processed_commands
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        metrics
+            .current_pending
+            .store(usize::MAX - 1, Ordering::Relaxed);
+
+        assert_eq!(metrics.reserve_enqueue(), usize::MAX);
+        assert_eq!(metrics.reserve_enqueue(), usize::MAX);
+        assert_eq!(metrics.snapshot().queued_commands, u64::MAX);
+        metrics.mark_processed();
+        metrics.mark_processed();
+        assert_eq!(metrics.snapshot().processed_commands, u64::MAX);
+        assert_eq!(metrics.snapshot().current_pending, usize::MAX - 2);
+
+        metrics.queued_commands.store(1, Ordering::Relaxed);
+        metrics.current_pending.store(1, Ordering::Relaxed);
+        metrics.rollback_enqueue();
+        metrics.rollback_enqueue();
+        metrics.mark_processed();
+        assert_eq!(metrics.snapshot().queued_commands, 0);
+        assert_eq!(metrics.snapshot().current_pending, 0);
     }
 
     #[test]

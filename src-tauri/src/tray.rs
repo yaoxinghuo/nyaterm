@@ -371,6 +371,9 @@ fn rebuild_root_menu(
         settings.general.minimize_to_tray,
         None::<&str>,
     )?;
+    let is_package_managed = app
+        .try_state::<crate::runtime::AppRuntime>()
+        .is_some_and(|runtime| runtime.package_manager().is_some());
     let check_updates = new_menu_item(app, MENU_CHECK_UPDATES, strings.check_updates, true)?;
     let separator_3 = PredefinedMenuItem::separator(app)?;
     let quit = new_menu_item(app, MENU_QUIT, strings.quit, true)?;
@@ -390,7 +393,9 @@ fn rebuild_root_menu(
         menu.append(&lock_screen)?;
     }
 
-    menu.append(&check_updates)?;
+    if !is_package_managed {
+        menu.append(&check_updates)?;
+    }
     menu.append(&separator_3)?;
     menu.append(&quit)?;
     Ok(())

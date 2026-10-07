@@ -3,6 +3,8 @@ import { FolderOpen } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MdContentCopy, MdDelete, MdDriveFileRenameOutline, MdEdit, MdLink } from "react-icons/md";
 import { toast } from "sonner";
+import { PluginContextMenuItems } from "@/components/plugins/PluginContextMenuItems";
+import { Badge } from "@/components/ui/badge";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -105,6 +107,15 @@ function getConnectionDetailRows(
 ): ConnectionDetailRow[] {
   const description =
     formatOptionalDetailValue(conn.description) ?? t("savedConnections.noDescription");
+  const tagRows: ConnectionDetailRow[] = conn.tags?.length
+    ? [
+        {
+          label: t("savedConnections.tags"),
+          value: conn.tags.join(" · "),
+          multiline: true,
+        },
+      ]
+    : [];
 
   switch (conn.type) {
     case "local_terminal": {
@@ -123,6 +134,7 @@ function getConnectionDetailRows(
           label: t("savedConnections.workingDir"),
           value: formatRequiredDetailValue(conn.working_dir, t),
         },
+        ...tagRows,
         {
           label: t("savedConnections.description"),
           value: description,
@@ -148,6 +160,7 @@ function getConnectionDetailRows(
           value: formatRequiredDetailValue(conn.username, t),
           copyValue: getCopyDetailValue(conn.username),
         },
+        ...tagRows,
         {
           label: t("savedConnections.description"),
           value: description,
@@ -173,6 +186,7 @@ function getConnectionDetailRows(
       const stopBits = formatOptionalDetailValue(conn.stop_bits);
       if (parity) rows.push({ label: t("savedConnections.parity"), value: parity });
       if (stopBits) rows.push({ label: t("savedConnections.stopBits"), value: stopBits });
+      rows.push(...tagRows);
       rows.push({
         label: t("savedConnections.description"),
         value: description,
@@ -206,6 +220,7 @@ function getConnectionDetailRows(
           multiline: true,
         });
       }
+      rows.push(...tagRows);
       rows.push({
         label: t("savedConnections.description"),
         value: description,
@@ -342,13 +357,17 @@ export default function ConnectionItem({ conn, indented, depth = 0 }: Connection
       : t("savedConnections.connect");
   const directConnectLabel = t("savedConnections.connect");
   const iconStyle = { color: isSelected || isKeyboardActive ? "var(--df-primary)" : iconDef.color };
+  const visibleTags = (conn.tags ?? []).slice(0, 2);
+  const remainingTagCount = Math.max(0, (conn.tags?.length ?? 0) - visibleTags.length);
   const indentLeft = indented ? `${8 + depth * 16 + 16}px` : "0.5rem";
   const [detailsOpen, setDetailsOpen] = useState(false);
   const detailsOpenTimerRef = useRef<number | null>(null);
   const detailsCloseTimerRef = useRef<number | null>(null);
   const suppressDetailsUntilLeaveRef = useRef(false);
+  const itemRef = useRef<HTMLDivElement | null>(null);
   const registerSelf = useCallback(
     (element: HTMLDivElement | null) => {
+      itemRef.current = element;
       registerConnectionElement(conn.id, element);
     },
     [conn.id, registerConnectionElement],
@@ -413,6 +432,12 @@ export default function ConnectionItem({ conn, indented, depth = 0 }: Connection
     closeDetails(true);
   }, [closeDetails]);
 
+  const handleEditConnection = useCallback(() => {
+    closeAndSuppressDetails();
+    itemRef.current?.focus({ preventScroll: true });
+    onEditConnection(conn);
+  }, [closeAndSuppressDetails, conn, onEditConnection]);
+
   useEffect(
     () => () => {
       clearDetailsOpenTimer();
@@ -428,9 +453,25 @@ export default function ConnectionItem({ conn, indented, depth = 0 }: Connection
           ref={registerSelf}
           data-saved-drop-type="connection"
           data-saved-drop-id={conn.id}
+          tabIndex={-1}
           className="relative min-w-full w-max"
           draggable={isDragEnabled && !isPointerDragEnabled}
           onWheel={closeAndSuppressDetails}
+          onKeyDown={(event) => {
+            if (
+              event.target !== event.currentTarget ||
+              event.defaultPrevented ||
+              event.nativeEvent.isComposing ||
+              event.key === "Process" ||
+              event.key !== "Enter"
+            ) {
+              return;
+            }
+
+            event.preventDefault();
+            closeAndSuppressDetails();
+            handleConnectOnly(conn);
+          }}
           onPointerDown={
             isPointerDragEnabled
               ? (e) => {
@@ -524,13 +565,13 @@ export default function ConnectionItem({ conn, indented, depth = 0 }: Connection
             <Tooltip open={detailsOpen}>
               <TooltipTrigger asChild>
                 <span
-                  className="flex min-w-0 shrink-0 items-center gap-2 pr-14"
+                  className="flex min-w-0 items-center gap-2 pr-14"
                   onPointerEnter={scheduleDetailsOpen}
                   onPointerLeave={handlePointerLeave}
                 >
                   <ConnIcon className="text-sm shrink-0" style={iconStyle} />
                   <span
-                    className="shrink-0 whitespace-nowrap text-xs font-medium"
+                    className="min-w-12 max-w-48 truncate whitespace-nowrap text-xs font-medium"
                     style={{
                       color:
                         isSelected || isKeyboardActive ? "var(--df-primary)" : "var(--df-text)",
@@ -538,6 +579,32 @@ export default function ConnectionItem({ conn, indented, depth = 0 }: Connection
                   >
                     {conn.name}
                   </span>
+                  {visibleTags.length > 0 ? (
+                    <span
+                      className="flex min-w-0 max-w-48 shrink items-center gap-1 overflow-hidden"
+                      title={conn.tags?.join(" · ")}
+                    >
+                      {visibleTags.map((tag) => (
+                        <Badge
+                          key={tag}
+                          variant="outline"
+                          data-connection-tag={tag}
+                          className="h-4 max-w-24 px-1 text-[0.625rem] font-normal text-muted-foreground"
+                        >
+                          <span className="truncate">{tag}</span>
+                        </Badge>
+                      ))}
+                      {remainingTagCount > 0 ? (
+                        <Badge
+                          variant="outline"
+                          data-connection-tag-overflow
+                          className="h-4 px-1 text-[0.625rem] font-normal text-muted-foreground"
+                        >
+                          +{remainingTagCount}
+                        </Badge>
+                      ) : null}
+                    </span>
+                  ) : null}
                 </span>
               </TooltipTrigger>
               <ConnectionDetailsTooltip
@@ -586,8 +653,7 @@ export default function ConnectionItem({ conn, indented, depth = 0 }: Connection
                 }}
                 onClick={(e) => {
                   e.stopPropagation();
-                  closeAndSuppressDetails();
-                  onEditConnection(conn);
+                  handleEditConnection();
                 }}
               >
                 <MdEdit className="text-[0.95rem] cursor-pointer" />
@@ -629,8 +695,7 @@ export default function ConnectionItem({ conn, indented, depth = 0 }: Connection
         ) : null}
         <ContextMenuItem
           onClick={() => {
-            closeAndSuppressDetails();
-            onEditConnection(conn);
+            handleEditConnection();
           }}
         >
           <MdEdit className="text-[0.875rem] text-muted-foreground mr-2" />
@@ -677,6 +742,7 @@ export default function ConnectionItem({ conn, indented, depth = 0 }: Connection
             ? t("savedConnections.deleteSelected")
             : t("savedConnections.delete")}
         </ContextMenuItem>
+        <PluginContextMenuItems menu="connection" connectionId={conn.id} />
       </ContextMenuContent>
     </ContextMenu>
   );

@@ -1,4 +1,5 @@
-import { downloadDir } from "@tauri-apps/api/path";
+import { supports } from "@/lib/backend/runtime";
+import { downloadDir } from "@/lib/backend/platform/path";
 import {
   type ElementType,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -71,6 +72,14 @@ function getTransferDisplayRank(transfer: TransferItem): number {
   if (transfer.status === "transferring") return 0;
   if (transfer.status === "queued") return 1;
   return 2;
+}
+
+function isBackendModemTransfer(transfer: TransferItem): boolean {
+  return transfer.source === "zmodem" || transfer.source === "serial_modem";
+}
+
+function isRestrictedBackendTransfer(transfer: TransferItem): boolean {
+  return isBackendModemTransfer(transfer) || transfer.source === "rdp";
 }
 
 function HeaderActionButton({
@@ -154,20 +163,42 @@ function TransferRow({
       : item.totalSize > 0
         ? Math.min(100, Math.round((item.bytesTransferred / item.totalSize) * 100))
         : 0;
-  const isZmodemTransfer = item.source === "zmodem";
-  const canPause = !isZmodemTransfer && item.status === "transferring";
-  const canPauseQueued = !isZmodemTransfer && item.status === "queued";
-  const canResume = !isZmodemTransfer && item.status === "paused";
-  const canRetry = !isZmodemTransfer && (item.status === "error" || item.status === "cancelled");
+  const isModemTransfer = isBackendModemTransfer(item);
+  const isRestrictedTransfer = isRestrictedBackendTransfer(item);
+  const canPause =
+    supports("transferControl") &&
+    !isRestrictedTransfer &&
+    item.status === "transferring";
+  const canPauseQueued =
+    supports("transferControl") &&
+    !isRestrictedTransfer &&
+    item.status === "queued";
+  const canResume =
+    supports("transferControl") &&
+    !isRestrictedTransfer &&
+    item.status === "paused";
+  const canRetry =
+    supports("transferControl") &&
+    !isRestrictedTransfer &&
+    (item.status === "error" || item.status === "cancelled");
   const canCancel =
-    !isZmodemTransfer &&
+    supports("transferControl") &&
+    !isModemTransfer &&
     (item.status === "queued" || item.status === "transferring" || item.status === "paused");
-  const canDelete = isZmodemTransfer
+  const canDelete = isModemTransfer
     ? item.status !== "transferring"
     : !canCancel || item.status === "queued" || item.queueState === "pending";
 
   let statusColor = "#facc15";
   let statusText = formatRate(item.speedBytesPerSec ?? 0);
+
+  if (
+    item.source === "serial_modem" &&
+    item.status === "transferring" &&
+    item.bytesTransferred === 0
+  ) {
+    statusText = t("terminal.serialModemWaiting");
+  }
 
   if (item.status === "queued") {
     statusColor = "#a1a1aa";
@@ -177,7 +208,10 @@ function TransferRow({
     statusText = t("fileTransfer.paused");
   } else if (item.status === "completed") {
     statusColor = "#4ade80";
-    statusText = t("fileTransfer.completed");
+    statusText =
+      item.source === "rdp" && item.direction === "download"
+        ? t("fileTransfer.readyToPaste")
+        : t("fileTransfer.completed");
   } else if (item.status === "error") {
     statusColor = "#f87171";
     statusText = t("fileTransfer.error");
@@ -236,7 +270,8 @@ function TransferRow({
                   <>
                     <span className="shrink-0">·</span>
                     <span className="truncate">
-                      {formatSize(item.bytesTransferred)} / {formatSize(item.totalSize)}
+                      {formatSize(item.bytesTransferred)} /{" "}
+                      {formatSize(item.totalSize)}
                     </span>
                   </>
                 ) : item.status === "completed" && item.size > 0 && item.totalSize === 0 ? (
@@ -297,23 +332,27 @@ function TransferRow({
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent className="min-w-[180px]">
-        {!isZmodemTransfer && (
+        {!isModemTransfer && (
           <>
-            <ContextMenuItem
-              onClick={() => onPause(item.id)}
-              disabled={!canPause && !canPauseQueued}
-            >
-              <MdPause className="mr-2 text-[0.875rem]" />
-              {t("fileTransfer.pause")}
-            </ContextMenuItem>
-            <ContextMenuItem onClick={() => onResume(item.id)} disabled={!canResume}>
-              <MdPlayArrow className="mr-2 text-[0.875rem]" />
-              {t("fileTransfer.resume")}
-            </ContextMenuItem>
-            <ContextMenuItem onClick={() => onRetry(item)} disabled={!canRetry}>
-              <MdRefresh className="mr-2 text-[0.875rem]" />
-              {t("fileTransfer.retry")}
-            </ContextMenuItem>
+            {item.source !== "rdp" && (
+              <>
+                <ContextMenuItem
+                  onClick={() => onPause(item.id)}
+                  disabled={!canPause && !canPauseQueued}
+                >
+                  <MdPause className="mr-2 text-[0.875rem]" />
+                  {t("fileTransfer.pause")}
+                </ContextMenuItem>
+                <ContextMenuItem onClick={() => onResume(item.id)} disabled={!canResume}>
+                  <MdPlayArrow className="mr-2 text-[0.875rem]" />
+                  {t("fileTransfer.resume")}
+                </ContextMenuItem>
+                <ContextMenuItem onClick={() => onRetry(item)} disabled={!canRetry}>
+                  <MdRefresh className="mr-2 text-[0.875rem]" />
+                  {t("fileTransfer.retry")}
+                </ContextMenuItem>
+              </>
+            )}
             <ContextMenuItem onClick={() => onCancel(item.id)} disabled={!canCancel}>
               <MdBlock className="mr-2 text-[0.875rem]" />
               {t("fileTransfer.cancel")}
@@ -404,14 +443,18 @@ export default function FileTransfer({ activeSessionId }: FileTransferProps) {
   );
 
   const canDeleteTransfer = useCallback((transfer: TransferItem) => {
-    if (transfer.source === "zmodem") {
+    if (isBackendModemTransfer(transfer)) {
       return transfer.status !== "transferring";
     }
     const canCancel =
-      transfer.status === "queued" ||
+      (supports("transferControl") && transfer.status === "queued") ||
       transfer.status === "transferring" ||
       transfer.status === "paused";
-    return !canCancel || transfer.status === "queued" || transfer.queueState === "pending";
+    return (
+      !canCancel ||
+      transfer.status === "queued" ||
+      transfer.queueState === "pending"
+    );
   }, []);
 
   const requestDeleteTransfer = useCallback(
@@ -475,15 +518,15 @@ export default function FileTransfer({ activeSessionId }: FileTransferProps) {
 
   const hasRunning = visibleTransfers.some(
     (transfer) =>
-      transfer.source !== "zmodem" &&
+      !isBackendModemTransfer(transfer) &&
       (transfer.status === "transferring" || transfer.status === "queued"),
   );
   const hasPaused = visibleTransfers.some(
-    (transfer) => transfer.source !== "zmodem" && transfer.status === "paused",
+    (transfer) => !isBackendModemTransfer(transfer) && transfer.status === "paused",
   );
   const hasActive = visibleTransfers.some(
     (transfer) =>
-      transfer.source !== "zmodem" &&
+      !isBackendModemTransfer(transfer) &&
       (transfer.status === "queued" ||
         transfer.status === "transferring" ||
         transfer.status === "paused"),
@@ -501,7 +544,7 @@ export default function FileTransfer({ activeSessionId }: FileTransferProps) {
       visibleTransfers
         .filter(
           (transfer) =>
-            transfer.source !== "zmodem" &&
+            !isBackendModemTransfer(transfer) &&
             (transfer.status === "transferring" || transfer.status === "queued"),
         )
         .map((transfer) => pauseTransfer(transfer.id)),
@@ -524,7 +567,7 @@ export default function FileTransfer({ activeSessionId }: FileTransferProps) {
   const handleResumeAll = useCallback(() => {
     void Promise.all(
       visibleTransfers
-        .filter((transfer) => transfer.source !== "zmodem" && transfer.status === "paused")
+        .filter((transfer) => !isBackendModemTransfer(transfer) && transfer.status === "paused")
         .map((transfer) => resumeTransfer(transfer.id)),
     );
   }, [resumeTransfer, visibleTransfers]);
@@ -534,7 +577,7 @@ export default function FileTransfer({ activeSessionId }: FileTransferProps) {
       visibleTransfers
         .filter(
           (transfer) =>
-            transfer.source !== "zmodem" &&
+            !isBackendModemTransfer(transfer) &&
             (transfer.status === "queued" ||
               transfer.status === "transferring" ||
               transfer.status === "paused"),
@@ -573,19 +616,19 @@ export default function FileTransfer({ activeSessionId }: FileTransferProps) {
               label={t("fileTransfer.pauseAll")}
               icon={MdPause}
               onClick={handlePauseAll}
-              disabled={!hasRunning}
+              disabled={!supports("transferControl") || !hasRunning}
             />
             <HeaderActionButton
               label={t("fileTransfer.resumeAll")}
               icon={MdPlayArrow}
               onClick={handleResumeAll}
-              disabled={!hasPaused}
+              disabled={!supports("transferControl") || !hasPaused}
             />
             <HeaderActionButton
               label={t("fileTransfer.cancelAll")}
               icon={MdBlock}
               onClick={handleCancelAll}
-              disabled={!hasActive}
+              disabled={!supports("transferControl") || !hasActive}
             />
             <HeaderActionButton
               label={t("fileTransfer.clearCompleted")}

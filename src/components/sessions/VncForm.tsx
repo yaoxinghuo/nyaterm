@@ -28,6 +28,8 @@ interface VncFormProps {
   setHost: (value: string) => void;
   port: number;
   setPort: (value: number) => void;
+  username: string;
+  setUsername: (value: string) => void;
   passwordId: string;
   setPasswordId: (value: string) => void;
   password: string;
@@ -69,6 +71,8 @@ export function VncForm({
   setHost,
   port,
   setPort,
+  username,
+  setUsername,
   passwordId,
   setPasswordId,
   password,
@@ -109,8 +113,9 @@ export function VncForm({
   useEffect(() => {
     invoke<SavedPassword[]>("get_saved_passwords")
       .then((items) => {
-        setPasswords(items);
-        if (passwordId && !items.some((item) => item.id === passwordId)) {
+        const usableItems = items.filter((item) => item.has_password === true);
+        setPasswords(usableItems);
+        if (passwordId && !usableItems.some((item) => item.id === passwordId)) {
           setPasswordId("");
         }
       })
@@ -180,6 +185,21 @@ export function VncForm({
         <Label className="text-xs font-medium text-foreground/80">
           {t("dialog.authentication")}
         </Label>
+        <div className="mt-1">
+          <Label className="text-xs font-medium text-foreground/80">{t("dialog.username")}</Label>
+          <Input
+            className="mt-1 h-8 text-xs"
+            value={username}
+            disabled={securityMode === "none"}
+            onChange={(event) => setUsername(event.target.value)}
+            placeholder={t("dialog.vncUsernamePlaceholder")}
+          />
+          {securityMode === "auto" ? (
+            <p className="mt-1 text-[0.6875rem] text-muted-foreground">
+              {t("dialog.vncUsernameHint")}
+            </p>
+          ) : null}
+        </div>
         <Tabs
           value={passwordSource}
           onValueChange={(value) => {
@@ -252,9 +272,11 @@ export function VncForm({
                 </>
               ) : null}
             </div>
-            <p className="mt-1 text-[0.6875rem] text-muted-foreground">
-              {t("dialog.vncPasswordLimit")}
-            </p>
+            {securityMode === "vnc-auth" ? (
+              <p className="mt-1 text-[0.6875rem] text-muted-foreground">
+                {t("dialog.vncPasswordLimit")}
+              </p>
+            ) : null}
           </TabsContent>
           <TabsContent value="saved" className="mt-3 border-0 outline-none">
             <Select

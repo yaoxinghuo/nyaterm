@@ -2,6 +2,30 @@ fn local_managed_integration_enabled(dynamic_title_enabled: bool, windows_host: 
     windows_host || dynamic_title_enabled
 }
 
+#[cfg(target_os = "windows")]
+fn ensure_local_terminal_supported() -> AppResult<()> {
+    let Some(version) = crate::platform::windows_version::current_windows_version() else {
+        tracing::warn!(
+            "Unable to query Windows version before Local Terminal creation; continuing"
+        );
+        return Ok(());
+    };
+
+    if !version.supports_conpty() {
+        return Err(crate::error::AppError::Unsupported(format!(
+            "Local Terminal requires Windows 10 version 1809 (Build 17763) or later. Current Windows build: {}.",
+            version.build
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_local_terminal_supported() -> AppResult<()> {
+    Ok(())
+}
+
 /// Spawns a local shell in a PTY and registers the session with the manager.
 pub async fn create_local_session(
     app: AppHandle,
@@ -10,6 +34,7 @@ pub async fn create_local_session(
     owner_window_label: Option<String>,
     session_ready_hook: Option<SessionReadyHook>,
 ) -> AppResult<String> {
+    ensure_local_terminal_supported()?;
     tracing::info!("Creating local PTY session");
     let resolved_shell_spec = match &config {
         Some(cfg) if !cfg.shell_path.trim().is_empty() => resolve_shell_command(
@@ -1302,7 +1327,7 @@ fn pty_session_thread(
             SessionCommand::DetachRenderer => {
                 output.detach();
             }
-            SessionCommand::Write { data, origin, .. } => {
+            SessionCommand::Write { data, raw, origin, .. } => {
                 if input_cancels_startup_injection(origin)
                     && startup_input_barrier
                         .as_ref()
@@ -1328,7 +1353,7 @@ fn pty_session_thread(
                 if zmodem_input_blocked.load(Ordering::Acquire) {
                     continue;
                 }
-                let send_data = encode_terminal_input(&data, &encoding);
+                let send_data = prepare_terminal_write_input(data, &encoding, raw, false);
                 let write_started_at = Instant::now();
                 match write_to_pty(&mut *writer, &send_data) {
                     Ok(()) => {
@@ -1464,6 +1489,11 @@ fn pty_session_thread(
                 *zm = None;
                 zmodem_input_blocked.store(false, Ordering::Release);
             }
+            SessionCommand::SerialModemUpload { result_tx, .. } => {
+                let _ = result_tx.send(Err(
+                    "Direct modem upload is only available for Serial sessions".to_string(),
+                ));
+            }
             SessionCommand::TmuxCommand { .. } | SessionCommand::TmuxDetach => {}
             SessionCommand::Close => {
                 break;
@@ -1485,7 +1515,7 @@ fn pty_session_thread(
     output.close();
 
     if let Some(ref rec) = recording_mgr {
-        rec.cleanup_session(&session_id);
+        rec.disconnect_session(&session_id);
     }
 
     rt_handle.block_on(async {

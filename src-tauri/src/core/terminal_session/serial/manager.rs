@@ -116,7 +116,11 @@ fn open_serial_port(config: &SerialConfig) -> serialport::Result<Box<dyn SerialP
         .data_bits(parse_data_bits(config.data_bits))
         .parity(parse_parity(&config.parity))
         .stop_bits(parse_stop_bits(&config.stop_bits))
-        .flow_control(FlowControl::None)
+        .flow_control(match config.flow_control {
+            crate::config::SerialFlowControl::None => FlowControl::None,
+            crate::config::SerialFlowControl::Software => FlowControl::Software,
+            crate::config::SerialFlowControl::Hardware => FlowControl::Hardware,
+        })
         .timeout(Duration::from_millis(10))
         .open()
 }

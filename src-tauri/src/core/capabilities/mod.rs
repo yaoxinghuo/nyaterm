@@ -8,7 +8,9 @@ mod terminal;
 
 pub use catalog::{CapabilityAccess, capability_for_tool};
 pub use output_store::OutputStore;
-pub use policy::{PolicyDecision, RiskAssessment, assess_command_risk, decide_policy};
+pub use policy::{
+    PolicyDecision, RiskAssessment, RiskReasonCode, assess_command_risk, decide_policy,
+};
 pub use recent_output::RecentOutputStore;
 pub use scope::{McpScope, McpScopeSnapshot};
 pub use terminal::{

@@ -90,6 +90,16 @@ export default function GpuMonitor({
       />
 
       <div className="flex-1 min-h-0 overflow-y-auto terminal-scroll p-2.5">
+        {gpuOverviewState.paused && (
+          <output className="block mb-2 text-xs text-muted-foreground">
+            {t("gpuMonitor.paused")}
+          </output>
+        )}
+        {error && overview && (
+          <p role="alert" className="mb-2 text-xs text-destructive">
+            {t("gpuMonitor.error")}
+          </p>
+        )}
         {!activeSessionId ? (
           <EmptyState icon={<SiNvidia />} text={t("gpuMonitor.noSession")} />
         ) : !enabled ? (

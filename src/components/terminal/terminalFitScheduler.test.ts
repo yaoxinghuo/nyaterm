@@ -17,6 +17,7 @@ function createHarness() {
   let nextFrameId = 1;
   let nextTimerId = 1;
   let visible = true;
+  let focusAllowed = true;
   let connected = true;
   let rect = { width: 800, height: 400 };
   const frames = new Map<number, FrameRequestCallback>();
@@ -48,6 +49,7 @@ function createHarness() {
     getFitAddon: () => fitAddon,
     getContainer: () => container,
     isVisible: () => visible,
+    canFocus: () => focusAllowed,
     requestAnimationFrame: (callback) => {
       const id = nextFrameId;
       nextFrameId += 1;
@@ -93,6 +95,9 @@ function createHarness() {
     scheduler,
     setConnected: (next: boolean) => {
       connected = next;
+    },
+    setFocusAllowed: (next: boolean) => {
+      focusAllowed = next;
     },
     setProposal: (next: TerminalFitDimensions) => {
       proposal = next;
@@ -173,6 +178,20 @@ describe("TerminalFitScheduler", () => {
     expect(terminal.clearTextureAtlas).toHaveBeenCalledTimes(1);
     expect(terminal.refresh).toHaveBeenCalledTimes(1);
     expect(terminal.focus).toHaveBeenCalledTimes(1);
+  });
+
+  it("rechecks focus permission when a queued fit executes", () => {
+    const { flushFrame, scheduler, setFocusAllowed, terminal } = createHarness();
+
+    scheduler.schedule({
+      reason: "active",
+      force: true,
+      focus: true,
+    });
+    setFocusAllowed(false);
+    flushFrame();
+
+    expect(terminal.focus).not.toHaveBeenCalled();
   });
 
   it("does not clear texture atlas for ordinary resize", () => {

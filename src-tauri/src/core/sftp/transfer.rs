@@ -34,6 +34,8 @@ pub struct TransferEvent {
     pub direction: String,
     /// "file" or "directory"
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// "started", "progress", "paused", "resumed", "completed", "cancelled", or "error"
     pub status: String,
     pub size: u64,
@@ -65,6 +67,7 @@ pub(crate) struct TransferRuntime {
     local_path: String,
     direction: String,
     kind: String,
+    source: Option<String>,
     parent_id: Option<String>,
     bytes_transferred: u64,
     total_size: u64,
@@ -99,6 +102,34 @@ impl TransferController {
         item_count_total: Option<u64>,
         item_count_completed: Option<u64>,
     ) -> Self {
+        Self::new_with_kind_and_source(
+            id,
+            session_id,
+            file_name,
+            remote_path,
+            local_path,
+            direction,
+            kind,
+            parent_id,
+            item_count_total,
+            item_count_completed,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_kind_and_source(
+        id: String,
+        session_id: String,
+        file_name: String,
+        remote_path: String,
+        local_path: String,
+        direction: String,
+        kind: String,
+        parent_id: Option<String>,
+        item_count_total: Option<u64>,
+        item_count_completed: Option<u64>,
+        source: Option<String>,
+    ) -> Self {
         Self {
             runtime: Mutex::new(TransferRuntime {
                 id,
@@ -108,6 +139,7 @@ impl TransferController {
                 local_path,
                 direction,
                 kind,
+                source,
                 parent_id,
                 bytes_transferred: 0,
                 total_size: 0,
@@ -178,6 +210,7 @@ impl TransferController {
             local_path: runtime.local_path.clone(),
             direction: runtime.direction.clone(),
             kind: runtime.kind.clone(),
+            source: runtime.source.clone(),
             status: status.to_string(),
             size,
             bytes_transferred: runtime.bytes_transferred,
@@ -243,13 +276,24 @@ impl TransferController {
 }
 
 pub(crate) fn register_transfer(controller: Arc<TransferController>) {
-    ACTIVE_TRANSFERS
+    let mut active = ACTIVE_TRANSFERS.lock().unwrap();
+    if RETAINED_TRANSFERS
         .lock()
         .unwrap()
-        .insert(controller.id(), controller);
+        .contains_key(&controller.id())
+    {
+        if let Some(previous) = active.get(&controller.id()) {
+            let control_state = previous.control_state();
+            controller.runtime.lock().unwrap().control_state = control_state;
+        }
+    }
+    active.insert(controller.id(), controller);
 }
 
 pub(crate) fn unregister_transfer(id: &str) {
+    if RETAINED_TRANSFERS.lock().unwrap().contains_key(id) {
+        return;
+    }
     let removed = ACTIVE_TRANSFERS.lock().unwrap().remove(id);
     if let Some(controller) = removed {
         remember_transfer_target(id.to_string(), controller.target_snapshot());
@@ -446,6 +490,62 @@ pub(crate) async fn wait_for_transfer_ready(controller: &Arc<TransferController>
             }
             TransferControlState::Paused => notified.await,
         }
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref RETAINED_TRANSFERS: Mutex<HashMap<String, ()>> = Mutex::new(HashMap::new());
+}
+
+// A move must remain cancellable after its copy finishes, through verification.
+pub(crate) struct RetainedTransfer(String);
+impl RetainedTransfer {
+    pub(crate) fn new(controller: Arc<TransferController>) -> Self {
+        let id = controller.id();
+        RETAINED_TRANSFERS.lock().unwrap().insert(id.clone(), ());
+        register_transfer(controller);
+        Self(id)
+    }
+    pub(crate) async fn ready(&self) -> AppResult<()> {
+        let controller = find_transfer(&self.0)
+            .ok_or_else(|| AppError::Cancelled(TRANSFER_CANCELLED_MESSAGE.into()))?;
+        wait_for_transfer_ready(&controller).await
+    }
+}
+impl Drop for RetainedTransfer {
+    fn drop(&mut self) {
+        RETAINED_TRANSFERS.lock().unwrap().remove(&self.0);
+        unregister_transfer(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod retained_transfer_tests {
+    use super::*;
+    #[tokio::test]
+    async fn clipboard_move_retains_cancellation_after_copy_completion() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let make = || {
+            create_child_file_transfer_controller(
+                Some(id.clone()),
+                "session",
+                "file".into(),
+                "/source",
+                "/target",
+                "copy",
+                None,
+            )
+        };
+        let retained = RetainedTransfer::new(make());
+        find_transfer(&id).unwrap().cancel();
+        register_transfer(make());
+        unregister_transfer(&id);
+        assert!(matches!(
+            retained.ready().await,
+            Err(AppError::Cancelled(_))
+        ));
+        drop(retained);
+        assert!(find_transfer(&id).is_none());
     }
 }
 

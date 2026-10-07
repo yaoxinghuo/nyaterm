@@ -1,4 +1,4 @@
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@/lib/backend/api";
 import type { Terminal } from "@xterm/xterm";
 import { toast } from "sonner";
 import { emitAIErrorDetected } from "@/lib/aiEvents";
@@ -10,6 +10,7 @@ import { invoke } from "@/lib/invoke";
 import { createTerminalInputState } from "@/lib/terminalInputTracker";
 import type { AiCaptureEvent } from "@/types/global";
 import type { Dec2026FrameGate } from "./dec2026FrameGate";
+import type { SerialModemEventPayload } from "./serialModemTerminalEvents";
 import { hasErrorKeyword } from "./terminalInputSelection";
 import type {
   HibernationLogEvent,
@@ -25,6 +26,10 @@ interface MutableRef<T> {
 
 interface ZmodemHandler {
   handle: (payload: ZmodemEventPayload) => void;
+}
+
+interface SerialModemHandler {
+  handle: (payload: SerialModemEventPayload) => void;
 }
 
 export async function replaySnapshotBeforeAttach(options: {
@@ -52,6 +57,7 @@ interface CreateXTerminalSessionEventsParams {
   }>;
   hibernationPhaseRef: MutableRef<HibernationPhase>;
   detachedHibernateEpochRef: MutableRef<number | null>;
+  appLockedRef: MutableRef<boolean>;
   onConnectionErrorRef: MutableRef<
     ((sessionId: string, error: string) => void) | undefined
   >;
@@ -66,6 +72,7 @@ interface CreateXTerminalSessionEventsParams {
   }) => void;
   enterDisconnectedStateIfAttachSessionMissing: (error: unknown) => boolean;
   noteSkippedOutput: (count: number) => void;
+  noteOutputPressure: (data: string, bytes: number) => void;
   noteOutputActivity: () => void;
   updateCredentialPromptInputMode: (payload: string) => void;
   feedCredentialOutput: (payload: string) => void;
@@ -84,6 +91,7 @@ interface CreateXTerminalSessionEventsParams {
     error?: unknown,
   ) => void;
   zmodemHandler: ZmodemHandler;
+  serialModemHandler: SerialModemHandler;
   replayPendingWakeEvents: () => void;
   settleOutputAfterAttach: () => Promise<boolean>;
   flushPendingDynamicTitle: () => void;
@@ -102,6 +110,7 @@ export function createXTerminalSessionEvents({
   alternateScreenTrackerRef,
   hibernationPhaseRef,
   detachedHibernateEpochRef,
+  appLockedRef,
   onConnectionErrorRef,
   tRef,
   isTerminalAlive,
@@ -109,6 +118,7 @@ export function createXTerminalSessionEvents({
   enterDisconnectedState,
   enterDisconnectedStateIfAttachSessionMissing,
   noteSkippedOutput,
+  noteOutputPressure,
   noteOutputActivity,
   updateCredentialPromptInputMode,
   feedCredentialOutput,
@@ -122,6 +132,7 @@ export function createXTerminalSessionEvents({
   updateOutputDrainMode,
   logHibernation,
   zmodemHandler,
+  serialModemHandler,
   replayPendingWakeEvents,
   settleOutputAfterAttach,
   flushPendingDynamicTitle,
@@ -157,11 +168,10 @@ export function createXTerminalSessionEvents({
           return;
         }
         noteOutputActivity();
+        noteOutputPressure(payload.data, payload.bytes);
 
         const recentPayload =
-          payload.data.length > 4096
-            ? payload.data.slice(-4096)
-            : payload.data;
+          payload.data.length > 4096 ? payload.data.slice(-4096) : payload.data;
         alternateScreenTrackerRef.current.ingest(payload.data);
         updateCredentialPromptInputMode(recentPayload);
         feedCredentialOutput(recentPayload);
@@ -248,7 +258,9 @@ export function createXTerminalSessionEvents({
       () => {
         if (!isTerminalAlive()) return;
         requestWake("focus");
-        terminal.focus();
+        if (!appLockedRef.current) {
+          terminal.focus();
+        }
       },
     );
     if (!addUnlistener(nextFocusUnlisten)) return;
@@ -300,6 +312,24 @@ export function createXTerminalSessionEvents({
     );
     if (!addUnlistener(nextZmodemUnlisten)) return;
 
+    const nextSerialModemUnlisten = await listen<SerialModemEventPayload>(
+      `serial-modem-event-${sessionId}`,
+      (event) => {
+        if (!isTerminalAlive()) return;
+        requestWake("serial_modem");
+        if (event.payload.type === "progress") {
+          zmodemActiveRef.current = true;
+        } else if (
+          event.payload.type === "complete" ||
+          event.payload.type === "failed"
+        ) {
+          zmodemActiveRef.current = false;
+        }
+        serialModemHandler.handle(event.payload);
+      },
+    );
+    if (!addUnlistener(nextSerialModemUnlisten)) return;
+
     let backendAttached = false;
     try {
       await replaySnapshotBeforeAttach({
@@ -339,7 +369,8 @@ export function createXTerminalSessionEvents({
         { reason: "terminal_ready", backend_attached: backendAttached },
         error,
       );
-      const sessionMissing = enterDisconnectedStateIfAttachSessionMissing(error);
+      const sessionMissing =
+        enterDisconnectedStateIfAttachSessionMissing(error);
       if (!backendAttached && !sessionMissing) {
         // The backend is still detached, so let setup retry without publishing
         // a title from an unsettled renderer.

@@ -15,6 +15,7 @@ export interface XTerminalProps {
   sessionId: string;
   sessionName?: string;
   active: boolean;
+  appLocked: boolean;
   visible?: boolean;
   sessionType: SessionType;
   connectionId?: string;

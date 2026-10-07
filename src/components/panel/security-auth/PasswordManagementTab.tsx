@@ -1,4 +1,4 @@
-import { Eye, EyeOff } from "lucide-react";
+import { Eye, EyeOff, GripVertical } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { MdAdd, MdDelete, MdEdit } from "react-icons/md";
@@ -15,9 +15,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { invoke } from "@/lib/invoke";
-import type { SavedPassword } from "@/types/global";
+import type { SavedAccount, SavedConnection } from "@/types/global";
 import { CopyButton } from "./CopyButton";
 import { SecretUnlockFooter } from "./SecretUnlockFooter";
+import { useSecretListSorting } from "./useSecretListSorting";
 
 interface PasswordManagementTabProps {
   onCountChange?: (count: number) => void;
@@ -31,11 +32,14 @@ interface PasswordEditorProps {
   editHasPassword: boolean;
   editName: string;
   editPassword: string;
+  editUsername: string;
   isEditing: boolean;
-  passwordLoading: boolean;
+  removePassword: boolean;
   onCancel: () => void;
   onNameChange: (value: string) => void;
   onPasswordChange: (value: string) => void;
+  onRemovePasswordChange: (value: boolean) => void;
+  onUsernameChange: (value: string) => void;
   onSave: () => void;
   saveDisabled: boolean;
   t: ReturnType<typeof useTranslation>["t"];
@@ -45,11 +49,14 @@ function PasswordEditor({
   editHasPassword,
   editName,
   editPassword,
+  editUsername,
   isEditing,
-  passwordLoading,
+  removePassword,
   onCancel,
   onNameChange,
   onPasswordChange,
+  onRemovePasswordChange,
+  onUsernameChange,
   onSave,
   saveDisabled,
   t,
@@ -58,42 +65,73 @@ function PasswordEditor({
 
   return (
     <div className="space-y-3">
-      <Input
-        placeholder={t("passwordManager.namePlaceholder")}
-        className="h-8 text-xs"
-        value={editName}
-        onChange={(event) => onNameChange(event.target.value)}
-        autoFocus
-      />
-      <div className="relative">
+      <div>
+        <Label className="text-xs">{t("passwordManager.name")}</Label>
         <Input
-          data-custom-password-reveal
-          type={showPassword ? "text" : "password"}
-          placeholder={
-            passwordLoading
-              ? t("common.loading")
-              : isEditing && editHasPassword
-                ? t("passwordManager.passwordUnchanged")
-                : t("passwordManager.passwordPlaceholder")
-          }
-          className="h-8 pr-8 text-xs"
-          value={editPassword}
-          onChange={(event) => onPasswordChange(event.target.value)}
-          disabled={passwordLoading}
+          placeholder={t("passwordManager.namePlaceholder")}
+          className="mt-1 h-8 text-xs"
+          value={editName}
+          onChange={(event) => onNameChange(event.target.value)}
+          autoFocus
         />
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="absolute top-0.5 right-0.5 h-7 w-7 text-muted-foreground hover:text-foreground"
-          onClick={() => setShowPassword((v) => !v)}
-          disabled={passwordLoading}
-          aria-label={
-            showPassword ? t("passwordManager.hidePassword") : t("passwordManager.showPassword")
-          }
-        >
-          {showPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-        </Button>
+      </div>
+      <div>
+        <Label className="text-xs">{t("passwordManager.username")}</Label>
+        <Input
+          placeholder={t("passwordManager.usernamePlaceholder")}
+          className="mt-1 h-8 text-xs"
+          value={editUsername}
+          onChange={(event) => onUsernameChange(event.target.value)}
+        />
+      </div>
+      <div>
+        <Label className="text-xs">{t("passwordManager.passwordOptional")}</Label>
+        <div className="relative mt-1">
+          <Input
+            data-custom-password-reveal
+            type={showPassword ? "text" : "password"}
+            placeholder={
+              removePassword
+                ? t("passwordManager.passwordWillBeRemoved")
+                : isEditing && editHasPassword
+                  ? t("passwordManager.passwordUnchanged")
+                  : t("passwordManager.passwordPlaceholder")
+            }
+            className="h-8 pr-8 text-xs"
+            value={editPassword}
+            onChange={(event) => {
+              onPasswordChange(event.target.value);
+              onRemovePasswordChange(false);
+            }}
+            disabled={removePassword}
+          />
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="absolute top-0.5 right-0.5 h-7 w-7 text-muted-foreground hover:text-foreground"
+            onClick={() => setShowPassword((v) => !v)}
+            disabled={removePassword}
+            aria-label={
+              showPassword ? t("passwordManager.hidePassword") : t("passwordManager.showPassword")
+            }
+          >
+            {showPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+          </Button>
+        </div>
+        {isEditing && editHasPassword ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="mt-1 h-7 px-2 text-xs text-destructive"
+            onClick={() => onRemovePasswordChange(!removePassword)}
+          >
+            {removePassword
+              ? t("passwordManager.keepPassword")
+              : t("passwordManager.removePassword")}
+          </Button>
+        ) : null}
       </div>
       <div className="flex justify-end gap-1.5 pt-0.5">
         <Button variant="outline" size="sm" className="h-7 px-3 text-xs" onClick={onCancel}>
@@ -115,25 +153,31 @@ export function PasswordManagementTab({
   showSecretUnlockFooter = false,
 }: PasswordManagementTabProps) {
   const { t } = useTranslation();
-  const [passwords, setPasswords] = useState<SavedPassword[]>([]);
+  const [passwords, setPasswords] = useState<SavedAccount[]>([]);
+  const [connections, setConnections] = useState<SavedConnection[]>([]);
   const [passwordCache, setPasswordCache] = useState<Record<string, string>>({});
   const [revealedIds, setRevealedIds] = useState<Set<string>>(new Set());
   const [revealLoadingIds, setRevealLoadingIds] = useState<Set<string>>(new Set());
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
+  const [editUsername, setEditUsername] = useState("");
   const [editPassword, setEditPassword] = useState("");
   const [editHasPassword, setEditHasPassword] = useState(false);
-  const [passwordLoading, setPasswordLoading] = useState(false);
+  const [removePassword, setRemovePassword] = useState(false);
   const [isNew, setIsNew] = useState(false);
-  const [deletingEntry, setDeletingEntry] = useState<SavedPassword | null>(null);
+  const [deletingEntry, setDeletingEntry] = useState<SavedAccount | null>(null);
   const [unlockRequestNonce, setUnlockRequestNonce] = useState(0);
   const editRequestRef = useRef(0);
   const pendingUnlockedActionRef = useRef<(() => void | Promise<void>) | null>(null);
 
   const loadPasswords = useCallback(async () => {
     try {
-      const result = await invoke<SavedPassword[]>("get_saved_passwords");
+      const [result, savedConnections] = await Promise.all([
+        invoke<SavedAccount[]>("get_saved_passwords"),
+        invoke<SavedConnection[]>("get_saved_connections"),
+      ]);
       setPasswords(result);
+      setConnections(savedConnections);
       onCountChange?.(result.length);
     } catch {
       /* ignore */
@@ -170,7 +214,9 @@ export function PasswordManagementTab({
 
       setRevealLoadingIds((prev) => new Set(prev).add(id));
       try {
-        const value = await invoke<string | null>("get_saved_password_value", { id });
+        const value = await invoke<string | null>("get_saved_password_value", {
+          id,
+        });
         setPasswordCache((prev) => ({ ...prev, [id]: value ?? "" }));
         setRevealedIds((prev) => new Set(prev).add(id));
       } catch {
@@ -191,9 +237,10 @@ export function PasswordManagementTab({
     editRequestRef.current += 1;
     setEditingId(null);
     setEditName("");
+    setEditUsername("");
     setEditPassword("");
     setEditHasPassword(false);
-    setPasswordLoading(false);
+    setRemovePassword(false);
     setIsNew(false);
   };
 
@@ -203,40 +250,46 @@ export function PasswordManagementTab({
     setIsNew(true);
   };
 
-  const handleEdit = async (entry: SavedPassword) => {
-    const requestId = ++editRequestRef.current;
+  const handleEdit = async (entry: SavedAccount) => {
+    editRequestRef.current += 1;
     setEditingId(entry.id);
     setEditName(entry.name);
+    setEditUsername(entry.username);
     setEditPassword("");
     setEditHasPassword(entry.has_password || false);
-    setPasswordLoading(true);
+    setRemovePassword(false);
     setIsNew(false);
+  };
 
-    try {
-      const password = await invoke<string | null>("get_saved_password_value", { id: entry.id });
-      if (editRequestRef.current !== requestId) return;
-      setEditPassword(password ?? "");
-    } catch {
-      if (editRequestRef.current !== requestId) return;
-      setEditPassword("");
-    } finally {
-      if (editRequestRef.current === requestId) {
-        setPasswordLoading(false);
-      }
-    }
+  const invalidatePasswordCache = (id: string) => {
+    setPasswordCache((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setRevealedIds((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
   };
 
   const handleSave = async () => {
     if (!editName.trim()) return;
-    if (isNew && !editPassword) return;
     try {
-      await invoke("save_password", {
+      const savedId = await invoke<string>("save_password", {
         entry: {
           id: isNew ? "" : editingId,
           name: editName.trim(),
-          password: editPassword || undefined,
+          username: editUsername.trim(),
+          password: isNew ? editPassword : removePassword ? "" : editPassword || undefined,
         },
       });
+      // The saved ciphertext may have changed; drop any cached plaintext so the
+      // eye toggle re-fetches the current value instead of showing a stale one.
+      invalidatePasswordCache(savedId);
       resetEdit();
       await loadPasswords();
     } catch {
@@ -244,10 +297,21 @@ export function PasswordManagementTab({
     }
   };
 
+  const deletingReferences = deletingEntry
+    ? connections.filter((connection) => {
+        const auth = connection.auth;
+        return (
+          auth?.account_id === deletingEntry.id ||
+          (!auth?.account_id && auth?.password_id === deletingEntry.id)
+        );
+      })
+    : [];
+
   const handleDeleteConfirm = async () => {
     if (!deletingEntry) return;
     try {
       await invoke("delete_password", { id: deletingEntry.id });
+      invalidatePasswordCache(deletingEntry.id);
       await loadPasswords();
     } catch {
       /* ignore */
@@ -279,6 +343,15 @@ export function PasswordManagementTab({
     }
   }, [onUnlockSecrets]);
 
+  const { actionsDisabled, reordering, handleProps, rowProps } = useSecretListSorting(
+    passwords,
+    setPasswords,
+    loadPasswords,
+    editingId !== null,
+    "reorder_passwords",
+    "passwordManager.reorderFailed",
+  );
+
   const lockedHint = !secretsUnlocked
     ? t(showSecretUnlockFooter ? "secretUnlock.lockedActionHint" : "secretUnlock.unlockTitle")
     : undefined;
@@ -299,7 +372,7 @@ export function PasswordManagementTab({
               size="sm"
               className="h-7 shrink-0 px-2 text-xs text-primary"
               onClick={handleAdd}
-              disabled={editingId !== null}
+              disabled={actionsDisabled}
             >
               <MdAdd className="text-base mr-1" /> {t("passwordManager.add")}
             </Button>
@@ -309,10 +382,32 @@ export function PasswordManagementTab({
             {passwords.map((entry) => (
               <div
                 key={entry.id}
+                {...rowProps(entry.id)}
                 className="security-auth-action-row flex flex-wrap items-center gap-1.5 border-b px-3 py-2.5 transition-colors last:border-0 hover:bg-accent"
               >
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="inline-flex shrink-0">
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        className="cursor-grab text-muted-foreground hover:text-foreground active:cursor-grabbing"
+                        {...handleProps(entry.id)}
+                        aria-label={t("passwordManager.dragToSort")}
+                      >
+                        <GripVertical className="h-4 w-4" />
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    {t(reordering ? "passwordManager.reordering" : "passwordManager.dragToSort")}
+                  </TooltipContent>
+                </Tooltip>
                 <div className="min-w-24 flex-1">
                   <div className="truncate text-xs">{entry.name}</div>
+                  <div className="mt-0.5 truncate text-[0.6875rem] text-muted-foreground">
+                    {entry.username || t("passwordManager.noUsername")}
+                  </div>
                   {revealedIds.has(entry.id) ? (
                     <div className="mt-1 flex items-start gap-0.5">
                       <span className="min-w-0 select-text break-all font-mono text-[0.6875rem] text-muted-foreground">
@@ -322,7 +417,13 @@ export function PasswordManagementTab({
                         <CopyButton value={passwordCache[entry.id]} />
                       ) : null}
                     </div>
-                  ) : null}
+                  ) : (
+                    <div className="mt-0.5 text-[0.6875rem] text-muted-foreground">
+                      {entry.has_password
+                        ? t("passwordManager.passwordSaved")
+                        : t("passwordManager.noPassword")}
+                    </div>
+                  )}
                 </div>
                 <div className="security-auth-row-actions flex shrink-0 items-center">
                   <Tooltip>
@@ -338,7 +439,9 @@ export function PasswordManagementTab({
                               runUnlockedAction(() => handleToggleReveal(entry.id));
                             }
                           }}
-                          disabled={editingId !== null || revealLoadingIds.has(entry.id)}
+                          disabled={
+                            actionsDisabled || revealLoadingIds.has(entry.id) || !entry.has_password
+                          }
                           aria-label={
                             revealedIds.has(entry.id)
                               ? t("passwordManager.hidePassword")
@@ -369,7 +472,7 @@ export function PasswordManagementTab({
                           onClick={() => {
                             runUnlockedAction(() => handleEdit(entry));
                           }}
-                          disabled={editingId !== null}
+                          disabled={actionsDisabled}
                           aria-label={t("common.edit")}
                         >
                           <MdEdit className="text-base" />
@@ -388,7 +491,7 @@ export function PasswordManagementTab({
                           onClick={() => {
                             runUnlockedAction(() => setDeletingEntry(entry));
                           }}
-                          disabled={editingId !== null}
+                          disabled={actionsDisabled}
                           aria-label={t("common.delete")}
                         >
                           <MdDelete className="text-base" />
@@ -426,13 +529,16 @@ export function PasswordManagementTab({
             editHasPassword={editHasPassword}
             editName={editName}
             editPassword={editPassword}
+            editUsername={editUsername}
             isEditing={!isNew}
-            passwordLoading={passwordLoading}
+            removePassword={removePassword}
             onCancel={resetEdit}
             onNameChange={setEditName}
             onPasswordChange={setEditPassword}
+            onRemovePasswordChange={setRemovePassword}
+            onUsernameChange={setEditUsername}
             onSave={handleSave}
-            saveDisabled={passwordLoading || !editName.trim() || (isNew && !editPassword)}
+            saveDisabled={!editName.trim()}
             t={t}
           />
         </DialogContent>
@@ -460,8 +566,18 @@ export function PasswordManagementTab({
           <DialogHeader>
             <DialogTitle>{t("passwordManager.deleteTitle")}</DialogTitle>
             <DialogDescription>
-              {t("passwordManager.deleteConfirm", { name: deletingEntry?.name })}
+              {t("passwordManager.deleteConfirm", {
+                name: deletingEntry?.name,
+              })}
             </DialogDescription>
+            {deletingReferences.length > 0 ? (
+              <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+                {t("passwordManager.deleteReferencedWarning", {
+                  count: deletingReferences.length,
+                  connections: deletingReferences.map((connection) => connection.name).join(", "),
+                })}
+              </div>
+            ) : null}
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setDeletingEntry(null)}>

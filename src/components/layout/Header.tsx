@@ -1,6 +1,7 @@
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { listen } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { runtime, supports } from "@/lib/backend/runtime";
+import { getCurrentWindow } from "@/lib/backend/platform/window";
+import { listen } from "@/lib/backend/api";
+import { openUrl } from "@/lib/backend/platform/opener";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { BiExport, BiImport } from "react-icons/bi";
@@ -86,7 +87,8 @@ import {
 } from "@/lib/appWorkspace";
 import { invoke } from "@/lib/invoke";
 import { logger } from "@/lib/logger";
-import { isMacOS } from "@/lib/platform";
+import { isMacOS as osMacOS } from "@/lib/platform";
+const isMacOS = osMacOS && supports("nativeWindows");
 import {
   decreaseTerminalFontSizeDelta,
   increaseTerminalFontSizeDelta,
@@ -128,8 +130,8 @@ function AscendIcon({ className }: { className?: string }) {
       aria-hidden="true"
       className={`inline-block h-[1em] w-[1em] bg-current ${className ?? ""}`}
       style={{
-        WebkitMask: "url('/icons/brands/ascend.svg') center / contain no-repeat",
-        mask: "url('/icons/brands/ascend.svg') center / contain no-repeat",
+        WebkitMask: `url('${import.meta.env.BASE_URL}icons/brands/ascend.svg') center / contain no-repeat`,
+        mask: `url('${import.meta.env.BASE_URL}icons/brands/ascend.svg') center / contain no-repeat`,
       }}
     />
   );
@@ -180,7 +182,13 @@ const iconMap: Record<string, React.ElementType> = {
   docker: SiDocker,
 };
 
-function DynamicIcon({ name, className }: { name: string; className?: string }) {
+function DynamicIcon({
+  name,
+  className,
+}: {
+  name: string;
+  className?: string;
+}) {
   const Icon = iconMap[name];
   if (!Icon) return null;
   return <Icon className={className} />;
@@ -270,8 +278,17 @@ function getHardwareCardLimit(width: number): number {
   return 1;
 }
 
-function getHardwareStatusCompact(visibleCardCount: number, hiddenCount: number, cardLimit: number): boolean {
-  return cardLimit <= 1 || (cardLimit <= 2 && visibleCardCount >= 2) || visibleCardCount >= 3 || hiddenCount > 0;
+function getHardwareStatusCompact(
+  visibleCardCount: number,
+  hiddenCount: number,
+  cardLimit: number,
+): boolean {
+  return (
+    cardLimit <= 1 ||
+    (cardLimit <= 2 && visibleCardCount >= 2) ||
+    visibleCardCount >= 3 ||
+    hiddenCount > 0
+  );
 }
 
 function formatUptimeShort(
@@ -533,7 +550,9 @@ function HeaderHardwareCardRow({
         {row === "utilization" ? card.indexLabel : ""}
       </span>
       <HeaderMiniProgress value={value} />
-      {!compact && <span className="truncate text-[var(--df-text-muted)]">{text}</span>}
+      {!compact && (
+        <span className="truncate text-[var(--df-text-muted)]">{text}</span>
+      )}
     </span>
   );
 }
@@ -756,7 +775,14 @@ export default function Header({
 }: HeaderProps) {
   const [appWindow] = useState(() => getCurrentWindow());
   const { themeName, setTheme, themeNames, terminalThemeName, setTerminalTheme } = useTheme();
-  const { updateAppSettings, updateUi, appSettings, tabs } = useApp();
+  const {
+    updateAppSettings,
+    updateUi,
+    appSettings,
+    tabs,
+    runtimeInfo,
+    runtimeInfoLoaded,
+  } = useApp();
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
@@ -922,6 +948,7 @@ export default function Header({
 
   const menus: Record<string, MenuItem[]> = {
     file: [
+      ...(runtime === "web" ? [{ id: "file.signOut", label: t("web.signOut"), action: onRequestQuit }] : []),
       addNativeAccelerator({
         id: "file.newSession",
         label: t("menu.newSession"),
@@ -1242,14 +1269,21 @@ export default function Header({
         icon: "menu_book",
         action: () => openUrl(`${packageJson.docspage}`),
       },
-      {
-        id: "help.checkUpdates",
-        label: t("menu.checkForUpdates"),
-        icon: hasUpdate ? "upgrade" : "update",
-        action: onCheckForUpdates,
-      },
+      ...(!supports("updater") ||
+      !runtimeInfoLoaded ||
+      runtimeInfo.packageManager
+        ? []
+        : [
+            {
+              id: "help.checkUpdates",
+              label: t("menu.checkForUpdates"),
+              icon: hasUpdate ? "upgrade" : "update",
+              action: onCheckForUpdates,
+            },
+          ]),
       {
         id: "help.viewLogs",
+        disabled: !supports("nativeFiles"),
         label: t("menu.viewLogs"),
         icon: "article",
         action: async () => {
@@ -1563,13 +1597,17 @@ export default function Header({
       if (activePane.type === "SSH" && activeConnection) {
         const def = resolveConnectionIcon(activeConnection.icon);
         const IconComp = def.icon;
-        return <IconComp className="text-sm shrink-0" style={{ color: def.color }} />;
+        return (
+          <IconComp className="text-sm shrink-0" style={{ color: def.color }} />
+        );
       }
 
       if (activeConnection?.icon) {
         const def = resolveConnectionIcon(activeConnection.icon);
         const IconComp = def.icon;
-        return <IconComp className="text-sm shrink-0" style={{ color: def.color }} />;
+        return (
+          <IconComp className="text-sm shrink-0" style={{ color: def.color }} />
+        );
       }
 
       if (activePane.type === "Telnet") {
@@ -1673,28 +1711,39 @@ export default function Header({
       );
       const hiddenCount = cards.length - visibleCards.length;
       const compact = getHardwareStatusCompact(visibleCards.length, hiddenCount, hardwareCardLimit);
-      const title = buildHardwareTitle("GPU", cards, "GPU");
+      const notice = gpuOverviewState?.paused
+        ? t("gpuMonitor.paused")
+        : gpuOverviewState?.error
+          ? t("gpuMonitor.error")
+          : null;
+      const hardwareTitle = buildHardwareTitle("GPU", cards, "GPU");
+      const title = notice ? `${hardwareTitle}\n${notice}` : hardwareTitle;
 
       return {
         icon: null,
         interactive: true,
         text: (
-          <HeaderHardwareStatus
-            cards={visibleCards}
-            compact={compact}
-            hiddenCount={hiddenCount}
-            icon={<SiNvidia />}
-            label="GPU"
-            onNextPage={() =>
-              setHardwarePage((current) => ({ ...current, gpu: (currentPage + 1) % pageCount }))
-            }
-            onPreviousPage={() =>
-              setHardwarePage((current) => ({
-                ...current,
-                gpu: (currentPage - 1 + pageCount) % pageCount,
-              }))
-            }
-          />
+          <>
+            {notice && (
+              <span className="text-xs text-muted-foreground">{notice}</span>
+            )}
+            <HeaderHardwareStatus
+              cards={visibleCards}
+              compact={compact}
+              hiddenCount={hiddenCount}
+              icon={<SiNvidia />}
+              label="GPU"
+              onNextPage={() =>
+                setHardwarePage((current) => ({ ...current, gpu: (currentPage + 1) % pageCount }))
+              }
+              onPreviousPage={() =>
+                setHardwarePage((current) => ({
+                  ...current,
+                  gpu: (currentPage - 1 + pageCount) % pageCount,
+                }))
+              }
+            />
+          </>
         ),
         title,
       };
@@ -1831,6 +1880,7 @@ export default function Header({
   }, [
     currentMinute,
     gpuOverviewState?.error,
+    gpuOverviewState?.paused,
     gpuOverviewState?.overview,
     hardwarePage.gpu,
     hardwarePage.npu,
@@ -1969,7 +2019,7 @@ export default function Header({
           </Button>
         )}
 
-        {!isMacOS && (
+        {!isMacOS && supports("nativeWindows") && (
           <div className="flex items-center h-full -mr-2 ml-1">
             <Button
               type="button"
