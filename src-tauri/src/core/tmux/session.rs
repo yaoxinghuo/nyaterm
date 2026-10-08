@@ -15,6 +15,7 @@
 //!   regular SSH loop, which continues as a normal shell.
 
 use super::control::{ControlMessage, ControlParser, LayoutCell, TmuxUiNode, parse_line};
+use crate::core::capture::OutputCaptureProcessor;
 use crate::core::terminal_session::TerminalOutputDecoder;
 use crate::core::{
     DynamicTitleCapabilities, SessionCommand, SessionCommandReceiver, SessionHandle, SessionInfo,
@@ -129,6 +130,10 @@ struct VirtualPane {
     /// size — bounds the layout-echo feedback when a target is unreachable
     /// (e.g. a remote `window-size=manual` that ignores the client size).
     resize_attempts: Option<((u32, u32), u8)>,
+    /// AI capture: intercepts `__DF_CMD_*` markers in this pane's decoded
+    /// output, exactly like the SSH loop's processor — `%output` is the
+    /// pane's pty byte stream, so the same marker contract applies.
+    capture: OutputCaptureProcessor,
     /// Bytes routed so far; only logged while small.
     routed_bytes: usize,
 }
@@ -421,6 +426,7 @@ impl<'a> ControlSession<'a> {
                 pending_dims: None,
                 dims: None,
                 resize_attempts: None,
+                capture: OutputCaptureProcessor::new(),
                 routed_bytes: 0,
             },
         );
@@ -1060,7 +1066,12 @@ impl<'a> ControlSession<'a> {
                     }
                 }
                 let decoded = virtual_pane.decoder.decode(&data);
-                virtual_pane.output.push_owned(decoded);
+                let text = if virtual_pane.capture.has_active() {
+                    virtual_pane.capture.process(&decoded)
+                } else {
+                    decoded
+                };
+                virtual_pane.output.push_owned(text);
                 virtual_pane.routed_bytes += data.len();
                 if virtual_pane.routed_bytes < 8192 {
                     tracing::info!(
@@ -1199,7 +1210,12 @@ impl<'a> ControlSession<'a> {
                                 continue;
                             }
                             let decoded = virtual_pane.decoder.decode(&data);
-                            virtual_pane.output.push_owned(decoded);
+                            let text = if virtual_pane.capture.has_active() {
+                                virtual_pane.capture.process(&decoded)
+                            } else {
+                                decoded
+                            };
+                            virtual_pane.output.push_owned(text);
                         }
                     }
                 }
@@ -1389,16 +1405,39 @@ impl<'a> ControlSession<'a> {
             SessionCommand::TmuxDetach => {
                 self.request_detach(channel, ExitMode::Detach).await;
             }
+            SessionCommand::CaptureExec {
+                marker_id,
+                wrapped_command,
+                result_tx,
+            } => {
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    // The marker-wrapped command goes through the pane's pty
+                    // like any typed input; its echo and markers return via
+                    // `%output` where `capture` picks them apart.
+                    pane.capture.register(marker_id, result_tx);
+                    self.input_buf
+                        .entry(pane_id)
+                        .or_default()
+                        .extend_from_slice(&wrapped_command);
+                    if self.input_flush.is_none() {
+                        self.input_flush = Some(Box::pin(tokio::time::sleep(
+                            Duration::from_millis(INPUT_FLUSH_DELAY_MS),
+                        )));
+                    }
+                } else {
+                    drop(result_tx);
+                }
+            }
+            SessionCommand::CancelCapture { marker_id } => {
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    pane.capture.cancel(&marker_id);
+                }
+            }
             SessionCommand::PauseOutput
             | SessionCommand::ResumeOutput
-            | SessionCommand::CancelCapture { .. }
             | SessionCommand::ZmodemAcceptDownload { .. }
             | SessionCommand::ZmodemAcceptUpload { .. }
             | SessionCommand::ZmodemCancel => {}
-            SessionCommand::CaptureExec { result_tx, .. } => {
-                // AI command capture is not supported inside tmux panes.
-                drop(result_tx);
-            }
         }
     }
 
