@@ -19,8 +19,8 @@ use crate::core::capture::OutputCaptureProcessor;
 use crate::core::terminal_session::TerminalOutputDecoder;
 use crate::core::{
     DynamicTitleCapabilities, SessionCommand, SessionCommandReceiver, SessionHandle, SessionInfo,
-    SessionManager, SessionOutputCoalescer, SessionType, now_session_started_at,
-    session_command_channel,
+    SessionManager, SessionOutputCoalescer, SessionType, SharedCwd, now_session_started_at,
+    session_command_channel, update_cwd_if_changed,
 };
 use russh::{ChannelMsg, client};
 use serde::Serialize;
@@ -57,6 +57,11 @@ const RESIZE_PANE_MAX_ATTEMPTS: u8 = 2;
 /// dims (full width or ~zero), and applying those would collapse the layout
 /// chasing transients.
 const RESIZE_SYNC_DEBOUNCE_MS: u64 = 250;
+
+/// Delay between a submitted command line and the `pane_current_path` poll:
+/// the pane's shell needs a moment to actually run `cd` before tmux reports
+/// the new directory.
+const CWD_QUERY_DELAY_MS: u64 = 400;
 
 #[derive(Debug)]
 pub(crate) enum ControlExit {
@@ -134,6 +139,10 @@ struct VirtualPane {
     /// output, exactly like the SSH loop's processor — `%output` is the
     /// pane's pty byte stream, so the same marker contract applies.
     capture: OutputCaptureProcessor,
+    /// Pane working directory, shared with the `SessionHandle` so
+    /// `get_terminal_cwd` and the file explorer see it. Populated by
+    /// `#{pane_current_path}` queries — tmux tracks it per pane.
+    cwd: SharedCwd,
     /// Bytes routed so far; only logged while small.
     routed_bytes: usize,
 }
@@ -147,6 +156,11 @@ enum PendingKind {
     },
     /// Cursor position query issued after a pane's capture seed.
     SeedCursor {
+        pane: String,
+    },
+    /// `#{pane_current_path}` poll; a `cd` inside the pane emits no
+    /// notification, so cwd is re-queried after each submitted command.
+    PaneCwd {
         pane: String,
     },
     /// User-typed command from the tmux bar; failures are surfaced.
@@ -221,6 +235,10 @@ pub(crate) struct ControlSession<'a> {
     /// Client size currently applied to tmux (grown to fit the active
     /// window's root layout; an unknown size counts as 0).
     client_size: Option<(u32, u32)>,
+    /// Panes whose cwd should be re-queried once `cwd_deadline` fires —
+    /// armed on spawn and whenever submitted input contains Enter.
+    cwd_pending: HashSet<String>,
+    cwd_deadline: Option<Pin<Box<Sleep>>>,
     /// Output received for panes we have not mapped yet (e.g. background
     /// windows), kept in case the pane becomes visible. Bounded.
     unknown_output: HashMap<String, VecDeque<(Option<std::time::Instant>, Vec<u8>)>>,
@@ -266,6 +284,8 @@ impl<'a> ControlSession<'a> {
             refresh_deadline: None,
             resize_deadline: None,
             client_size: None,
+            cwd_pending: HashSet::new(),
+            cwd_deadline: None,
             unknown_output: HashMap::new(),
             exit_mode: None,
             exit_seen: false,
@@ -341,17 +361,22 @@ impl<'a> ControlSession<'a> {
             pane_id.trim_start_matches('%')
         );
         let (cmd_tx, mut cmd_rx) = session_command_channel(session_id.clone());
+        let cwd = SharedCwd::default();
         let output = SessionOutputCoalescer::for_app(
             self.app.clone(),
             format!("terminal-output-{session_id}"),
             cmd_tx.clone(),
         );
 
-        let parent = self
-            .manager
-            .session_info(self.control_session_id)
-            .await
-            .ok();
+        let (parent, parent_remote_fs, parent_ssh_handle) = {
+            let sessions = self.manager.sessions.lock().await;
+            let handle = sessions.get(self.control_session_id);
+            (
+                handle.map(|h| h.info.clone()),
+                handle.and_then(|h| h.remote_fs.clone()),
+                handle.and_then(|h| h.ssh_handle.clone()),
+            )
+        };
         let name = self
             .pane_names
             .get(pane_id)
@@ -372,9 +397,19 @@ impl<'a> ControlSession<'a> {
                 .map(|info| info.ai_execution_profile)
                 .unwrap_or_default(),
             injection_active: false,
+            // The pane's cwd comes from tmux's own pane_current_path poll,
+            // not from shell-integration hooks in the pane's shell.
+            cwd_tracking_active: true,
             dynamic_title_capabilities: DynamicTitleCapabilities::default(),
-            remote_file_browser_enabled: false,
-            remote_stats_enabled: false,
+            // The pane shares the control session's SFTP channel: it lives on
+            // the same SSH connection and stays up while the shell channel is
+            // in control mode.
+            remote_file_browser_enabled: parent
+                .as_ref()
+                .is_some_and(|info| info.remote_file_browser_enabled),
+            remote_stats_enabled: parent
+                .as_ref()
+                .is_some_and(|info| info.remote_stats_enabled),
             ssh_profile: parent.as_ref().and_then(|info| info.ssh_profile.clone()),
             ssh_runtime_mode: None,
         };
@@ -384,9 +419,11 @@ impl<'a> ControlSession<'a> {
                 cmd_tx,
                 startup_input_barrier: None,
                 ssh_config: None,
-                ssh_handle: None,
-                cwd: Arc::default(),
-                remote_fs: None,
+                // Exec channels (stats, probes) multiplex over the parent's
+                // authenticated connection — the pane owns no SSH transport.
+                ssh_handle: parent_ssh_handle,
+                cwd: cwd.clone(),
+                remote_fs: parent_remote_fs,
             })
             .await;
 
@@ -427,6 +464,7 @@ impl<'a> ControlSession<'a> {
                 dims: None,
                 resize_attempts: None,
                 capture: OutputCaptureProcessor::new(),
+                cwd,
                 routed_bytes: 0,
             },
         );
@@ -437,6 +475,10 @@ impl<'a> ControlSession<'a> {
             virtual_session = %session_id,
             "tmux pane mapped to virtual session"
         );
+
+        // Seed the pane's cwd from tmux's own tracking.
+        self.cwd_pending.insert(pane_key.clone());
+        self.arm_cwd_query();
     }
 
     async fn seed_pane(&mut self, channel: &mut russh::Channel<client::Msg>, pane_id: &str) {
@@ -1223,6 +1265,17 @@ impl<'a> ControlSession<'a> {
                     self.seed_pane(channel, &pane).await;
                 }
             }
+            PendingKind::PaneCwd { pane } => {
+                if !failed {
+                    if let (Some(pane), Some(path)) = (self.panes.get(&pane), lines.first()) {
+                        let path = path.trim();
+                        if let Some(next) = update_cwd_if_changed(&pane.cwd, path).await {
+                            let event = format!("cwd-changed-{}", pane.session_id);
+                            let _ = self.app.emit(&event, &next);
+                        }
+                    }
+                }
+            }
             PendingKind::UserCommand => {
                 if failed && !lines.is_empty() {
                     let _ = self.app.emit(
@@ -1279,6 +1332,13 @@ impl<'a> ControlSession<'a> {
             if data.is_empty() {
                 continue;
             }
+            // A submitted line may have changed the pane's working directory;
+            // tmux emits no event for that, so poll `pane_current_path` once
+            // the command has had a moment to run.
+            if data.iter().any(|b| matches!(b, b'\r' | b'\n')) {
+                self.cwd_pending.insert(pane_id.clone());
+                self.arm_cwd_query();
+            }
             for chunk in data.chunks(SEND_KEYS_CHUNK_BYTES) {
                 let mut line = String::from("send-keys -H -t ");
                 line.push_str(&pane_id);
@@ -1289,6 +1349,32 @@ impl<'a> ControlSession<'a> {
             }
         }
         self.input_flush = None;
+    }
+
+    fn arm_cwd_query(&mut self) {
+        if self.cwd_deadline.is_none() {
+            self.cwd_deadline = Some(Box::pin(tokio::time::sleep(Duration::from_millis(
+                CWD_QUERY_DELAY_MS,
+            ))));
+        }
+    }
+
+    async fn flush_cwd_queries(&mut self, channel: &mut russh::Channel<client::Msg>) {
+        self.cwd_deadline = None;
+        let panes: Vec<String> = self.cwd_pending.drain().collect();
+        for pane_id in panes {
+            if !self.panes.contains_key(&pane_id) {
+                continue;
+            }
+            self.send_query(
+                channel,
+                PendingKind::PaneCwd {
+                    pane: pane_id.clone(),
+                },
+                &format!("display-message -p -t '{pane_id}' '#{{pane_current_path}}'"),
+            )
+            .await;
+        }
     }
 
     async fn continue_paused(&mut self, channel: &mut russh::Channel<client::Msg>) {
@@ -1562,6 +1648,14 @@ pub(crate) async fn run_control_session(
                     }
                 }
                 session.sync_pane_sizes(channel).await;
+            }
+
+            () = async {
+                if let Some(deadline) = session.cwd_deadline.as_mut() {
+                    deadline.as_mut().await;
+                }
+            }, if session.cwd_deadline.is_some() => {
+                session.flush_cwd_queries(channel).await;
             }
 
             command = cmd_rx.recv() => {

@@ -202,6 +202,11 @@ pub struct SessionInfo {
     /// command-confirmation events. Dynamic-title cwd hooks are independent.
     #[serde(default)]
     pub injection_active: bool,
+    /// True when the backend reports this terminal's cwd through a mechanism
+    /// other than shell integration — currently tmux panes, whose directory
+    /// is tracked by the server (`pane_current_path`) and polled on submit.
+    #[serde(default)]
+    pub cwd_tracking_active: bool,
     #[serde(flatten)]
     pub dynamic_title_capabilities: DynamicTitleCapabilities,
     /// True when the remote file browser is enabled for this session.
@@ -1462,6 +1467,7 @@ mod tests {
                 owner_window_label: None,
                 ai_execution_profile: AiExecutionProfile::Auto,
                 injection_active,
+                cwd_tracking_active: false,
                 dynamic_title_capabilities: DynamicTitleCapabilities::default(),
                 remote_file_browser_enabled: true,
                 remote_stats_enabled: true,

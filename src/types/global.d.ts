@@ -93,6 +93,8 @@ export interface SessionInfo {
   ai_execution_profile: AIExecutionProfile;
   /** True when backend shell command-confirmation integration is active. */
   injection_active: boolean;
+  /** True when the backend reports cwd without shell hooks (tmux panes). */
+  cwd_tracking_active?: boolean;
   /** Whether application/remote dynamic titles may be promoted. */
   dynamic_title_enabled: boolean;
   /** Whether the selected shell received NyaTerm dynamic-title/cwd hooks. */

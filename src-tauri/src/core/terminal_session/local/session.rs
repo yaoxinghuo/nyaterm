@@ -116,6 +116,7 @@ pub async fn create_local_session(
         owner_window_label,
         ai_execution_profile,
         injection_active,
+        cwd_tracking_active: false,
         // Integration becomes active only after a session-bound ready marker.
         dynamic_title_capabilities: DynamicTitleCapabilities::new(
             dynamic_title_enabled,
