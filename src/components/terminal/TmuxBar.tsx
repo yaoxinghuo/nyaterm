@@ -73,7 +73,7 @@ function TmuxBar({ controlSessionId }: TmuxBarProps) {
       className="flex h-8 shrink-0 items-center gap-1.5 border-b px-2"
       style={{
         borderColor: "var(--df-border)",
-        background: "var(--df-bg-secondary)",
+        background: "var(--df-bg-panel)",
       }}
       data-testid="tmux-bar"
     >
@@ -173,7 +173,8 @@ function TmuxBar({ controlSessionId }: TmuxBarProps) {
             className="absolute left-0 top-full z-50 mt-1 max-h-64 w-64 overflow-auto rounded-md border p-1 shadow-md"
             style={{
               borderColor: "var(--df-border)",
-              background: "var(--df-bg-secondary)",
+              // -solid keeps the suggestion list opaque over pane content.
+              background: "var(--df-bg-panel-solid, var(--df-bg-panel))",
             }}
           >
             {TMUX_COMMON_COMMANDS.filter((entry) =>

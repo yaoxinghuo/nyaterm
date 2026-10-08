@@ -27,8 +27,13 @@ pub(crate) enum ControlMessage {
         data: Vec<u8>,
     },
     /// `%extended-output %<pane> <age> <flags> : <data>` (tmux >= 3.2, `-CC`).
+    ///
+    /// `age` is the millisecond age of the output block on the server; it lets
+    /// callers deduplicate notifications that were generated before a
+    /// `capture-pane` snapshot but deferred past the enclosing `%end` marker.
     ExtendedOutput {
         pane: String,
+        age: u64,
         data: Vec<u8>,
     },
     /// `%layout-change @<window> <layout> <visible-layout> <flags>`
@@ -255,9 +260,12 @@ pub(crate) fn parse_line(line: &str) -> Option<ControlMessage> {
             // `%extended-output %<id> <age> <flags...> : <data>`
             let args = rest_after_keyword(line, "%extended-output")?;
             let (meta, data) = args.split_once(" : ")?;
-            let pane = meta.split_whitespace().next()?;
+            let mut meta_parts = meta.split_whitespace();
+            let pane = meta_parts.next()?;
+            let age = meta_parts.next().and_then(|t| t.parse().ok()).unwrap_or(0);
             Some(ControlMessage::ExtendedOutput {
                 pane: pane.to_string(),
+                age,
                 data: unescape_octal(data),
             })
         }
@@ -609,6 +617,7 @@ mod tests {
             parse_line("%extended-output %5 1234 - : data"),
             Some(ControlMessage::ExtendedOutput {
                 pane: "%5".into(),
+                age: 1234,
                 data: b"data".to_vec()
             })
         );

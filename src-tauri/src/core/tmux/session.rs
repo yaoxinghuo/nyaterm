@@ -42,8 +42,6 @@ const INPUT_FLUSH_DELAY_MS: u64 = 4;
 const SEND_KEYS_CHUNK_BYTES: usize = 1024;
 /// Debounce for structural refreshes (`list-windows`/`list-panes`).
 const STATE_REFRESH_DELAY_MS: u64 = 120;
-/// Debounce for applying renderer resize requests towards tmux.
-const RESIZE_APPLY_DELAY_MS: u64 = 40;
 /// Buffer cap for output belonging to panes we have not mapped yet.
 const PENDING_PANE_OUTPUT_MAX_BYTES: usize = 512 * 1024;
 /// How long to wait for `%exit` after `detach-client` before giving up.
@@ -87,14 +85,23 @@ struct VirtualPane {
     decoder: TerminalOutputDecoder,
     /// Forwarder task draining this pane's command channel.
     forwarder: JoinHandle<()>,
-    /// Output received before `capture-pane` seeding completed.
-    pending_output: VecDeque<Vec<u8>>,
+    /// Output received before `capture-pane` seeding completed. The instant
+    /// is the server-side production time estimated from `%extended-output`'s
+    /// age (`None` for plain `%output`, which carries no timestamp).
+    pending_output: VecDeque<(Option<std::time::Instant>, Vec<u8>)>,
     seeded: bool,
+    /// When this pane's latest `capture-pane` snapshot was taken; output
+    /// provably produced before it is already inside the seeded screen and
+    /// must not be replayed (tmux defers notifications past `%end` blocks).
+    capture_at: Option<std::time::Instant>,
     /// Last renderer attach; a re-attach to a seeded pane means the terminal
     /// widget was remounted (empty buffer) and needs the screen re-seeded.
     last_attach: Option<std::time::Instant>,
     /// A capture/cursor seed pair is already in flight for this pane.
     seeding: bool,
+    /// The in-flight seed predates a client grow and must be redone once it
+    /// lands, so its (possibly clipped) snapshot never reaches the screen.
+    reseed: bool,
     /// Bytes routed so far; only logged while small.
     routed_bytes: usize,
 }
@@ -171,13 +178,12 @@ pub(crate) struct ControlSession<'a> {
     continue_deadline: Option<Pin<Box<Sleep>>>,
 
     refresh_deadline: Option<Pin<Box<Sleep>>>,
-    resize_deadline: Option<Pin<Box<Sleep>>>,
-    /// Desired (cols, rows) reported by the renderer per pane.
-    /// Client size currently applied to tmux (active window root size).
+    /// Client size currently applied to tmux (grown to fit the active
+    /// window's root layout; an unknown size counts as 0).
     client_size: Option<(u32, u32)>,
     /// Output received for panes we have not mapped yet (e.g. background
     /// windows), kept in case the pane becomes visible. Bounded.
-    unknown_output: HashMap<String, VecDeque<Vec<u8>>>,
+    unknown_output: HashMap<String, VecDeque<(Option<std::time::Instant>, Vec<u8>)>>,
 
     exit_mode: Option<ExitMode>,
     exit_seen: bool,
@@ -217,7 +223,6 @@ impl<'a> ControlSession<'a> {
             last_emitted: None,
             continue_deadline: None,
             refresh_deadline: None,
-            resize_deadline: None,
             client_size: None,
             unknown_output: HashMap::new(),
             exit_mode: None,
@@ -370,8 +375,10 @@ impl<'a> ControlSession<'a> {
                 forwarder,
                 pending_output,
                 seeded: false,
+                capture_at: None,
                 last_attach: None,
                 seeding: false,
+                reseed: false,
                 routed_bytes: 0,
             },
         );
@@ -403,13 +410,18 @@ impl<'a> ControlSession<'a> {
         )
         .await;
         // Ask for the live cursor so a sparse/fresh pane does not leave the
-        // terminal cursor parked at bottom-left after the seed.
+        // terminal cursor parked at bottom-left after the seed. `cursor_y`
+        // is screen-relative while the capture text includes `history_size`
+        // scrollback lines on top, so the seed needs both to place the
+        // cursor at the matching row.
         self.send_query(
             channel,
             PendingKind::SeedCursor {
                 pane: pane_id.to_string(),
             },
-            &format!("display-message -p -t '{pane_id}' '#{{cursor_x}} #{{cursor_y}}'"),
+            &format!(
+                "display-message -p -t '{pane_id}' '#{{cursor_x}} #{{cursor_y}} #{{history_size}}'"
+            ),
         )
         .await;
     }
@@ -573,11 +585,12 @@ impl<'a> ControlSession<'a> {
 
     /// Reconcile virtual panes with the active window's layout.
     async fn reconcile_panes(&mut self, channel: &mut russh::Channel<client::Msg>) {
-        let layout = self
+        let (layout, zoomed) = self
             .active_window
             .as_ref()
             .and_then(|id| self.windows.get(id))
-            .and_then(|window| window.layout.clone());
+            .map(|window| (window.layout.clone(), window.zoomed))
+            .unwrap_or((None, false));
         let wanted: HashSet<String> = layout
             .as_ref()
             .map(|layout| {
@@ -589,6 +602,18 @@ impl<'a> ControlSession<'a> {
             })
             .unwrap_or_default();
 
+        // The client must cover the window before any capture below runs:
+        // while the window outgrows the client, tmux clips panes and marks
+        // clipped edges with `#`, and it never re-pushes `%output` after a
+        // resize — a capture taken pre-grow would seed those marks forever.
+        // Skipped while zoomed since any client resize drops the zoom.
+        let mut grew = false;
+        if !zoomed {
+            if let Some(layout) = layout.as_ref() {
+                grew = self.grow_client(channel, layout.width, layout.height).await;
+            }
+        }
+
         // Drop panes that vanished or belong to a different window.
         let existing: Vec<String> = self.panes.keys().cloned().collect();
         for pane_id in existing {
@@ -596,21 +621,68 @@ impl<'a> ControlSession<'a> {
                 self.drop_pane(&pane_id).await;
             }
         }
-        // Spawn panes we don't know yet, then seed their scrollback.
-        let mut spawned = Vec::new();
+        // Spawn panes we don't know yet.
         for pane_id in &wanted {
             if !self.panes.contains_key(pane_id) {
                 self.spawn_pane(pane_id).await;
-                spawned.push(pane_id.clone());
             }
         }
-        for pane_id in spawned {
+        if grew {
+            // Panes seeded while the client was still too small may contain
+            // '#' clipping marks; the resize produces no redraw `%output`,
+            // so re-capture them. Panes whose seed is in flight run on the
+            // pre-grow snapshot — flag them for a second seed when it lands.
+            for pane_id in &wanted {
+                if let Some(pane) = self.panes.get_mut(pane_id) {
+                    if pane.seeding {
+                        pane.reseed = true;
+                    } else {
+                        pane.seeded = false;
+                    }
+                }
+            }
+        }
+        let to_seed: Vec<String> = wanted
+            .iter()
+            .filter(|pane_id| {
+                self.panes
+                    .get(*pane_id)
+                    .is_some_and(|pane| !pane.seeded && !pane.seeding)
+            })
+            .cloned()
+            .collect();
+        for pane_id in to_seed {
             self.seed_pane(channel, &pane_id).await;
         }
-        if let Some(layout) = layout {
-            self.client_size = Some((layout.width, layout.height));
-        }
         self.emit_state();
+    }
+
+    /// Grow the control client to fit the window layout. Shrinking would
+    /// make tmux rebalance panes and echo `%layout-change`, so we only ever
+    /// grow. Returns true when a `refresh-client -C` was actually sent.
+    async fn grow_client(
+        &mut self,
+        channel: &mut russh::Channel<client::Msg>,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        let current = self.client_size.unwrap_or((0, 0));
+        let grown = (width.max(current.0), height.max(current.1));
+        if grown == current {
+            return false;
+        }
+        if !self
+            .send_line(
+                channel,
+                PendingKind::Ignore,
+                &format!("refresh-client -C {}x{}", grown.0, grown.1),
+            )
+            .await
+        {
+            return false;
+        }
+        self.client_size = Some(grown);
+        true
     }
 
     async fn handle_message(&mut self, channel: &mut russh::Channel<client::Msg>, line: String) {
@@ -669,9 +741,14 @@ impl<'a> ControlSession<'a> {
             ControlMessage::End | ControlMessage::Error => {
                 // Unsolicited end without a begin: ignore.
             }
-            ControlMessage::Output { pane, data }
-            | ControlMessage::ExtendedOutput { pane, data } => {
-                self.route_output(&pane, data);
+            ControlMessage::Output { pane, data } => {
+                self.route_output(&pane, None, data);
+            }
+            ControlMessage::ExtendedOutput { pane, age, data } => {
+                let produced_at = std::time::Instant::now()
+                    .checked_sub(Duration::from_millis(age))
+                    .unwrap_or_else(std::time::Instant::now);
+                self.route_output(&pane, Some(produced_at), data);
             }
             ControlMessage::LayoutChange {
                 window,
@@ -685,11 +762,6 @@ impl<'a> ControlSession<'a> {
                     visible_layout: None,
                     zoomed: false,
                 });
-                // tmux re-emits identical layouts in response to our own
-                // refresh-client; only a changed layout may schedule a
-                // follow-up resize, otherwise the echo feeds itself.
-                let changed = entry.layout.as_ref() != Some(&layout)
-                    || entry.visible_layout.as_ref() != Some(&visible_layout);
                 entry.zoomed = flags.contains('Z');
                 entry.layout = Some(layout);
                 entry.visible_layout = Some(visible_layout);
@@ -699,14 +771,9 @@ impl<'a> ControlSession<'a> {
                     self.active_window = Some(window.clone());
                 }
                 if self.active_window.as_deref() == Some(window.as_str()) {
+                    // reconcile_panes also grows the client when the layout
+                    // outgrows it — that is what removes `#` clipping marks.
                     self.reconcile_panes(channel).await;
-                }
-                // Layout changes may outgrow the client; tmux draws a `#`
-                // marker at the clipped edge until refresh-client -C fixes it.
-                if changed && self.resize_deadline.is_none() {
-                    self.resize_deadline = Some(Box::pin(tokio::time::sleep(
-                        Duration::from_millis(RESIZE_APPLY_DELAY_MS),
-                    )));
                 }
             }
             ControlMessage::WindowAdd { window } => {
@@ -812,11 +879,19 @@ impl<'a> ControlSession<'a> {
         self.exit_seen = true;
     }
 
-    fn route_output(&mut self, pane: &str, data: Vec<u8>) {
+    fn route_output(&mut self, pane: &str, produced_at: Option<std::time::Instant>, data: Vec<u8>) {
         if let Some(virtual_pane) = self.panes.get_mut(pane) {
             // Not-yet-seeded panes keep raw bytes: decoding is stateful and
             // must see each byte exactly once.
             if virtual_pane.seeded {
+                // A notification provably produced before the last capture is
+                // already painted by the seed — tmux defers such blocks past
+                // the command's `%end`, so arrival order alone cannot tell.
+                if let (Some(at), Some(capture_at)) = (produced_at, virtual_pane.capture_at) {
+                    if at <= capture_at {
+                        return;
+                    }
+                }
                 let decoded = virtual_pane.decoder.decode(&data);
                 virtual_pane.output.push_owned(decoded);
                 virtual_pane.routed_bytes += data.len();
@@ -829,15 +904,15 @@ impl<'a> ControlSession<'a> {
                     );
                 }
             } else {
-                virtual_pane.pending_output.push_back(data);
+                virtual_pane.pending_output.push_back((produced_at, data));
             }
         } else {
             // Pane output can arrive before its layout (attach, or panes in
             // background windows). Buffer a bounded amount keyed by pane id.
             let pending = self.unknown_output.entry(pane.to_string()).or_default();
-            let total: usize = pending.iter().map(Vec::len).sum();
+            let total: usize = pending.iter().map(|(_, data)| data.len()).sum();
             if total < PENDING_PANE_OUTPUT_MAX_BYTES {
-                pending.push_back(data);
+                pending.push_back((produced_at, data));
             }
         }
     }
@@ -870,42 +945,73 @@ impl<'a> ControlSession<'a> {
             }
             PendingKind::CapturePane { pane } => {
                 if let Some(virtual_pane) = self.panes.get_mut(&pane) {
-                    if !failed && !lines.is_empty() {
-                        let mut decoder = TerminalOutputDecoder::new(&self.encoding);
-                        let text = decoder.decode(lines.join("\r\n").as_bytes());
-                        virtual_pane.output.push_owned(text);
-                    }
                     if !failed {
-                        // The capture is a snapshot that already contains
-                        // everything buffered so far; replaying the queue
-                        // would paint the same lines twice.
-                        virtual_pane.pending_output.clear();
+                        // Reset + clear first: this makes the seed idempotent
+                        // for remounted terminals and for re-captures after a
+                        // client grow (which must overwrite '#' clipping
+                        // marks already on screen).
+                        let mut decoder = TerminalOutputDecoder::new(&self.encoding);
+                        let mut text = String::from("\x1b[H\x1b[2J\x1b[3J");
+                        text.push_str(&decoder.decode(lines.join("\r\n").as_bytes()));
+                        virtual_pane.output.push_owned(text);
+                        // Snapshot boundary for output dedup: notifications
+                        // produced before this instant are inside the capture.
+                        virtual_pane.capture_at = Some(std::time::Instant::now());
                     }
                 }
             }
             PendingKind::SeedCursor { pane } => {
+                let mut reseed = false;
                 if let Some(virtual_pane) = self.panes.get_mut(&pane) {
                     virtual_pane.seeding = false;
-                    if !failed {
+                    reseed = std::mem::take(&mut virtual_pane.reseed);
+                    if !failed && !reseed {
                         if let Some(line) = lines.first() {
                             let mut parts = line.split_whitespace();
-                            if let (Some(Ok(x)), Some(Ok(y))) = (
+                            if let (Some(Ok(x)), Some(Ok(y)), history) = (
                                 parts.next().map(str::parse::<u32>),
                                 parts.next().map(str::parse::<u32>),
+                                parts
+                                    .next()
+                                    .and_then(|t| t.parse::<u32>().ok())
+                                    .unwrap_or(0),
                             ) {
+                                // `cursor_y` counts screen rows only while the
+                                // seeded text starts with `history_size`
+                                // scrollback lines — offset accordingly.
                                 virtual_pane.output.push_owned(format!(
                                     "\x1b[{};{}H",
-                                    y + 1,
+                                    history + y + 1,
                                     x + 1
                                 ));
                             }
                         }
                     }
-                    virtual_pane.seeded = true;
-                    while let Some(data) = virtual_pane.pending_output.pop_front() {
-                        let decoded = virtual_pane.decoder.decode(&data);
-                        virtual_pane.output.push_owned(decoded);
+                    if !reseed {
+                        virtual_pane.seeded = true;
+                        let capture_at = virtual_pane.capture_at;
+                        while let Some((produced_at, data)) =
+                            virtual_pane.pending_output.pop_front()
+                        {
+                            // Entries provably produced before the snapshot —
+                            // and un-`aged` `%output`, which is always older —
+                            // are already painted; replaying them would draw
+                            // the same lines twice.
+                            let stale = match (produced_at, capture_at) {
+                                (Some(at), Some(cap)) => at <= cap,
+                                (None, Some(_)) => true,
+                                _ => false,
+                            };
+                            if stale {
+                                continue;
+                            }
+                            let decoded = virtual_pane.decoder.decode(&data);
+                            virtual_pane.output.push_owned(decoded);
+                        }
                     }
+                }
+                if reseed {
+                    self.seed_pane(channel, &pane).await;
                 }
             }
             PendingKind::UserCommand => {
@@ -974,39 +1080,6 @@ impl<'a> ControlSession<'a> {
             }
         }
         self.input_flush = None;
-    }
-
-    async fn apply_resize(&mut self, channel: &mut russh::Channel<client::Msg>) {
-        let Some(window) = self.active_window.as_ref() else {
-            return;
-        };
-        let Some(state) = self.windows.get(window) else {
-            return;
-        };
-        if state.zoomed {
-            // Any client/pane resize forces an unzoom; leave the layout alone.
-            return;
-        }
-        let Some(layout) = state.layout.clone() else {
-            return;
-        };
-
-        // Grow the client to fit the layout. Shrinking would make tmux
-        // rebalance panes and echo %layout-change, so we only ever grow —
-        // and an unknown client size counts as 0 so the first layout always
-        // claims the real extent (fixes the `#` overflow markers).
-        let current = self.client_size.unwrap_or((0, 0));
-        let grown = (layout.width.max(current.0), layout.height.max(current.1));
-        if grown == current {
-            return;
-        }
-        self.send_line(
-            channel,
-            PendingKind::Ignore,
-            &format!("refresh-client -C {}x{}", grown.0, grown.1),
-        )
-        .await;
-        self.client_size = Some(grown);
     }
 
     async fn continue_paused(&mut self, channel: &mut russh::Channel<client::Msg>) {
@@ -1224,15 +1297,6 @@ pub(crate) async fn run_control_session(
             }, if session.refresh_deadline.is_some() => {
                 session.refresh_deadline = None;
                 session.refresh_lists(channel).await;
-            }
-
-            () = async {
-                if let Some(deadline) = session.resize_deadline.as_mut() {
-                    deadline.as_mut().await;
-                }
-            }, if session.resize_deadline.is_some() => {
-                session.resize_deadline = None;
-                session.apply_resize(channel).await;
             }
 
             () = async {

@@ -1503,6 +1503,13 @@ pub(super) async fn ssh_io_loop(
                                     &session_id,
                                     "\r\n\x1b[2m[nyaterm] tmux control mode\x1b[0m\r\n",
                                 );
+                                // The leaf terminal unmounts for the tmux
+                                // pane tree; detach so that output arriving
+                                // during/after control mode (including the
+                                // shell prompt repainted on detach) buffers
+                                // for the remounted renderer instead of being
+                                // emitted into a dead listener.
+                                output.detach();
                                 match tmux::run_control_session(
                                     &app,
                                     &session_id,
@@ -1535,13 +1542,12 @@ pub(super) async fn ssh_io_loop(
                                                 &result.visible,
                                             );
                                         }
-                                        // The shell's prompt is not redrawn
-                                        // after the control client detaches;
-                                        // an empty Enter makes it repaint.
-                                        // Delayed: the remounted renderer must
-                                        // attach first or the redraw is lost.
-                                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                                        let _ = channel.data("\r".as_bytes()).await;
+                                        // No synthetic "\r" here: the shell
+                                        // repaints its own prompt when the
+                                        // control client exits, and that
+                                        // output replays once the renderer
+                                        // re-attaches — a second Enter would
+                                        // print a duplicate prompt.
                                         continue;
                                     }
                                     tmux::ControlExit::Closed => break "tmux-control-exit",
