@@ -80,6 +80,11 @@ export function buildTmuxPaneTree(
       kind: "split",
       direction: node.direction,
       // tmux-owned layout — the divider is fixed at 50/50 and not draggable.
+      // Feeding tmux's real ratio back here closes a feedback loop: renderer
+      // reports drive resize-pane, whose layout echo would shift the
+      // containers, which report new sizes — a ratchet that runs away on any
+      // px-level asymmetry. Fixed ratios keep renderer sizes stable so the
+      // backend sync converges instead.
       ratio: 0.5,
       first: convert(node.first),
       second: convert(node.second),

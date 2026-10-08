@@ -48,6 +48,14 @@ const PENDING_PANE_OUTPUT_MAX_BYTES: usize = 512 * 1024;
 const DETACH_EXIT_TIMEOUT_MS: u64 = 3000;
 /// Flow control: after a `%pause`, let the pane breathe, then continue it.
 const PAUSE_CONTINUE_DELAY_MS: u64 = 250;
+/// `resize-pane` retries per distinct target; the echoed `%layout-change`
+/// retriggers the fixup, so without a cap an unreachable target would loop.
+const RESIZE_PANE_MAX_ATTEMPTS: u8 = 2;
+/// Renderer resize reports settle for this long before they become pane
+/// targets: a freshly split pane's container transiently reports degenerate
+/// dims (full width or ~zero), and applying those would collapse the layout
+/// chasing transients.
+const RESIZE_SYNC_DEBOUNCE_MS: u64 = 250;
 
 #[derive(Debug)]
 pub(crate) enum ControlExit {
@@ -102,6 +110,25 @@ struct VirtualPane {
     /// The in-flight seed predates a client grow and must be redone once it
     /// lands, so its (possibly clipped) snapshot never reaches the screen.
     reseed: bool,
+    /// `capture-pane` rows held until the cursor reply lands. The seed is
+    /// composed in a single payload then, because the scrollback/screen
+    /// split needs `history_size` from that reply.
+    pending_seed: Option<Vec<String>>,
+    /// Terminal size reported by the local renderer (`resize_session`). The
+    /// tmux layout owns pane dimensions, and a mismatch wraps full-width
+    /// output — e.g. zsh's `#`/`%` partial-line markers, erased by `\r \r`
+    /// at pane width — onto the wrong row in xterm where it survives.
+    desired: Option<(u32, u32)>,
+    /// Latest renderer report, promoted to `desired` after the debounce so
+    /// transient container sizes never reach tmux.
+    pending_dims: Option<(u32, u32)>,
+    /// Cell dimensions the current screen was seeded at; a layout change
+    /// that alters them triggers a fresh capture so rows realign.
+    dims: Option<(u32, u32)>,
+    /// Last `resize-pane` target and attempts for the current `desired`
+    /// size — bounds the layout-echo feedback when a target is unreachable
+    /// (e.g. a remote `window-size=manual` that ignores the client size).
+    resize_attempts: Option<((u32, u32), u8)>,
     /// Bytes routed so far; only logged while small.
     routed_bytes: usize,
 }
@@ -149,6 +176,11 @@ pub(crate) struct ControlSession<'a> {
     parser: ControlParser,
     /// Lines collected inside a `%begin`..`%end` block.
     block_lines: Option<Vec<String>>,
+    /// When the current response block opened. Used as the capture snapshot
+    /// boundary: output produced before this instant is guaranteed inside a
+    /// capture executed within the block, while output produced after may
+    /// still be new — the boundary must err toward replaying, not dropping.
+    block_started_at: Option<std::time::Instant>,
     /// Every command line written to the control channel produces exactly one
     /// `%begin`/`%end` (or `%error`) block, in send order. The FIFO therefore
     /// must be pushed for *every* line — internal queries push their kind so
@@ -178,6 +210,9 @@ pub(crate) struct ControlSession<'a> {
     continue_deadline: Option<Pin<Box<Sleep>>>,
 
     refresh_deadline: Option<Pin<Box<Sleep>>>,
+    /// Pending renderer-size sync; armed whenever a pane reports new dims
+    /// and debounced so only settled sizes are applied.
+    resize_deadline: Option<Pin<Box<Sleep>>>,
     /// Client size currently applied to tmux (grown to fit the active
     /// window's root layout; an unknown size counts as 0).
     client_size: Option<(u32, u32)>,
@@ -207,6 +242,7 @@ impl<'a> ControlSession<'a> {
             connection_id,
             parser: ControlParser::new(),
             block_lines: None,
+            block_started_at: None,
             pending_responses: VecDeque::new(),
             windows: HashMap::new(),
             panes: HashMap::new(),
@@ -223,6 +259,7 @@ impl<'a> ControlSession<'a> {
             last_emitted: None,
             continue_deadline: None,
             refresh_deadline: None,
+            resize_deadline: None,
             client_size: None,
             unknown_output: HashMap::new(),
             exit_mode: None,
@@ -379,6 +416,11 @@ impl<'a> ControlSession<'a> {
                 last_attach: None,
                 seeding: false,
                 reseed: false,
+                pending_seed: None,
+                desired: None,
+                pending_dims: None,
+                dims: None,
+                resize_attempts: None,
                 routed_bytes: 0,
             },
         );
@@ -392,11 +434,25 @@ impl<'a> ControlSession<'a> {
     }
 
     async fn seed_pane(&mut self, channel: &mut russh::Channel<client::Msg>, pane_id: &str) {
+        let dims = self
+            .active_window
+            .as_ref()
+            .and_then(|id| self.windows.get(id))
+            .and_then(|window| window.layout.as_ref())
+            .and_then(|layout| {
+                pane_id
+                    .trim_start_matches('%')
+                    .parse::<u32>()
+                    .ok()
+                    .and_then(|num| layout.find_pane(num))
+            })
+            .map(|cell| (cell.width, cell.height));
         if let Some(pane) = self.panes.get_mut(pane_id) {
             if pane.seeding {
                 return;
             }
             pane.seeding = true;
+            pane.dims = dims;
         }
         // `-e` keeps escape sequences, `-p` prints to stdout, `-S -` starts at
         // the beginning of the pane's scrollback.
@@ -642,6 +698,32 @@ impl<'a> ControlSession<'a> {
                 }
             }
         }
+        // A pane whose cell resized since its seed renders rows that were
+        // laid out for the old width; capture again at the new size.
+        for pane_id in &wanted {
+            let Some(dims) = layout
+                .as_ref()
+                .and_then(|layout| {
+                    pane_id
+                        .trim_start_matches('%')
+                        .parse::<u32>()
+                        .ok()
+                        .and_then(|num| layout.find_pane(num))
+                })
+                .map(|cell| (cell.width, cell.height))
+            else {
+                continue;
+            };
+            if let Some(pane) = self.panes.get_mut(pane_id) {
+                if pane.dims.is_some() && pane.dims != Some(dims) {
+                    if pane.seeding {
+                        pane.reseed = true;
+                    } else {
+                        pane.seeded = false;
+                    }
+                }
+            }
+        }
         let to_seed: Vec<String> = wanted
             .iter()
             .filter(|pane_id| {
@@ -654,6 +736,7 @@ impl<'a> ControlSession<'a> {
         for pane_id in to_seed {
             self.seed_pane(channel, &pane_id).await;
         }
+        self.sync_pane_sizes(channel).await;
         self.emit_state();
     }
 
@@ -683,6 +766,89 @@ impl<'a> ControlSession<'a> {
         }
         self.client_size = Some(grown);
         true
+    }
+
+    /// Drive pane dimensions toward the sizes reported by their renderers.
+    ///
+    /// `SessionCommand::Resize` records each xterm's cell size, but the tmux
+    /// layout owns actual pane dims; a mismatch wraps full-width output onto
+    /// the wrong xterm row (how zsh's `\r`-erased `#`/`%` markers survive).
+    /// First the client — and with it the window, under the default
+    /// `window-size=latest` — is sized to the fold of all renderer demands;
+    /// once it matches, per-pane drift left by tmux's proportional scaling
+    /// is corrected with `resize-pane`.
+    async fn sync_pane_sizes(&mut self, channel: &mut russh::Channel<client::Msg>) {
+        let Some(window) = self
+            .active_window
+            .as_ref()
+            .and_then(|id| self.windows.get(id))
+        else {
+            return;
+        };
+        // Resizing a zoomed window would drop the zoom.
+        if window.zoomed {
+            return;
+        }
+        let Some(layout) = window.layout.clone() else {
+            return;
+        };
+
+        let needed = needed_window_size(&layout, &self.panes);
+        if needed != (layout.width, layout.height) {
+            // Unlike grow_client this also shrinks: renderers may be
+            // narrower than the window's current share. `refresh-client`
+            // only emits `%layout-change` when the resize actually takes
+            // effect, so this self-limits against remotes ignoring it.
+            if self
+                .send_line(
+                    channel,
+                    PendingKind::Ignore,
+                    &format!("refresh-client -C {}x{}", needed.0, needed.1),
+                )
+                .await
+            {
+                self.client_size = Some(needed);
+            }
+            return;
+        }
+
+        // The window already matches the renderers' demand; fix whatever
+        // drift remains per pane. Targets are collected first because
+        // send_line borrows self mutably.
+        let mut targets = Vec::new();
+        for pane_num in layout.pane_ids() {
+            let Some(cell) = layout.find_pane(pane_num) else {
+                continue;
+            };
+            let pane_id = format!("%{pane_num}");
+            let Some(pane) = self.panes.get_mut(&pane_id) else {
+                continue;
+            };
+            let Some(desired) = pane.desired else {
+                continue;
+            };
+            if desired == (cell.width, cell.height) {
+                pane.resize_attempts = None;
+                continue;
+            }
+            let attempts = match pane.resize_attempts {
+                Some((target, count)) if target == desired => count,
+                _ => 0,
+            };
+            if attempts >= RESIZE_PANE_MAX_ATTEMPTS {
+                continue;
+            }
+            pane.resize_attempts = Some((desired, attempts + 1));
+            targets.push((pane_id, desired));
+        }
+        for (pane_id, (cols, rows)) in targets {
+            self.send_line(
+                channel,
+                PendingKind::Ignore,
+                &format!("resize-pane -t '{pane_id}' -x {cols} -y {rows}"),
+            )
+            .await;
+        }
     }
 
     async fn handle_message(&mut self, channel: &mut russh::Channel<client::Msg>, line: String) {
@@ -737,6 +903,7 @@ impl<'a> ControlSession<'a> {
         match message {
             ControlMessage::Begin => {
                 self.block_lines = Some(Vec::new());
+                self.block_started_at = Some(std::time::Instant::now());
             }
             ControlMessage::End | ControlMessage::Error => {
                 // Unsolicited end without a begin: ignore.
@@ -946,17 +1113,19 @@ impl<'a> ControlSession<'a> {
             PendingKind::CapturePane { pane } => {
                 if let Some(virtual_pane) = self.panes.get_mut(&pane) {
                     if !failed {
-                        // Reset + clear first: this makes the seed idempotent
-                        // for remounted terminals and for re-captures after a
-                        // client grow (which must overwrite '#' clipping
-                        // marks already on screen).
-                        let mut decoder = TerminalOutputDecoder::new(&self.encoding);
-                        let mut text = String::from("\x1b[H\x1b[2J\x1b[3J");
-                        text.push_str(&decoder.decode(lines.join("\r\n").as_bytes()));
-                        virtual_pane.output.push_owned(text);
-                        // Snapshot boundary for output dedup: notifications
-                        // produced before this instant are inside the capture.
-                        virtual_pane.capture_at = Some(std::time::Instant::now());
+                        // Held until the SeedCursor reply arrives: the seed is
+                        // composed as a single payload there, because the
+                        // scrollback/screen split needs `history_size`.
+                        virtual_pane.pending_seed = Some(lines);
+                        // Snapshot boundary for output dedup: the capture ran
+                        // after the block opened, so output produced before
+                        // %begin is guaranteed inside it; anything later may
+                        // be genuinely new (tmux defers it past %end) and must
+                        // be replayed rather than dropped.
+                        virtual_pane.capture_at = Some(
+                            self.block_started_at
+                                .unwrap_or_else(std::time::Instant::now),
+                        );
                     }
                 }
             }
@@ -965,26 +1134,50 @@ impl<'a> ControlSession<'a> {
                 if let Some(virtual_pane) = self.panes.get_mut(&pane) {
                     virtual_pane.seeding = false;
                     reseed = std::mem::take(&mut virtual_pane.reseed);
-                    if !failed && !reseed {
-                        if let Some(line) = lines.first() {
+                    if !reseed {
+                        let cursor = (!failed).then(|| lines.first()).flatten().and_then(|line| {
                             let mut parts = line.split_whitespace();
-                            if let (Some(Ok(x)), Some(Ok(y)), history) = (
-                                parts.next().map(str::parse::<u32>),
-                                parts.next().map(str::parse::<u32>),
-                                parts
-                                    .next()
-                                    .and_then(|t| t.parse::<u32>().ok())
-                                    .unwrap_or(0),
-                            ) {
-                                // `cursor_y` counts screen rows only while the
-                                // seeded text starts with `history_size`
-                                // scrollback lines — offset accordingly.
-                                virtual_pane.output.push_owned(format!(
-                                    "\x1b[{};{}H",
-                                    history + y + 1,
-                                    x + 1
-                                ));
+                            let x = parts.next()?.parse::<u32>().ok()?;
+                            let y = parts.next()?.parse::<u32>().ok()?;
+                            let history = parts
+                                .next()
+                                .and_then(|t| t.parse::<usize>().ok())
+                                .unwrap_or(0);
+                            Some((x, y, history))
+                        });
+                        if let Some(seed_lines) = virtual_pane.pending_seed.take() {
+                            let (x, y, history) = cursor.unwrap_or_default();
+                            let hist = history.min(seed_lines.len());
+                            let mut decoder = TerminalOutputDecoder::new(&self.encoding);
+                            // Reset + clear first: this makes the seed
+                            // idempotent for remounted terminals and for
+                            // re-captures after a client grow (which must
+                            // overwrite '#' clipping marks already on
+                            // screen).
+                            let mut text = String::from("\x1b[H\x1b[2J\x1b[3J");
+                            if hist > 0 {
+                                // `capture-pane -S -` leads with
+                                // `history_size` scrollback rows. Writing
+                                // them plainly would leave stale rows (e.g.
+                                // leftover '#'/'%' marks) parked above the
+                                // prompt, so scroll them into the renderer's
+                                // own scrollback first, then paint only the
+                                // screen part.
+                                text.push_str(
+                                    &decoder.decode(seed_lines[..hist].join("\r\n").as_bytes()),
+                                );
+                                text.push_str("\r\n");
+                                text.push_str("\x1b[r\x1b[9999B");
+                                text.push_str(&"\n".repeat(hist));
+                                text.push_str("\x1b[H");
                             }
+                            text.push_str(
+                                &decoder.decode(seed_lines[hist..].join("\r\n").as_bytes()),
+                            );
+                            // `cursor_y` is screen-relative; with scrollback
+                            // scrolled away it lands directly on that row.
+                            text.push_str(&format!("\x1b[{};{}H", y + 1, x + 1));
+                            virtual_pane.output.push_owned(text);
                         }
                     }
                     if !reseed {
@@ -1122,9 +1315,15 @@ impl<'a> ControlSession<'a> {
                     ))));
                 }
             }
-            SessionCommand::Resize { .. } => {
-                // Pane sizes belong to the tmux layout; the local renderer's
-                // fit result is intentionally ignored.
+            SessionCommand::Resize { cols, rows } => {
+                if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    if pane.pending_dims != Some((cols, rows)) {
+                        pane.pending_dims = Some((cols, rows));
+                        self.resize_deadline = Some(Box::pin(tokio::time::sleep(
+                            Duration::from_millis(RESIZE_SYNC_DEBOUNCE_MS),
+                        )));
+                    }
+                }
             }
             SessionCommand::SerialModemUpload { .. } => {
                 // Serial-only command; unreachable on an SSH control channel.
@@ -1308,6 +1507,24 @@ pub(crate) async fn run_control_session(
                 session.continue_paused(channel).await;
             }
 
+            () = async {
+                if let Some(deadline) = session.resize_deadline.as_mut() {
+                    deadline.as_mut().await;
+                }
+            }, if session.resize_deadline.is_some() => {
+                session.resize_deadline = None;
+                // Promote the settled renderer reports into resize targets.
+                for pane in session.panes.values_mut() {
+                    if let Some(dims) = pane.pending_dims.take() {
+                        if pane.desired != Some(dims) {
+                            pane.desired = Some(dims);
+                            pane.resize_attempts = None;
+                        }
+                    }
+                }
+                session.sync_pane_sizes(channel).await;
+            }
+
             command = cmd_rx.recv() => {
                 match command {
                     Some(SessionCommand::TmuxCommand { line }) => {
@@ -1371,4 +1588,30 @@ pub(crate) async fn run_control_session(
 
     session.teardown().await;
     exit
+}
+
+/// Window dimensions under which every pane could take its renderer's size:
+/// each leaf contributes its reported size when known and its current cell
+/// dimensions otherwise, inner cells add back the divider lines tmux draws
+/// between children.
+fn needed_window_size(cell: &LayoutCell, panes: &HashMap<String, VirtualPane>) -> (u32, u32) {
+    if cell.is_leaf() {
+        return cell
+            .pane
+            .and_then(|num| panes.get(&format!("%{num}")))
+            .and_then(|pane| pane.desired)
+            .unwrap_or((cell.width, cell.height));
+    }
+    let (mut width, mut height) = (0, 0);
+    for (index, child) in cell.children.iter().enumerate() {
+        let (child_w, child_h) = needed_window_size(child, panes);
+        if cell.columns {
+            width += child_w + u32::from(index > 0);
+            height = height.max(child_h);
+        } else {
+            height += child_h + u32::from(index > 0);
+            width = width.max(child_w);
+        }
+    }
+    (width, height)
 }
