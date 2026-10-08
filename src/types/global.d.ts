@@ -598,6 +598,8 @@ export interface SavedConnection {
   encoding?: string;
   /** RDP-only: optional Windows/domain part for authentication. */
   domain?: string;
+  /** RDP-only: absent means use the global default client. */
+  rdp_client_mode?: RdpClientMode;
   /** RDP/VNC security options. */
   security?: Partial<RdpSecuritySettings & VncSecuritySettings>;
   /** RDP/VNC display options. */
@@ -613,6 +615,7 @@ export interface SavedConnection {
 }
 
 export type RdpCertificatePolicy = "strict" | "prompt" | "accept-temporarily";
+export type RdpClientMode = "builtin" | "windows";
 export type RdpDisplayMode = "fit-window" | "fixed" | "native";
 export type RdpClipboardMode = "disabled" | "text-only" | "text-and-files";
 
@@ -1172,7 +1175,7 @@ export interface GeneralSettings {
   minimize_to_tray: boolean;
   boss_key: string | null;
   confirm_on_close: boolean;
-  rdp_client_mode: "builtin" | "windows";
+  rdp_client_mode: RdpClientMode;
 }
 
 export type BackgroundImageFit = "cover" | "contain" | "stretch" | "tile";

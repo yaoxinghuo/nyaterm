@@ -57,6 +57,7 @@ import {
   getTemporaryLinkSessionType,
   isSessionCreationCancelled,
   launchSavedRdpWithSystemClient,
+  type SavedConnectionOpenOptions,
   type StartupCommandRequest,
   sendStartupCommandToSession,
 } from "./lib/appSessionFactory";
@@ -638,7 +639,7 @@ function App() {
   const connectSavedConnection = useCallback(
     async (
       connection: SavedConnection,
-      options?: {
+      options?: SavedConnectionOpenOptions & {
         failureContext?: string;
         runtimeModeOverride?: SshRuntimeMode;
         propagateError?: boolean;
@@ -654,6 +655,7 @@ function App() {
           await launchSavedRdpWithSystemClient(
             connection,
             appSettings.general.rdp_client_mode,
+            { rdpClientModeOverride: options?.rdpClientModeOverride },
           )
         ) {
           recordRecentConnection(connection.id);
