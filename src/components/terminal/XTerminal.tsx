@@ -475,10 +475,26 @@ export default function XTerminal({
     hibernatedRef.current = hibernated;
   }, [hibernated]);
 
+  const wasVisibleRef = useRef(visible);
   useEffect(() => {
     visibleRef.current = visible;
+    const becameVisible = visible && !wasVisibleRef.current;
+    wasVisibleRef.current = visible;
     if (visible) {
       requestWake("visible");
+      // tmux control-mode panes share one persistent virtual session while
+      // their window stays mounted-but-hidden. Re-attaching on every reveal
+      // makes the backend replay buffered output / reseed the screen, which
+      // self-heals a pane whose seed emit raced a renderer that was already
+      // gone (e.g. detach → reattach → window switch leaving a blank pane
+      // until the next keystroke). Skipped on initial mount: the normal
+      // setup path attaches after listeners are registered, and an early
+      // attach here could drain pending output before they exist.
+      if (becameVisible && sessionIdRef.current.includes("::pane")) {
+        void invoke("attach_session", {
+          sessionId: sessionIdRef.current,
+        }).catch(() => {});
+      }
     }
     handleVisibilityChangeRef.current?.();
   }, [requestWake, visible]);

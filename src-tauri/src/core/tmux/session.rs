@@ -1541,14 +1541,11 @@ impl<'a> ControlSession<'a> {
                 // Serial-only command; unreachable on an SSH control channel.
             }
             SessionCommand::AttachConfirmed { ack } => {
-                tracing::info!(
-                    session_id = %self.control_session_id,
-                    pane = %pane_id,
-                    known = self.panes.contains_key(&pane_id),
-                    "tmux pane attach"
-                );
                 let mut reseed = false;
+                let mut deferred_reseed = false;
+                let mut known = false;
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
+                    known = true;
                     pane.output.attach_confirmed(ack);
                     // A renderer attaching to an already-seeded pane was
                     // remounted (fresh buffer); resend the screen. Attaches
@@ -1563,6 +1560,7 @@ impl<'a> ControlSession<'a> {
                         // this mount's listener registration. Re-capture once
                         // it lands so a snapshot provably reaches this attach.
                         pane.reseed = true;
+                        deferred_reseed = true;
                     } else if !pane.seeded || stale_attach {
                         // `!seeded` with no seed in flight is an unrecoverable
                         // state unless we capture here (the renderer would sit
@@ -1574,6 +1572,14 @@ impl<'a> ControlSession<'a> {
                 } else {
                     let _ = ack.send(());
                 }
+                tracing::info!(
+                    session_id = %self.control_session_id,
+                    pane = %pane_id,
+                    known,
+                    reseed,
+                    deferred_reseed,
+                    "tmux pane attach"
+                );
                 if reseed {
                     self.seed_pane(channel, &pane_id).await;
                 }
