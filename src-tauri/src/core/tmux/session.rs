@@ -957,7 +957,20 @@ impl<'a> ControlSession<'a> {
                 Some(ControlMessage::Begin) => {
                     tracing::warn!("tmux control: nested %begin; discarding outer block");
                     self.block_lines = None;
-                    self.pending_responses.pop_front();
+                    // The discarded block's response never reaches
+                    // `handle_block`; unwind state its kind armed so a pane
+                    // is not stuck mid-seed (and unseeddable) forever.
+                    if let Some(kind) = self.pending_responses.pop_front() {
+                        let pane = match kind {
+                            PendingKind::CapturePane { ref pane }
+                            | PendingKind::SeedCursor { ref pane } => Some(pane.clone()),
+                            _ => None,
+                        };
+                        if let Some(pane) = pane.and_then(|p| self.panes.get_mut(&p)) {
+                            pane.seeding = false;
+                            pane.pending_seed = None;
+                        }
+                    }
                 }
                 Some(ControlMessage::Exit { .. }) => {
                     self.mark_exit();
@@ -1281,7 +1294,8 @@ impl<'a> ControlSession<'a> {
                                 .unwrap_or(0);
                             Some((x, y, history))
                         });
-                        if let Some(seed_lines) = virtual_pane.pending_seed.take() {
+                        let wrote_seed = if let Some(seed_lines) = virtual_pane.pending_seed.take()
+                        {
                             let (x, y, history) = cursor.unwrap_or_default();
                             let hist = history.min(seed_lines.len());
                             let mut decoder = TerminalOutputDecoder::new(&self.encoding);
@@ -1314,10 +1328,15 @@ impl<'a> ControlSession<'a> {
                             // scrolled away it lands directly on that row.
                             text.push_str(&format!("\x1b[{};{}H", y + 1, x + 1));
                             virtual_pane.output.push_owned(text);
-                        }
+                            true
+                        } else {
+                            false
+                        };
+                        // A failed capture wrote nothing; leaving the pane
+                        // unseeded lets the next attach or layout pass retry.
+                        virtual_pane.seeded = wrote_seed;
                     }
                     if !reseed {
-                        virtual_pane.seeded = true;
                         let capture_at = virtual_pane.capture_at;
                         while let Some((produced_at, data)) =
                             virtual_pane.pending_output.pop_front()
@@ -1535,14 +1554,23 @@ impl<'a> ControlSession<'a> {
                     // remounted (fresh buffer); resend the screen. Attaches
                     // within 250 ms are the same mount seen twice (e.g.
                     // StrictMode), not a remount.
-                    reseed = pane.seeded
-                        && pane
-                            .last_attach
-                            .is_none_or(|t| t.elapsed() > Duration::from_millis(250));
-                    pane.last_attach = Some(std::time::Instant::now());
-                    if reseed {
+                    let stale_attach = pane
+                        .last_attach
+                        .is_none_or(|t| t.elapsed() > Duration::from_millis(250));
+                    if pane.seeding {
+                        // The in-flight capture may have been issued for a
+                        // renderer that is already gone, or its emit can beat
+                        // this mount's listener registration. Re-capture once
+                        // it lands so a snapshot provably reaches this attach.
+                        pane.reseed = true;
+                    } else if !pane.seeded || stale_attach {
+                        // `!seeded` with no seed in flight is an unrecoverable
+                        // state unless we capture here (the renderer would sit
+                        // blank until the next %output).
                         pane.seeded = false;
+                        reseed = true;
                     }
+                    pane.last_attach = Some(std::time::Instant::now());
                 } else {
                     let _ = ack.send(());
                 }
