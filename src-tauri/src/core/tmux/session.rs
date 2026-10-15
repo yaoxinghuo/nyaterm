@@ -49,6 +49,11 @@ const PENDING_PANE_OUTPUT_MAX_BYTES: usize = 512 * 1024;
 const DETACH_EXIT_TIMEOUT_MS: u64 = 3000;
 /// Flow control: after a `%pause`, let the pane breathe, then continue it.
 const PAUSE_CONTINUE_DELAY_MS: u64 = 250;
+/// Plain lines tolerated before the control stream is considered verified.
+/// Real control-mode output is exclusively `%` lines, so any shell text
+/// means the channel was taken over by mistake; the margin only exists so
+/// a stray artifact cannot abort a legitimate session.
+const MAX_UNVERIFIED_LINES: usize = 8;
 /// `resize-pane` retries per distinct target; the echoed `%layout-change`
 /// retriggers the fixup, so without a cap an unreachable target would loop.
 const RESIZE_PANE_MAX_ATTEMPTS: u8 = 2;
@@ -77,7 +82,12 @@ pub(crate) enum ControlExit {
 pub(crate) struct TmuxWindowInfo {
     pub id: String,
     pub name: String,
+    /// `#{window_index}` — the user-visible `N:name` ordering key, which
+    /// changes on `move-window`/`swap-window` unlike the stable `@id`.
+    pub index: u32,
     pub active: bool,
+    /// The window's own pane tree — every tmux window maps to a native tab.
+    pub tree: Option<TmuxUiNode>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -88,7 +98,6 @@ pub(crate) struct TmuxStatePayload {
     pub windows: Vec<TmuxWindowInfo>,
     pub active_window_id: Option<String>,
     pub active_pane_session_id: Option<String>,
-    pub tree: Option<TmuxUiNode>,
 }
 
 /// One tmux pane projected as a virtual terminal session.
@@ -103,6 +112,9 @@ struct VirtualPane {
     /// is the server-side production time estimated from `%extended-output`'s
     /// age (`None` for plain `%output`, which carries no timestamp).
     pending_output: VecDeque<(Option<std::time::Instant>, Vec<u8>)>,
+    /// Byte count of `pending_output`, kept incrementally so the bound in
+    /// `route_output` does not rescan the queue per chunk.
+    pending_bytes: usize,
     seeded: bool,
     /// When this pane's latest `capture-pane` snapshot was taken; output
     /// provably produced before it is already inside the seeded screen and
@@ -176,6 +188,8 @@ enum ExitMode {
 
 struct WindowState {
     name: String,
+    /// `#{window_index}`; learned from `list-windows` (0 until then).
+    index: u32,
     /// Full layout — used for the reconcile pane set (zoomed-away panes stay
     /// mapped so they don't lose their terminal state).
     layout: Option<LayoutCell>,
@@ -241,11 +255,26 @@ pub(crate) struct ControlSession<'a> {
     cwd_deadline: Option<Pin<Box<Sleep>>>,
     /// Output received for panes we have not mapped yet (e.g. background
     /// windows), kept in case the pane becomes visible. Bounded.
-    unknown_output: HashMap<String, VecDeque<(Option<std::time::Instant>, Vec<u8>)>>,
+    /// Buffered output for panes not yet mapped to a virtual session; the
+    /// `usize` is the queue's total bytes so the bound check does not
+    /// rescan it per `%output` chunk.
+    unknown_output: HashMap<String, (VecDeque<(Option<std::time::Instant>, Vec<u8>)>, usize)>,
 
     exit_mode: Option<ExitMode>,
     exit_seen: bool,
     detach_deadline: Option<Pin<Box<Sleep>>>,
+
+    /// Set once any line parses as a control message — a real control
+    /// stream is exclusively `%` lines, so reaching this proves the channel
+    /// truly speaks the protocol.
+    verified: bool,
+    /// Plain-text lines received before verification. A false takeover
+    /// (armed detector + a program printing `%` lines) lands shell output
+    /// here; past [`MAX_UNVERIFIED_LINES`] the session bails back to the
+    /// normal shell path and replays them so nothing is swallowed.
+    unverified_lines: Vec<String>,
+    /// Bail out of control mode back to the shell (see `unverified_lines`).
+    bail: bool,
 }
 
 impl<'a> ControlSession<'a> {
@@ -290,6 +319,9 @@ impl<'a> ControlSession<'a> {
             exit_mode: None,
             exit_seen: false,
             detach_deadline: None,
+            verified: false,
+            unverified_lines: Vec::new(),
+            bail: false,
         }
     }
 
@@ -337,7 +369,7 @@ impl<'a> ControlSession<'a> {
             // characters in -F output as `_`, so tabs cannot be used as
             // separators. The name field goes last since it may contain
             // spaces; splitn(4, ' ') preserves it.
-            "list-windows -F '#{window_id} #{window_active} #{window_layout} #{window_visible_layout} #{window_flags} #{window_name}'",
+            "list-windows -F '#{window_id} #{window_index} #{window_active} #{window_layout} #{window_visible_layout} #{window_flags} #{window_name}'",
         )
         .await;
         self.send_query(
@@ -441,9 +473,10 @@ impl<'a> ControlSession<'a> {
         // Output that arrived before the pane was mapped is replayed after
         // the capture-pane seed, keeping chronology.
         let mut pending_output = VecDeque::new();
-        if let Some(mut buffered) = self.unknown_output.remove(&pane_key) {
+        if let Some((mut buffered, _)) = self.unknown_output.remove(&pane_key) {
             pending_output.append(&mut buffered);
         }
+        let pending_bytes = pending_output.iter().map(|(_, data)| data.len()).sum();
 
         self.panes.insert(
             pane_key.clone(),
@@ -453,6 +486,7 @@ impl<'a> ControlSession<'a> {
                 decoder: TerminalOutputDecoder::new(&self.encoding),
                 forwarder,
                 pending_output,
+                pending_bytes,
                 seeded: false,
                 capture_at: None,
                 last_attach: None,
@@ -482,19 +516,7 @@ impl<'a> ControlSession<'a> {
     }
 
     async fn seed_pane(&mut self, channel: &mut russh::Channel<client::Msg>, pane_id: &str) {
-        let dims = self
-            .active_window
-            .as_ref()
-            .and_then(|id| self.windows.get(id))
-            .and_then(|window| window.layout.as_ref())
-            .and_then(|layout| {
-                pane_id
-                    .trim_start_matches('%')
-                    .parse::<u32>()
-                    .ok()
-                    .and_then(|num| layout.find_pane(num))
-            })
-            .map(|cell| (cell.width, cell.height));
+        let dims = self.pane_dims(pane_id);
         if let Some(pane) = self.panes.get_mut(pane_id) {
             if pane.seeding {
                 return;
@@ -628,13 +650,6 @@ impl<'a> ControlSession<'a> {
     }
 
     fn emit_state(&mut self) {
-        let tree = self
-            .active_window
-            .as_ref()
-            .and_then(|id| self.windows.get(id))
-            .and_then(|window| window.visible_layout.as_ref().or(window.layout.as_ref()))
-            .and_then(|layout| self.build_ui_tree(layout));
-
         let windows = {
             let mut list: Vec<TmuxWindowInfo> = self
                 .windows
@@ -642,10 +657,18 @@ impl<'a> ControlSession<'a> {
                 .map(|(id, window)| TmuxWindowInfo {
                     id: id.clone(),
                     name: window.name.clone(),
+                    index: window.index,
                     active: Some(id) == self.active_window.as_ref(),
+                    tree: window
+                        .visible_layout
+                        .as_ref()
+                        .or(window.layout.as_ref())
+                        .and_then(|layout| self.build_ui_tree(layout)),
                 })
                 .collect();
-            list.sort_by(|a, b| a.id.cmp(&b.id));
+            // Order by `#{window_index}` — the number users see in `N:name`
+            // labels; renumbering (`move-window`) must reorder tabs too.
+            list.sort_by_key(|window| window.index);
             list
         };
 
@@ -659,7 +682,6 @@ impl<'a> ControlSession<'a> {
                 .as_ref()
                 .and_then(|pane| self.panes.get(pane))
                 .map(|pane| pane.session_id.clone()),
-            tree,
         };
         if self.last_emitted.as_ref() == Some(&payload) {
             return;
@@ -668,7 +690,7 @@ impl<'a> ControlSession<'a> {
             session_id = %self.control_session_id,
             windows = payload.windows.len(),
             active_window = ?payload.active_window_id,
-            has_tree = payload.tree.is_some(),
+            has_tree = payload.windows.iter().any(|window| window.tree.is_some()),
             "tmux emit state"
         );
         self.last_emitted = Some(payload.clone());
@@ -682,43 +704,41 @@ impl<'a> ControlSession<'a> {
             windows: Vec::new(),
             active_window_id: None,
             active_pane_session_id: None,
-            tree: None,
         };
         let _ = self.app.emit(TMUX_STATE_EVENT, &payload);
     }
 
-    /// Reconcile virtual panes with the active window's layout.
+    /// Reconcile virtual panes with every known window's layout — each tmux
+    /// window maps to a native tab, so background windows' panes stay alive
+    /// and keep receiving their `%output` instead of being torn down.
     async fn reconcile_panes(&mut self, channel: &mut russh::Channel<client::Msg>) {
-        let (layout, zoomed) = self
+        let (active_layout, zoomed) = self
             .active_window
             .as_ref()
             .and_then(|id| self.windows.get(id))
             .map(|window| (window.layout.clone(), window.zoomed))
             .unwrap_or((None, false));
-        let wanted: HashSet<String> = layout
-            .as_ref()
-            .map(|layout| {
-                layout
-                    .pane_ids()
-                    .iter()
-                    .map(|id| format!("%{id}"))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut wanted = HashSet::new();
+        for window in self.windows.values() {
+            if let Some(layout) = window.layout.as_ref() {
+                wanted.extend(layout.pane_ids().iter().map(|id| format!("%{id}")));
+            }
+        }
 
-        // The client must cover the window before any capture below runs:
-        // while the window outgrows the client, tmux clips panes and marks
-        // clipped edges with `#`, and it never re-pushes `%output` after a
-        // resize — a capture taken pre-grow would seed those marks forever.
-        // Skipped while zoomed since any client resize drops the zoom.
+        // The client must cover the active window before any capture below
+        // runs: while the window outgrows the client, tmux clips panes and
+        // marks clipped edges with `#`, and it never re-pushes `%output`
+        // after a resize — a capture taken pre-grow would seed those marks
+        // forever. Skipped while zoomed since any client resize drops the
+        // zoom. Background windows are not clipped by the client size.
         let mut grew = false;
         if !zoomed {
-            if let Some(layout) = layout.as_ref() {
+            if let Some(layout) = active_layout.as_ref() {
                 grew = self.grow_client(channel, layout.width, layout.height).await;
             }
         }
 
-        // Drop panes that vanished or belong to a different window.
+        // Drop panes that vanished from every window's layout.
         let existing: Vec<String> = self.panes.keys().cloned().collect();
         for pane_id in existing {
             if !wanted.contains(&pane_id) {
@@ -736,12 +756,16 @@ impl<'a> ControlSession<'a> {
             // '#' clipping marks; the resize produces no redraw `%output`,
             // so re-capture them. Panes whose seed is in flight run on the
             // pre-grow snapshot — flag them for a second seed when it lands.
-            for pane_id in &wanted {
-                if let Some(pane) = self.panes.get_mut(pane_id) {
-                    if pane.seeding {
-                        pane.reseed = true;
-                    } else {
-                        pane.seeded = false;
+            // Only the active window's panes are clipped by client size.
+            if let Some(layout) = active_layout.as_ref() {
+                for pane_num in layout.pane_ids() {
+                    let pane_id = format!("%{pane_num}");
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        if pane.seeding {
+                            pane.reseed = true;
+                        } else {
+                            pane.seeded = false;
+                        }
                     }
                 }
             }
@@ -749,17 +773,7 @@ impl<'a> ControlSession<'a> {
         // A pane whose cell resized since its seed renders rows that were
         // laid out for the old width; capture again at the new size.
         for pane_id in &wanted {
-            let Some(dims) = layout
-                .as_ref()
-                .and_then(|layout| {
-                    pane_id
-                        .trim_start_matches('%')
-                        .parse::<u32>()
-                        .ok()
-                        .and_then(|num| layout.find_pane(num))
-                })
-                .map(|cell| (cell.width, cell.height))
-            else {
+            let Some(dims) = self.pane_dims(pane_id) else {
                 continue;
             };
             if let Some(pane) = self.panes.get_mut(pane_id) {
@@ -786,6 +800,16 @@ impl<'a> ControlSession<'a> {
         }
         self.sync_pane_sizes(channel).await;
         self.emit_state();
+    }
+
+    /// A pane's cell size inside whichever window's layout contains it.
+    fn pane_dims(&self, pane_id: &str) -> Option<(u32, u32)> {
+        let num = pane_id.trim_start_matches('%').parse::<u32>().ok()?;
+        self.windows
+            .values()
+            .filter_map(|window| window.layout.as_ref())
+            .find_map(|layout| layout.find_pane(num))
+            .map(|cell| (cell.width, cell.height))
     }
 
     /// Grow the control client to fit the window layout. Shrinking would
@@ -826,68 +850,78 @@ impl<'a> ControlSession<'a> {
     /// once it matches, per-pane drift left by tmux's proportional scaling
     /// is corrected with `resize-pane`.
     async fn sync_pane_sizes(&mut self, channel: &mut russh::Channel<client::Msg>) {
-        let Some(window) = self
+        // Client sizing only concerns the window tmux currently shows the
+        // client — i.e. the active one. Background windows keep their own
+        // geometry until their tab is activated.
+        if let Some(window) = self
             .active_window
             .as_ref()
             .and_then(|id| self.windows.get(id))
-        else {
-            return;
-        };
-        // Resizing a zoomed window would drop the zoom.
-        if window.zoomed {
-            return;
-        }
-        let Some(layout) = window.layout.clone() else {
-            return;
-        };
-
-        let needed = needed_window_size(&layout, &self.panes);
-        if needed != (layout.width, layout.height) {
-            // Unlike grow_client this also shrinks: renderers may be
-            // narrower than the window's current share. `refresh-client`
-            // only emits `%layout-change` when the resize actually takes
-            // effect, so this self-limits against remotes ignoring it.
-            if self
-                .send_line(
-                    channel,
-                    PendingKind::Ignore,
-                    &format!("refresh-client -C {}x{}", needed.0, needed.1),
-                )
-                .await
-            {
-                self.client_size = Some(needed);
+        {
+            // Resizing a zoomed window would drop the zoom.
+            if !window.zoomed {
+                if let Some(layout) = window.layout.clone() {
+                    let needed = needed_window_size(&layout, &self.panes);
+                    if needed != (layout.width, layout.height) {
+                        // Unlike grow_client this also shrinks: renderers may
+                        // be narrower than the window's current share.
+                        // `refresh-client` only emits `%layout-change` when
+                        // the resize actually takes effect, so this
+                        // self-limits against remotes ignoring it. The echo
+                        // reruns the per-pane fixup below.
+                        if self
+                            .send_line(
+                                channel,
+                                PendingKind::Ignore,
+                                &format!("refresh-client -C {}x{}", needed.0, needed.1),
+                            )
+                            .await
+                        {
+                            self.client_size = Some(needed);
+                        }
+                        return;
+                    }
+                }
             }
-            return;
         }
 
-        // The window already matches the renderers' demand; fix whatever
-        // drift remains per pane. Targets are collected first because
-        // send_line borrows self mutably.
+        // The layout already matches the renderers' demand; fix whatever
+        // drift remains per pane, in every window — background panes keep
+        // live renderers too. Targets are collected first because send_line
+        // borrows self mutably.
         let mut targets = Vec::new();
-        for pane_num in layout.pane_ids() {
-            let Some(cell) = layout.find_pane(pane_num) else {
-                continue;
-            };
-            let pane_id = format!("%{pane_num}");
-            let Some(pane) = self.panes.get_mut(&pane_id) else {
-                continue;
-            };
-            let Some(desired) = pane.desired else {
-                continue;
-            };
-            if desired == (cell.width, cell.height) {
-                pane.resize_attempts = None;
+        for window in self.windows.values() {
+            if window.zoomed {
                 continue;
             }
-            let attempts = match pane.resize_attempts {
-                Some((target, count)) if target == desired => count,
-                _ => 0,
-            };
-            if attempts >= RESIZE_PANE_MAX_ATTEMPTS {
+            let Some(layout) = window.layout.as_ref() else {
                 continue;
+            };
+            for pane_num in layout.pane_ids() {
+                let Some(cell) = layout.find_pane(pane_num) else {
+                    continue;
+                };
+                let pane_id = format!("%{pane_num}");
+                let Some(pane) = self.panes.get_mut(&pane_id) else {
+                    continue;
+                };
+                let Some(desired) = pane.desired else {
+                    continue;
+                };
+                if desired == (cell.width, cell.height) {
+                    pane.resize_attempts = None;
+                    continue;
+                }
+                let attempts = match pane.resize_attempts {
+                    Some((target, count)) if target == desired => count,
+                    _ => 0,
+                };
+                if attempts >= RESIZE_PANE_MAX_ATTEMPTS {
+                    continue;
+                }
+                pane.resize_attempts = Some((desired, attempts + 1));
+                targets.push((pane_id, desired));
             }
-            pane.resize_attempts = Some((desired, attempts + 1));
-            targets.push((pane_id, desired));
         }
         for (pane_id, (cols, rows)) in targets {
             self.send_line(
@@ -900,10 +934,10 @@ impl<'a> ControlSession<'a> {
     }
 
     async fn handle_message(&mut self, channel: &mut russh::Channel<client::Msg>, line: String) {
-        // Temporary visibility while bring-up is being debugged.
-        tracing::info!(
+        // Control lines carry remote terminal content — never log them raw.
+        tracing::trace!(
             session_id = %self.control_session_id,
-            line = %line.chars().take(200).collect::<String>(),
+            bytes = line.len(),
             "tmux control: line"
         );
         // Command-response blocks capture all lines between begin/end.
@@ -936,13 +970,29 @@ impl<'a> ControlSession<'a> {
         }
 
         let Some(message) = parse_line(&line) else {
-            tracing::info!(
-                session_id = %self.control_session_id,
-                line = %line.chars().take(120).collect::<String>(),
-                "tmux control: unparsed line"
-            );
+            if self.verified {
+                tracing::debug!(
+                    session_id = %self.control_session_id,
+                    bytes = line.len(),
+                    "tmux control: unparsed line"
+                );
+            } else {
+                // A real control stream is exclusively `%` lines; plain text
+                // means a program printed tmux-looking output into an armed
+                // detector. Count it, and bail back to the shell if our
+                // bootstrap commands keep coming back as shell noise.
+                self.unverified_lines.push(line);
+                if self.unverified_lines.len() >= MAX_UNVERIFIED_LINES {
+                    tracing::warn!(
+                        session_id = %self.control_session_id,
+                        "tmux control: not a control stream; returning to shell"
+                    );
+                    self.bail = true;
+                }
+            }
             return;
         };
+        self.verified = true;
         tracing::debug!(
             session_id = %self.control_session_id,
             message = ?std::mem::discriminant(&message),
@@ -973,6 +1023,7 @@ impl<'a> ControlSession<'a> {
             } => {
                 let entry = self.windows.entry(window.clone()).or_insert(WindowState {
                     name: String::new(),
+                    index: 0,
                     layout: None,
                     visible_layout: None,
                     zoomed: false,
@@ -985,15 +1036,16 @@ impl<'a> ControlSession<'a> {
                 if self.active_window.is_none() {
                     self.active_window = Some(window.clone());
                 }
-                if self.active_window.as_deref() == Some(window.as_str()) {
-                    // reconcile_panes also grows the client when the layout
-                    // outgrows it — that is what removes `#` clipping marks.
-                    self.reconcile_panes(channel).await;
-                }
+                // Reconcile for any window's layout change — background
+                // windows' panes are live too (each maps to a native tab).
+                // reconcile_panes also grows the client when the active
+                // layout outgrows it — that is what removes `#` clipping.
+                self.reconcile_panes(channel).await;
             }
             ControlMessage::WindowAdd { window } => {
                 self.windows.entry(window).or_insert(WindowState {
                     name: String::new(),
+                    index: 0,
                     layout: None,
                     visible_layout: None,
                     zoomed: false,
@@ -1084,7 +1136,12 @@ impl<'a> ControlSession<'a> {
                     "tmux control server message"
                 );
             }
-            ControlMessage::Exit { .. } => {
+            ControlMessage::Exit { reason } => {
+                tracing::info!(
+                    session_id = %self.control_session_id,
+                    reason = ?reason,
+                    "tmux control client exited"
+                );
                 self.mark_exit();
             }
         }
@@ -1124,16 +1181,42 @@ impl<'a> ControlSession<'a> {
                     );
                 }
             } else {
+                virtual_pane.pending_bytes += data.len();
                 virtual_pane.pending_output.push_back((produced_at, data));
+                // Seeding under heavy output must not grow the queue without
+                // bound: spill the oldest bytes straight to the pane — a
+                // possibly duplicated line beats dropping output.
+                while virtual_pane.pending_bytes > PENDING_PANE_OUTPUT_MAX_BYTES {
+                    let Some((_, spilled)) = virtual_pane.pending_output.pop_front() else {
+                        break;
+                    };
+                    virtual_pane.pending_bytes -= spilled.len();
+                    let decoded = virtual_pane.decoder.decode(&spilled);
+                    let text = if virtual_pane.capture.has_active() {
+                        virtual_pane.capture.process(&decoded)
+                    } else {
+                        decoded
+                    };
+                    virtual_pane.output.push_owned(text);
+                }
             }
         } else {
             // Pane output can arrive before its layout (attach, or panes in
-            // background windows). Buffer a bounded amount keyed by pane id.
-            let pending = self.unknown_output.entry(pane.to_string()).or_default();
-            let total: usize = pending.iter().map(|(_, data)| data.len()).sum();
-            if total < PENDING_PANE_OUTPUT_MAX_BYTES {
-                pending.push_back((produced_at, data));
+            // background windows). Buffer a bounded amount keyed by pane id;
+            // past the cap the oldest bytes are dropped — the tail matters
+            // most since it replays right after the `capture-pane` seed.
+            let (pending, total) = self
+                .unknown_output
+                .entry(pane.to_string())
+                .or_insert_with(|| (VecDeque::new(), 0));
+            while *total + data.len() > PENDING_PANE_OUTPUT_MAX_BYTES {
+                let Some((_, old)) = pending.pop_front() else {
+                    break;
+                };
+                *total -= old.len();
             }
+            *total += data.len();
+            pending.push_back((produced_at, data));
         }
     }
 
@@ -1239,6 +1322,7 @@ impl<'a> ControlSession<'a> {
                         while let Some((produced_at, data)) =
                             virtual_pane.pending_output.pop_front()
                         {
+                            virtual_pane.pending_bytes -= data.len();
                             // Entries provably produced before the snapshot —
                             // and un-`aged` `%output`, which is always older —
                             // are already painted; replaying them would draw
@@ -1267,10 +1351,15 @@ impl<'a> ControlSession<'a> {
             }
             PendingKind::PaneCwd { pane } => {
                 if !failed {
-                    if let (Some(pane), Some(path)) = (self.panes.get(&pane), lines.first()) {
-                        let path = path.trim();
-                        if let Some(next) = update_cwd_if_changed(&pane.cwd, path).await {
-                            let event = format!("cwd-changed-{}", pane.session_id);
+                    // `VirtualPane` is not `Sync` (capture holds a boxed
+                    // callback); clone the `Arc` cwd so no pane borrow lives
+                    // across the `update_cwd_if_changed` await.
+                    let cwd_and_event = self
+                        .panes
+                        .get(&pane)
+                        .map(|pane| (pane.cwd.clone(), format!("cwd-changed-{}", pane.session_id)));
+                    if let (Some((cwd, event)), Some(path)) = (cwd_and_event, lines.first()) {
+                        if let Some(next) = update_cwd_if_changed(&cwd, path.trim()).await {
                             let _ = self.app.emit(&event, &next);
                         }
                     }
@@ -1293,9 +1382,9 @@ impl<'a> ControlSession<'a> {
 
     fn apply_window_list(&mut self, lines: Vec<String>) {
         for line in lines {
-            let mut parts = line.splitn(6, ' ');
-            let (Some(id), Some(active), Some(layout_str)) =
-                (parts.next(), parts.next(), parts.next())
+            let mut parts = line.splitn(7, ' ');
+            let (Some(id), Some(index), Some(active), Some(layout_str)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
             else {
                 continue;
             };
@@ -1304,11 +1393,13 @@ impl<'a> ControlSession<'a> {
             let name = parts.next().unwrap_or_default();
             let entry = self.windows.entry(id.to_string()).or_insert(WindowState {
                 name: String::new(),
+                index: 0,
                 layout: None,
                 visible_layout: None,
                 zoomed: false,
             });
             entry.name = name.to_string();
+            entry.index = index.parse().unwrap_or(entry.index);
             if let Some((layout, _)) = super::control::parse_layout(layout_str) {
                 entry.visible_layout = Some(
                     super::control::parse_layout(visible_str)
@@ -1495,20 +1586,25 @@ impl<'a> ControlSession<'a> {
                 marker_id,
                 wrapped_command,
                 result_tx,
+                execution,
             } => {
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
                     // The marker-wrapped command goes through the pane's pty
                     // like any typed input; its echo and markers return via
                     // `%output` where `capture` picks them apart.
-                    pane.capture.register(marker_id, result_tx);
-                    self.input_buf
-                        .entry(pane_id)
-                        .or_default()
-                        .extend_from_slice(&wrapped_command);
-                    if self.input_flush.is_none() {
-                        self.input_flush = Some(Box::pin(tokio::time::sleep(
-                            Duration::from_millis(INPUT_FLUSH_DELAY_MS),
-                        )));
+                    if pane
+                        .capture
+                        .register_execution(marker_id, result_tx, Some(execution))
+                    {
+                        self.input_buf
+                            .entry(pane_id)
+                            .or_default()
+                            .extend_from_slice(&wrapped_command);
+                        if self.input_flush.is_none() {
+                            self.input_flush = Some(Box::pin(tokio::time::sleep(
+                                Duration::from_millis(INPUT_FLUSH_DELAY_MS),
+                            )));
+                        }
                     }
                 } else {
                     drop(result_tx);
@@ -1518,6 +1614,25 @@ impl<'a> ControlSession<'a> {
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
                     pane.capture.cancel(&marker_id);
                 }
+            }
+            SessionCommand::GetEncoding { reply } => {
+                let _ = reply.send(self.encoding.clone());
+            }
+            SessionCommand::SetEncoding {
+                encoding: requested,
+                reply,
+            } => {
+                let result = if let Some(next) =
+                    nyaterm_core::terminal_encoding::supported_session_encoding(&requested)
+                {
+                    if let Some(pane) = self.panes.get_mut(&pane_id) {
+                        pane.decoder.reset(next);
+                    }
+                    Ok(next.to_string())
+                } else {
+                    Err(format!("Unsupported terminal encoding: {requested}"))
+                };
+                let _ = reply.send(result);
             }
             SessionCommand::PauseOutput
             | SessionCommand::ResumeOutput
@@ -1585,12 +1700,20 @@ pub(crate) async fn run_control_session(
     }
 
     let exit = loop {
-        if session.exit_seen {
+        if session.exit_seen || session.bail {
+            let mut leftover = Vec::new();
+            if session.bail {
+                // Replay the swallowed plain lines so the user sees what
+                // their shell actually answered to our probe commands.
+                leftover.extend_from_slice(session.unverified_lines.join("\r\n").as_bytes());
+                if !leftover.is_empty() {
+                    leftover.extend_from_slice(b"\r\n");
+                }
+            }
+            leftover.extend_from_slice(&session.parser.take_pending());
             break match session.exit_mode {
                 Some(ExitMode::Close) => ControlExit::Closed,
-                _ => ControlExit::ReturnToShell {
-                    leftover: session.parser.take_pending(),
-                },
+                _ => ControlExit::ReturnToShell { leftover },
             };
         }
 
@@ -1678,22 +1801,56 @@ pub(crate) async fn run_control_session(
                     Some(SessionCommand::AttachConfirmed { ack }) => {
                         let _ = ack.send(());
                     }
+                    Some(SessionCommand::GetEncoding { reply }) => {
+                        let _ = reply.send(session.encoding.clone());
+                    }
+                    Some(SessionCommand::SetEncoding { encoding, reply }) => {
+                        // The control channel renders nothing itself; the
+                        // stored encoding feeds the pane decoders, so apply
+                        // it to existing panes too.
+                        let result = if let Some(next) =
+                            nyaterm_core::terminal_encoding::supported_session_encoding(
+                                &encoding,
+                            )
+                        {
+                            session.encoding = next.to_string();
+                            for pane in session.panes.values_mut() {
+                                pane.decoder.reset(next);
+                            }
+                            Ok(session.encoding.clone())
+                        } else {
+                            Err(format!("Unsupported terminal encoding: {encoding}"))
+                        };
+                        let _ = reply.send(result);
+                    }
                     Some(
                         SessionCommand::DetachRenderer
-                        | SessionCommand::Write { .. }
                         | SessionCommand::Resize { .. }
                         | SessionCommand::PauseOutput
                         | SessionCommand::ResumeOutput
                         | SessionCommand::AckOutput { .. }
-                        | SessionCommand::CancelCapture { .. }
                         | SessionCommand::ZmodemAcceptDownload { .. }
                         | SessionCommand::ZmodemAcceptUpload { .. }
                         | SessionCommand::ZmodemCancel,
                     ) => {}
-                    Some(SessionCommand::CaptureExec { result_tx, .. }) => {
-                        drop(result_tx);
+                    Some(
+                        command @ (SessionCommand::Write { .. }
+                        | SessionCommand::CaptureExec { .. }
+                        | SessionCommand::CancelCapture { .. }),
+                    ) => {
+                        // The control channel itself has no pty — input or a
+                        // capture aimed at the bare session id means the pane
+                        // the user is looking at (AI tools resolve the host
+                        // tab to this session). Forward to the active pane.
+                        if let Some(pane_id) = session.active_pane.clone() {
+                            session.handle_pane_command(channel, pane_id, command).await;
+                        } else if let SessionCommand::CaptureExec { result_tx, .. } = command {
+                            drop(result_tx);
+                        }
                     }
-                    None => break ControlExit::Closed,
+                    None => {
+                        break ControlExit::Closed;
+                    }
                 }
             }
 

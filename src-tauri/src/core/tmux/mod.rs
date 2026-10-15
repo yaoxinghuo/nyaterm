@@ -9,5 +9,5 @@ pub(crate) mod control;
 pub(crate) mod detect;
 pub(crate) mod session;
 
-pub(crate) use detect::{TmuxControlDetector, TmuxFeed};
+pub(crate) use detect::{TmuxControlDetector, TmuxFeed, is_tmux_control_command};
 pub(crate) use session::{ControlExit, run_control_session};

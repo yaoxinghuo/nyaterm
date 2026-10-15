@@ -28,9 +28,9 @@ import {
   normalizeQuickCommandUiConfig,
 } from "@/lib/quickCommandSettings";
 import {
-  buildTmuxPaneTree,
-  findTmuxTab,
-  tmuxFallbackLeaf,
+  findTmuxHostTab,
+  reconcileTmuxWindowTabs,
+  tmuxWindowTabs,
 } from "@/lib/tmux/tree";
 import type { TmuxSessionState } from "@/lib/tmux/types";
 import {
@@ -40,6 +40,7 @@ import {
   createWorkspaceTab,
   ensureActivePane,
   findOpenFileDocument,
+
   findSessionPaneById,
   getFirstSessionPane,
   getNextPersistOrder,
@@ -986,12 +987,33 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const closeTabs = useCallback(
     (
       tabIds: string[],
-      options?: { immediatePersist?: boolean; nextActiveTabId?: string | null },
+      options?: {
+        immediatePersist?: boolean;
+        nextActiveTabId?: string | null;
+        /** Close tmux window tabs without sending `kill-window` — used when
+         * the windows are already gone (remote close / detach / exit). */
+        skipTmuxKill?: boolean;
+      },
     ) => {
       if (tabIds.length === 0) return;
 
       const idsToClose = new Set(tabIds);
       const currentTabs = tabsRef.current;
+      // Closing a tmux window tab kills that tmux window — the natural
+      // meaning of `×` for a window tab, matching iTerm2's `-CC` behavior.
+      // The local close is optimistic; if the kill fails the next state
+      // emit simply recreates the tab. Skipped on paths where the window
+      // is already dead — detach must leave the remote session intact.
+      if (!options?.skipTmuxKill) {
+        for (const tab of currentTabs) {
+          if (idsToClose.has(tab.id) && tab.tmux) {
+            void invoke("tmux_send_command", {
+              sessionId: tab.tmux.controlSessionId,
+              command: `kill-window -t '${tab.tmux.windowId}'`,
+            }).catch(() => {});
+          }
+        }
+      }
       const nextTabs = currentTabs.filter((tab) => !idsToClose.has(tab.id));
       const currentActiveTabId = activeTabIdRef.current;
 
@@ -1037,39 +1059,78 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [closeTabs],
   );
 
+  // `activePaneSessionId` echo guard: only a *changed* remote pane is
+  // followed, so a local click is not reverted by a stale emit.
+  const tmuxRemotePanes = useRef(new Map<string, string>());
+
   const applyTmuxState = useCallback(
     (state: TmuxSessionState) => {
       const currentTabs = tabsRef.current;
-      const tab = findTmuxTab(currentTabs, state.controlSessionId);
-      if (!tab) return;
+      const controlSessionId = state.controlSessionId;
+      const hostTab = findTmuxHostTab(currentTabs, controlSessionId);
+      const windowTabs = tmuxWindowTabs(currentTabs, controlSessionId);
 
       if (state.exited) {
-        // Control client detached: fall back to a plain shell leaf so the
-        // tab keeps working as a normal terminal.
-        const leaf = tmuxFallbackLeaf(state, tab);
-        const nextTabs = currentTabs.map((item) =>
-          item.id === tab.id
-            ? { ...item, root: leaf, activePaneId: leaf.id }
-            : item,
-        );
-        void commitTabs(nextTabs);
+        // Control client detached or died: every window tab goes — the host
+        // tab was never consumed, so its shell leaf simply resumes output.
+        // `skipTmuxKill`: detach leaves the remote session alive, so killing
+        // its windows here would destroy exactly what detach preserves.
+        // Also strip the host marker — the tab is a plain shell tab again.
+        if (hostTab?.tmuxHost) {
+          void commitTabs(
+            currentTabs.map((tab) =>
+              tab.id === hostTab.id ? { ...tab, tmuxHost: undefined } : tab,
+            ),
+          );
+        }
+        if (windowTabs.length > 0) {
+          closeTabs(windowTabs.map((tab) => tab.id), {
+            nextActiveTabId: hostTab?.id ?? null,
+            skipTmuxKill: true,
+          });
+        }
+        tmuxRemotePanes.current.delete(controlSessionId);
         return;
       }
 
-      const built = buildTmuxPaneTree(state, tab);
-      if (!built) return;
-      const nextTabs = currentTabs.map((item) =>
-        item.id === tab.id
-          ? ensureActivePane({
-              ...item,
-              root: built.root,
-              activePaneId: built.activePaneId,
-            })
-          : item,
+      if (!hostTab) {
+        // The session owning these windows is gone (tab closed / connection
+        // dropped) but a non-exit state arrived anyway — drop stale tabs.
+        if (windowTabs.length > 0) {
+          closeTabs(windowTabs.map((tab) => tab.id), { skipTmuxKill: true });
+        }
+        return;
+      }
+
+      // Follow the remote active pane only when it actually moved — a local
+      // click must not be reverted by an echo of the old value.
+      const remotePane = state.activePaneSessionId ?? null;
+      const followRemoteActivePane =
+        remotePane !== null &&
+        remotePane !== tmuxRemotePanes.current.get(controlSessionId);
+      if (remotePane !== null) {
+        tmuxRemotePanes.current.set(controlSessionId, remotePane);
+      }
+
+      const { tabs: nextTabs } = reconcileTmuxWindowTabs(
+        currentTabs,
+        state,
+        hostTab,
+        { followRemoteActivePane },
       );
       void commitTabs(nextTabs);
+
+      // Window tabs are sub-tabs inside the host's container — never the
+      // top-level active tab. Defensive only: if activation ever lands on
+      // one (stale restore, drag edge), bounce it back to the host.
+      const activeTab = activeTabIdRef.current
+        ? nextTabs.find((tab) => tab.id === activeTabIdRef.current)
+        : null;
+      if (activeTab?.tmux) {
+        setActiveTabId(hostTab.id);
+      }
     },
-    [commitTabs],
+    [closeTabs, commitTabs, setActiveTabId],
   );
 
   const reorderTabs = useCallback(

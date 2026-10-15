@@ -91,10 +91,22 @@ pub async fn create_local_session(
     let LocalStartupScript {
         script: startup_script,
         shell_init_args,
-        pwsh_init_args,
+        mut pwsh_init_args,
         cmd_prompt,
         dynamic_title_integration_requested,
     } = startup;
+    if ai_execution_profile == AiExecutionProfile::Powershell && allow_injection {
+        let dispatch = crate::core::capture::PowershellDispatch::new()?;
+        let helper = dispatch.init_script();
+        if let Some(args) = pwsh_init_args.as_mut() {
+            if let Some(init) = args.last_mut() {
+                init.insert_str(0, &helper);
+            }
+        } else {
+            pwsh_init_args = Some(vec!["-NoExit".into(), "-Command".into(), helper]);
+        }
+        manager.powershell_dispatch.lock().unwrap().insert(session_id.clone(), dispatch);
+    }
     let startup_input_barrier = startup_script
         .as_ref()
         .map(|_| Arc::new(StartupInputBarrier::new()));
@@ -659,7 +671,9 @@ fn pty_session_thread(
         startup_terminal_sequence_pending.clone();
     let cwd_reader = cwd.clone();
     let cwd_presentation_event_reader = cwd_presentation_event.clone();
-    let encoding_for_reader = encoding.clone();
+    let mut encoding = nyaterm_core::terminal_encoding::session_encoding_label(&encoding);
+    let output_decoder = Arc::new(StdMutex::new(TerminalOutputDecoder::new(&encoding)));
+    let output_decoder_reader = output_decoder.clone();
     let startup_activity = startup_script
         .as_ref()
         .map(|_| Arc::new(StdMutex::new(None::<Instant>)));
@@ -673,7 +687,6 @@ fn pty_session_thread(
         let mut zmodem_detector = ZmodemDetector::new();
         let mut terminal_query_detector = TerminalQueryDetector::new();
         let mut pending_managed_cwd_event: Option<CwdPayloadEvent> = None;
-        let mut output_decoder = TerminalOutputDecoder::new(&encoding_for_reader);
         loop {
             {
                 let (lock, cvar) = &*output_pause_reader;
@@ -757,7 +770,7 @@ fn pty_session_thread(
                                     if let Some(rec) = recording_mgr_reader.as_ref() {
                                         rec.write_raw_output(&sid_for_rec_reader, &passthrough);
                                     }
-                                    let pre = output_decoder.decode(&passthrough);
+                                    let pre = lock_or_recover(&output_decoder_reader, "local_encoding_decoder").decode(&passthrough);
                                     if !pre.is_empty() {
                                         output_reader.push_owned(pre);
                                     }
@@ -835,7 +848,7 @@ fn pty_session_thread(
                         }
                     };
 
-                    let text = output_decoder.decode(&process_raw);
+                    let text = lock_or_recover(&output_decoder_reader, "local_encoding_decoder").decode(&process_raw);
                     let _startup_output_order_guard = startup_output_order_reader
                         .as_ref()
                         .map(|order| lock_or_recover(order, "local_startup_output_order"));
@@ -1017,6 +1030,9 @@ fn pty_session_thread(
                     if let Ok(mut proc) = capture_for_reader.lock() {
                         if proc.has_active() {
                             result.visible = proc.process(&result.visible);
+                            if result.ready {
+                                proc.finish_abandoned_at_prompt();
+                            }
                         }
                     }
 
@@ -1328,6 +1344,19 @@ fn pty_session_thread(
             SessionCommand::DetachRenderer => {
                 output.detach();
             }
+            SessionCommand::GetEncoding { reply } => {
+                let _ = reply.send(encoding.clone());
+            }
+            SessionCommand::SetEncoding { encoding: requested, reply } => {
+                let result = if let Some(next) = nyaterm_core::terminal_encoding::supported_session_encoding(&requested) {
+                    lock_or_recover(&output_decoder, "local_encoding_decoder").reset(next);
+                    encoding = next.to_string();
+                    Ok(encoding.clone())
+                } else {
+                    Err(format!("Unsupported terminal encoding: {requested}"))
+                };
+                let _ = reply.send(result);
+            }
             SessionCommand::Write { data, raw, origin, .. } => {
                 if input_cancels_startup_injection(origin)
                     && startup_input_barrier
@@ -1382,12 +1411,14 @@ fn pty_session_thread(
                 marker_id,
                 wrapped_command,
                 result_tx,
+                execution,
             } => {
                 if let Ok(mut proc) = capture_processor.lock() {
-                    proc.register(marker_id, result_tx);
+                    if !proc.register_execution(marker_id.clone(), result_tx, Some(execution)) { continue; }
                 }
                 let send_command = encode_terminal_input(&wrapped_command, &encoding);
                 if let Err(error) = write_to_pty(&mut *writer, &send_command) {
+                    if let Ok(mut proc) = capture_processor.lock() { proc.abort(&marker_id); }
                     tracing::warn!(
                         session_id = %session_id,
                         error = %error,
