@@ -27,12 +27,33 @@ const SNAPSHOT_ENTITIES_TABLE: TableDefinition<&str, &str> = TableDefinition::ne
 const SNAPSHOT_V2_JSON_DOCS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("json_docs");
 const SNAPSHOT_V2_TEXT_DOCS_TABLE: TableDefinition<&str, &str> = TableDefinition::new("text_docs");
 include!("types.rs");
+include!("merge.rs");
 include!("codec.rs");
 include!("hash.rs");
 include!("legacy.rs");
 include!("redb_codec.rs");
 include!("temp_redb.rs");
 include!("tests.rs");
+
+/// 跨 crate 回归测试专用，生产构建不启用。
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use super::PortableSnapshot;
+    use crate::error::AppResult;
+    use std::collections::BTreeMap;
+
+    pub fn calculate_v3_raw_payload_hash(entities: &BTreeMap<String, String>) -> AppResult<String> {
+        super::calculate_v3_raw_payload_hash(entities)
+    }
+
+    pub fn encode_v3_raw_snapshot_redb_for_test(
+        snapshot: &PortableSnapshot,
+        entities: &BTreeMap<String, String>,
+        payload_hash: String,
+    ) -> Vec<u8> {
+        super::encode_v3_raw_snapshot_redb_for_test(snapshot, entities, payload_hash)
+    }
+}
 pub fn sync_settings_payload_changed(
     previous: &AppSettings,
     next: &AppSettings,

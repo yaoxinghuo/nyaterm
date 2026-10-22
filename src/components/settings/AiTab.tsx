@@ -54,6 +54,7 @@ import {
   getCustomProviderBaseUrlPlaceholder,
   getProviderLabel,
   isBuiltinProvider,
+  localizeDefaultAiAction,
   MODEL_REASONING_EFFORTS,
   supportsApiFormatSelection,
 } from "@/lib/aiSettings";
@@ -464,6 +465,21 @@ export function AiGeneralTab() {
         </SettingFieldGrid>
         <div className="text-xs text-muted-foreground">{t("ai.agentMaxStepsDesc")}</div>
         <div className="text-xs text-muted-foreground">{t("ai.terminalOutputLinesDesc")}</div>
+        {runtime === "desktop" && (
+          <div className="space-y-3">
+            <Label htmlFor="agent-custom-instructions">{t("ai.agentCustomInstructions")}</Label>
+            <Textarea
+              id="agent-custom-instructions"
+              aria-describedby="agent-custom-instructions-desc"
+              rows={5}
+              value={ai.agent_custom_instructions ?? ""}
+              onChange={(event) => update({ agent_custom_instructions: event.target.value })}
+            />
+            <p id="agent-custom-instructions-desc" className="text-xs text-muted-foreground">
+              {t("ai.agentCustomInstructionsDesc")}
+            </p>
+          </div>
+        )}
       </SettingSection>
     </div>
   );
@@ -2621,6 +2637,9 @@ function ActionListEditor({
   const updateAction = (id: string, patch: Partial<AICustomActionConfig>) => {
     onChange(actions.map((action) => (action.id === id ? { ...action, ...patch } : action)));
   };
+  const localizedActions = actions.map((action) =>
+    localizeDefaultAiAction(action, (key) => t(key)),
+  );
 
   return (
     <SettingSection
@@ -2637,7 +2656,7 @@ function ActionListEditor({
       }
       contentClassName="space-y-4"
     >
-      {actions.map((action) => (
+      {localizedActions.map((action) => (
         <div key={action.id} className="rounded-md border border-border/70 bg-background/75 p-4">
           <div className="mb-3 flex items-center justify-between gap-3">
             <div className="min-w-0 truncate text-sm font-medium">{action.name}</div>

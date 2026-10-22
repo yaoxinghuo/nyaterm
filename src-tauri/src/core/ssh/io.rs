@@ -1295,6 +1295,50 @@ pub(super) async fn ssh_io_loop(
         tokio::select! {
             biased;
 
+            () = async {
+                if let Some(deadline) = tmux_detector.deadline() {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }, if tmux_detector.deadline().is_some() => {
+                let bytes = tmux_detector.expire_candidate();
+                if let Some(ref recorder) = recording_mgr {
+                    recorder.write_raw_output(&session_id, &bytes);
+                }
+                let text = output_decoder.decode(&bytes);
+                let mut result = stripper.push(&text);
+
+                if capture_processor.has_active() {
+                    result.visible = capture_processor.process(&result.visible);
+                    if result.ready {
+                        capture_processor.finish_abandoned_at_prompt();
+                    }
+                }
+
+                handle_osc_result(
+                    &app,
+                    &output,
+                    &cwd_event,
+                    &cwd,
+                    &recording_mgr,
+                    &session_id,
+                    &manager,
+                    &mut channel,
+                    &mut pending_script,
+                    &mut inject_deadline,
+                    &mut phase,
+                    &result,
+                    &mut suppressed_visible_fallback,
+                    shell_kind,
+                    &mut injection_sent_at,
+                    &mut suppression_diagnostics,
+                ).await;
+                arm_post_login_timer(
+                    &phase,
+                    &pending_post_login,
+                    &mut post_login_deadline,
+                );
+            }
+
             _ = &mut inject_deadline,
                 if phase == IoPhase::Suppressing && injection_sent_at.is_some() =>
             {
@@ -1514,12 +1558,11 @@ pub(super) async fn ssh_io_loop(
                             continue;
                         }
 
-                        // tmux control mode (`tmux -CC`): watch for `%`-notifications
-                        // at a line start; on the first one the channel switches to
-                        // the control session until `%exit` hands it back.
+                        // tmux control mode: confirm startup framing and a nonce response
+                        // before changing session ownership or workspace state.
                         let data = match tmux_detector.feed(data) {
                             TmuxFeed::Passthrough(data) => data,
-                            TmuxFeed::Detected { passthrough, rest } => {
+                            TmuxFeed::Detected { passthrough, startup, rest } => {
                                 // Flush the bytes preceding the notification through
                                 // the regular path, then hand the channel over.
                                 if !passthrough.is_empty() {
@@ -1535,6 +1578,51 @@ pub(super) async fn ssh_io_loop(
                                         &result.visible,
                                     );
                                 }
+                                let rest = match tmux::verify_control_channel(&mut channel, &startup, &rest).await {
+                                    Ok(rest) => rest,
+                                    Err(leftover) => {
+                                        // No UI/session state was changed. Replay the exact bytes
+                                        // through the shell pipeline; queued user input stays intact.
+                                        tmux_detector = TmuxControlDetector::new();
+                                        if let Some(ref recorder) = recording_mgr {
+                                            recorder.write_raw_output(&session_id, &leftover);
+                                        }
+                                        let text = output_decoder.decode(&leftover);
+                                        let mut result = stripper.push(&text);
+
+                                        if capture_processor.has_active() {
+                                            result.visible = capture_processor.process(&result.visible);
+                                            if result.ready {
+                                                capture_processor.finish_abandoned_at_prompt();
+                                            }
+                                        }
+
+                                        handle_osc_result(
+                                            &app,
+                                            &output,
+                                            &cwd_event,
+                                            &cwd,
+                                            &recording_mgr,
+                                            &session_id,
+                                            &manager,
+                                            &mut channel,
+                                            &mut pending_script,
+                                            &mut inject_deadline,
+                                            &mut phase,
+                                            &result,
+                                            &mut suppressed_visible_fallback,
+                                            shell_kind,
+                                            &mut injection_sent_at,
+                                            &mut suppression_diagnostics,
+                                        ).await;
+                                        arm_post_login_timer(
+                                            &phase,
+                                            &pending_post_login,
+                                            &mut post_login_deadline,
+                                        );
+                                        continue;
+                                    }
+                                };
                                 let stamp = tmux_local_stamp();
                                 emit_visible_text(
                                     &output,
@@ -1544,13 +1632,13 @@ pub(super) async fn ssh_io_loop(
                                         "\r\n\x1b[2m[{stamp}] [nyaterm] tmux control mode\x1b[0m\r\n"
                                     ),
                                 );
-                                // Guard the edge where the leaf unmounts
-                                // mid-control (tab closed/detached
-                                // renderer): output then buffers for an
-                                // attach instead of emitting into a dead
-                                // listener. The common path — leaf stays
-                                // mounted — is re-attached explicitly on
-                                // ReturnToShell below.
+                                // Flush the entry banner before detaching so a
+                                // host terminal that deep-hibernates while
+                                // hidden (>2 min inside tmux) captures the
+                                // banner in its snapshot instead of stranding
+                                // it in `output.pending`.
+                                let host_renderer_attached = output.is_attached();
+                                output.close();
                                 output.detach();
                                 match tmux::run_control_session(
                                     &app,
@@ -1561,19 +1649,28 @@ pub(super) async fn ssh_io_loop(
                                     &rest,
                                     &encoding,
                                     connection_id.clone(),
+                                    host_renderer_attached,
                                 )
                                 .await
                                 {
-                                    tmux::ControlExit::ReturnToShell { leftover } => {
-                                        // The host leaf stays mounted under
-                                        // the window-tabs model, so no
-                                        // AttachConfirmed will ever arrive —
-                                        // re-attach here or the shell's
-                                        // output buffers forever and the pane
-                                        // looks frozen.
-                                        let (attach_tx, _attach_rx) =
-                                            tokio::sync::oneshot::channel();
-                                        output.attach_confirmed(attach_tx);
+                                    tmux::ControlExit::ReturnToShell {
+                                        leftover,
+                                        host_renderer_attached,
+                                    } => {
+                                        // Re-attach immediately only when the
+                                        // host renderer stayed mounted and
+                                        // attached throughout control mode. If
+                                        // the hidden host renderer hibernated
+                                        // while inside tmux (`DetachRenderer`),
+                                        // keep `output` detached so the exit
+                                        // banner and shell prompt buffer until
+                                        // the waking renderer restores its
+                                        // snapshot and sends `AttachConfirmed`.
+                                        if host_renderer_attached {
+                                            let (attach_tx, _attach_rx) =
+                                                tokio::sync::oneshot::channel();
+                                            output.attach_confirmed(attach_tx);
+                                        }
                                         let stamp = tmux_local_stamp();
                                         emit_visible_text(
                                             &output,
@@ -1814,14 +1911,6 @@ pub(super) async fn ssh_io_loop(
         stats_sampler.clear_session(&session_id).await;
     }
 
-    if let Some(ref conn_id) = connection_id {
-        if let Some(tunnel_mgr) = app.try_state::<Arc<super::TunnelManager>>() {
-            tunnel_mgr
-                .close_auto_tunnels_for_connection(&app, conn_id)
-                .await;
-        }
-    }
-
     tracing::info!(
         session_id = %session_id,
         close_reason,
@@ -1902,7 +1991,7 @@ pub(super) async fn sftp_only_ssh_lifecycle_loop(
     _handle: SshHandle,
     cmd_rx: SessionCommandReceiver,
     disconnect_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
-    connection_id: Option<String>,
+    _connection_id: Option<String>,
 ) {
     tracing::info!(session_id = %session_id, "SFTP-only SSH lifecycle loop started");
     let close_reason =
@@ -1910,14 +1999,6 @@ pub(super) async fn sftp_only_ssh_lifecycle_loop(
 
     if let Some(stats_sampler) = app.try_state::<Arc<RemoteStatsSampler>>() {
         stats_sampler.clear_session(&session_id).await;
-    }
-
-    if let Some(ref conn_id) = connection_id {
-        if let Some(tunnel_mgr) = app.try_state::<Arc<super::TunnelManager>>() {
-            tunnel_mgr
-                .close_auto_tunnels_for_connection(&app, conn_id)
-                .await;
-        }
     }
 
     tracing::info!(

@@ -258,17 +258,9 @@ export interface Tab {
     windowName: string;
     /** `#{window_index}` — the `N:` prefix on the sub-tab label. */
     windowIndex: number;
-    /** True while this is the tmux client's current window — the sub-tab
-     * the host container shows (unless the control pane is selected). */
+    /** Selected remote window within its host SSH leaf. */
     active: boolean;
   };
-  /**
-   * Set while this tab hosts the SSH channel running `tmux -CC`: one of
-   * its leaves keeps `sessionId === controlSessionId` and acts as the
-   * control pane — frozen shell output, tmux bar attached, bare Enter
-   * detaches. Runtime-only marker, cleared when the control session ends.
-   */
-  tmuxHost?: { controlSessionId: string };
 }
 
 /** SSH connection config for creating a session. */
@@ -1248,6 +1240,7 @@ export interface GeneralSettings {
   minimize_to_tray: boolean;
   boss_key: string | null;
   confirm_on_close: boolean;
+  /** Legacy fallback for saved connections without an explicit client preference. */
   rdp_client_mode: RdpClientMode;
 }
 
@@ -1637,6 +1630,7 @@ export interface AISettings {
   terminal_ai_actions: AICustomActionConfig[];
   file_ai_actions: AICustomActionConfig[];
   max_ai_file_size_bytes: number;
+  agent_custom_instructions: string;
   max_agent_steps?: number | null;
   agent_step_timeout_ms?: number | null;
   terminal_output_lines: number;
@@ -1882,6 +1876,7 @@ export interface TunnelConfig {
   target_port: number;
   is_open: boolean;
   auto_open: boolean;
+  auto_reconnect: boolean;
   bind_localhost: boolean;
   group_id?: string;
 }
@@ -1895,6 +1890,9 @@ export type TunnelRuntimeStatus =
   | "error";
 
 export interface TunnelRuntimeState {
+  revision?: number;
+  retryAttempt: number;
+  nextRetryAt?: number | null;
   tunnelId: string;
   status: TunnelRuntimeStatus;
   error?: string | null;

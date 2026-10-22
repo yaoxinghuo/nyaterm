@@ -14,7 +14,7 @@
 //! - `%exit` (after `detach` or a remote kill) hands the channel back to the
 //!   regular SSH loop, which continues as a normal shell.
 
-use super::control::{ControlMessage, ControlParser, LayoutCell, TmuxUiNode, parse_line};
+use super::control::{BlockId, ControlMessage, ControlParser, LayoutCell, TmuxUiNode, parse_line};
 use crate::core::capture::OutputCaptureProcessor;
 use crate::core::terminal_session::TerminalOutputDecoder;
 use crate::core::{
@@ -43,17 +43,15 @@ const INPUT_FLUSH_DELAY_MS: u64 = 4;
 const SEND_KEYS_CHUNK_BYTES: usize = 1024;
 /// Debounce for structural refreshes (`list-windows`/`list-panes`).
 const STATE_REFRESH_DELAY_MS: u64 = 120;
+/// Index changes (notably silent swaps) do not always emit useful notifications.
+const WINDOW_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const WINDOWS_QUERY: &str = "list-windows -F '#{window_id} #{window_index} #{window_active} #{window_layout} #{window_visible_layout} #{window_flags} #{pane_id} #{window_name}'";
 /// Buffer cap for output belonging to panes we have not mapped yet.
 const PENDING_PANE_OUTPUT_MAX_BYTES: usize = 512 * 1024;
 /// How long to wait for `%exit` after `detach-client` before giving up.
 const DETACH_EXIT_TIMEOUT_MS: u64 = 3000;
 /// Flow control: after a `%pause`, let the pane breathe, then continue it.
 const PAUSE_CONTINUE_DELAY_MS: u64 = 250;
-/// Plain lines tolerated before the control stream is considered verified.
-/// Real control-mode output is exclusively `%` lines, so any shell text
-/// means the channel was taken over by mistake; the margin only exists so
-/// a stray artifact cannot abort a legitimate session.
-const MAX_UNVERIFIED_LINES: usize = 8;
 /// `resize-pane` retries per distinct target; the echoed `%layout-change`
 /// retriggers the fixup, so without a cap an unreachable target would loop.
 const RESIZE_PANE_MAX_ATTEMPTS: u8 = 2;
@@ -72,7 +70,14 @@ const CWD_QUERY_DELAY_MS: u64 = 400;
 pub(crate) enum ControlExit {
     /// tmux detached/exited: the channel is back at a normal shell; the
     /// caller should resume regular I/O and forward `leftover` bytes first.
-    ReturnToShell { leftover: Vec<u8> },
+    /// `host_renderer_attached` is `false` when the hidden host `XTerminal`
+    /// deep-hibernated (`DetachRenderer`) while control mode was active and
+    /// has not re-attached yet — the caller must then keep `output` detached
+    /// until the waking renderer sends `AttachConfirmed`.
+    ReturnToShell {
+        leftover: Vec<u8>,
+        host_renderer_attached: bool,
+    },
     /// The channel or the whole session was closed.
     Closed,
 }
@@ -143,6 +148,12 @@ struct VirtualPane {
     /// Cell dimensions the current screen was seeded at; a layout change
     /// that alters them triggers a fresh capture so rows realign.
     dims: Option<(u32, u32)>,
+    /// Renderer dimensions (`desired`) at the time the current seed was
+    /// taken. A pane first seeded while hidden in a background tab (`desired`
+    /// is `None`, xterm still at default 80x24) must be reseeded once its
+    /// renderer becomes visible and reports its real dimensions, even when
+    /// those dimensions already match the remote tmux layout (`dims`).
+    seeded_desired: Option<(u32, u32)>,
     /// Last `resize-pane` target and attempts for the current `desired`
     /// size — bounds the layout-echo feedback when a target is unreachable
     /// (e.g. a remote `window-size=manual` that ignores the client size).
@@ -157,6 +168,63 @@ struct VirtualPane {
     cwd: SharedCwd,
     /// Bytes routed so far; only logged while small.
     routed_bytes: usize,
+}
+
+impl VirtualPane {
+    fn replay_pending_output(&mut self) {
+        while let Some((produced_at, data)) = self.pending_output.pop_front() {
+            self.pending_bytes -= data.len();
+            // Plain %output has no production timestamp. It may have arrived
+            // during capture, so prefer a duplicate over losing new output.
+            if output_precedes_capture(produced_at, self.capture_at) {
+                continue;
+            }
+            let decoded = self.decoder.decode(&data);
+            let text = if self.capture.has_active() {
+                self.capture.process(&decoded)
+            } else {
+                decoded
+            };
+            self.output.push_owned(text);
+        }
+    }
+}
+
+fn output_precedes_capture(
+    produced_at: Option<std::time::Instant>,
+    capture_at: Option<std::time::Instant>,
+) -> bool {
+    matches!((produced_at, capture_at), (Some(at), Some(cap)) if at <= cap)
+}
+
+fn buffer_unknown_output(
+    pending: &mut VecDeque<(Option<std::time::Instant>, Vec<u8>)>,
+    total: &mut usize,
+    produced_at: Option<std::time::Instant>,
+    mut data: Vec<u8>,
+) {
+    if data.len() > PENDING_PANE_OUTPUT_MAX_BYTES {
+        // Allocate just the tail: draining the prefix would retain the
+        // oversized allocation even though the byte counter is bounded.
+        data = data[data.len() - PENDING_PANE_OUTPUT_MAX_BYTES..].to_vec();
+    }
+    while *total > PENDING_PANE_OUTPUT_MAX_BYTES - data.len() {
+        let Some((_, old)) = pending.pop_front() else {
+            break;
+        };
+        *total -= old.len();
+    }
+    *total += data.len();
+    pending.push_back((produced_at, data));
+}
+
+fn log_server_notice(session_id: &str, kind: &str, bytes: usize) {
+    tracing::info!(
+        session_id = %session_id,
+        kind,
+        bytes,
+        "tmux control server notice"
+    );
 }
 
 /// Why a response block was queued (FIFO correlation with `%begin`/`%end`).
@@ -209,6 +277,7 @@ pub(crate) struct ControlSession<'a> {
     parser: ControlParser,
     /// Lines collected inside a `%begin`..`%end` block.
     block_lines: Option<Vec<String>>,
+    block_id: Option<BlockId>,
     /// When the current response block opened. Used as the capture snapshot
     /// boundary: output produced before this instant is guaranteed inside a
     /// capture executed within the block, while output produced after may
@@ -263,18 +332,6 @@ pub(crate) struct ControlSession<'a> {
     exit_mode: Option<ExitMode>,
     exit_seen: bool,
     detach_deadline: Option<Pin<Box<Sleep>>>,
-
-    /// Set once any line parses as a control message — a real control
-    /// stream is exclusively `%` lines, so reaching this proves the channel
-    /// truly speaks the protocol.
-    verified: bool,
-    /// Plain-text lines received before verification. A false takeover
-    /// (armed detector + a program printing `%` lines) lands shell output
-    /// here; past [`MAX_UNVERIFIED_LINES`] the session bails back to the
-    /// normal shell path and replays them so nothing is swallowed.
-    unverified_lines: Vec<String>,
-    /// Bail out of control mode back to the shell (see `unverified_lines`).
-    bail: bool,
 }
 
 impl<'a> ControlSession<'a> {
@@ -294,6 +351,7 @@ impl<'a> ControlSession<'a> {
             connection_id,
             parser: ControlParser::new(),
             block_lines: None,
+            block_id: None,
             block_started_at: None,
             pending_responses: VecDeque::new(),
             windows: HashMap::new(),
@@ -319,9 +377,6 @@ impl<'a> ControlSession<'a> {
             exit_mode: None,
             exit_seen: false,
             detach_deadline: None,
-            verified: false,
-            unverified_lines: Vec::new(),
-            bail: false,
         }
     }
 
@@ -360,24 +415,32 @@ impl<'a> ControlSession<'a> {
         }
     }
 
+    async fn refresh_windows(&mut self, channel: &mut russh::Channel<client::Msg>) {
+        // The entry stays queued until the matching response block completes.
+        if !self
+            .pending_responses
+            .iter()
+            .any(|kind| matches!(kind, PendingKind::WindowsRefresh))
+        {
+            self.send_query(channel, PendingKind::WindowsRefresh, WINDOWS_QUERY)
+                .await;
+        }
+    }
+
     async fn refresh_lists(&mut self, channel: &mut russh::Channel<client::Msg>) {
-        // `window_name` goes last: names may contain tabs/spaces.
-        self.send_query(
-            channel,
-            PendingKind::WindowsRefresh,
-            // Space-separated like iTerm2's gateway: tmux renders control
-            // characters in -F output as `_`, so tabs cannot be used as
-            // separators. The name field goes last since it may contain
-            // spaces; splitn(4, ' ') preserves it.
-            "list-windows -F '#{window_id} #{window_index} #{window_active} #{window_layout} #{window_visible_layout} #{window_flags} #{window_name}'",
-        )
-        .await;
-        self.send_query(
-            channel,
-            PendingKind::PanesRefresh,
-            "list-panes -s -F '#{pane_id} #{window_id} #{pane_current_command}'",
-        )
-        .await;
+        self.refresh_windows(channel).await;
+        if !self
+            .pending_responses
+            .iter()
+            .any(|kind| matches!(kind, PendingKind::PanesRefresh))
+        {
+            self.send_query(
+                channel,
+                PendingKind::PanesRefresh,
+                "list-panes -s -F '#{pane_id} #{window_id} #{pane_current_command}'",
+            )
+            .await;
+        }
     }
 
     async fn spawn_pane(&mut self, pane_id: &str) {
@@ -496,6 +559,7 @@ impl<'a> ControlSession<'a> {
                 desired: None,
                 pending_dims: None,
                 dims: None,
+                seeded_desired: None,
                 resize_attempts: None,
                 capture: OutputCaptureProcessor::new(),
                 cwd,
@@ -523,6 +587,7 @@ impl<'a> ControlSession<'a> {
             }
             pane.seeding = true;
             pane.dims = dims;
+            pane.seeded_desired = pane.desired;
         }
         // `-e` keeps escape sequences, `-p` prints to stdout, `-S -` starts at
         // the beginning of the pane's scrollback.
@@ -730,9 +795,13 @@ impl<'a> ControlSession<'a> {
         // marks clipped edges with `#`, and it never re-pushes `%output`
         // after a resize — a capture taken pre-grow would seed those marks
         // forever. Skipped while zoomed since any client resize drops the
-        // zoom. Background windows are not clipped by the client size.
+        // zoom, and skipped once any local renderer has reported its real
+        // size (`sync_pane_sizes` then owns `client_size`, so switching to a
+        // background window with a larger stale layout must not bounce the
+        // client back up before `sync_pane_sizes` shrinks it).
+        let has_renderer_size = self.panes.values().any(|pane| pane.desired.is_some());
         let mut grew = false;
-        if !zoomed {
+        if !zoomed && !has_renderer_size {
             if let Some(layout) = active_layout.as_ref() {
                 grew = self.grow_client(channel, layout.width, layout.height).await;
             }
@@ -944,19 +1013,21 @@ impl<'a> ControlSession<'a> {
         if let Some(lines) = self.block_lines.as_mut() {
             let message = parse_line(&line);
             match message {
-                Some(ControlMessage::End | ControlMessage::Error) => {
+                Some(ControlMessage::End(id) | ControlMessage::Error(id))
+                    if self.block_id == Some(id) =>
+                {
                     let collected = std::mem::take(lines);
-                    let failed = matches!(message, Some(ControlMessage::Error));
+                    let failed = matches!(message, Some(ControlMessage::Error(_)));
                     self.block_lines = None;
+                    self.block_id = None;
                     let kind = self
                         .pending_responses
                         .pop_front()
                         .unwrap_or(PendingKind::Ignore);
                     self.handle_block(channel, kind, collected, failed).await;
                 }
-                Some(ControlMessage::Begin) => {
+                Some(ControlMessage::Begin(id)) => {
                     tracing::warn!("tmux control: nested %begin; discarding outer block");
-                    self.block_lines = None;
                     // The discarded block's response never reaches
                     // `handle_block`; unwind state its kind armed so a pane
                     // is not stuck mid-seed (and unseeddable) forever.
@@ -971,6 +1042,12 @@ impl<'a> ControlSession<'a> {
                             pane.pending_seed = None;
                         }
                     }
+                    self.block_id = Some(id);
+                    self.block_lines = Some(Vec::new());
+                    self.block_started_at = Some(std::time::Instant::now());
+                }
+                Some(ControlMessage::End(_) | ControlMessage::Error(_)) => {
+                    tracing::warn!("tmux control: mismatched response marker");
                 }
                 Some(ControlMessage::Exit { .. }) => {
                     self.mark_exit();
@@ -983,40 +1060,21 @@ impl<'a> ControlSession<'a> {
         }
 
         let Some(message) = parse_line(&line) else {
-            if self.verified {
-                tracing::debug!(
-                    session_id = %self.control_session_id,
-                    bytes = line.len(),
-                    "tmux control: unparsed line"
-                );
-            } else {
-                // A real control stream is exclusively `%` lines; plain text
-                // means a program printed tmux-looking output into an armed
-                // detector. Count it, and bail back to the shell if our
-                // bootstrap commands keep coming back as shell noise.
-                self.unverified_lines.push(line);
-                if self.unverified_lines.len() >= MAX_UNVERIFIED_LINES {
-                    tracing::warn!(
-                        session_id = %self.control_session_id,
-                        "tmux control: not a control stream; returning to shell"
-                    );
-                    self.bail = true;
-                }
-            }
+            tracing::debug!(session_id = %self.control_session_id, bytes = line.len(), "tmux control: unparsed line");
             return;
         };
-        self.verified = true;
         tracing::debug!(
             session_id = %self.control_session_id,
             message = ?std::mem::discriminant(&message),
             "tmux control: message"
         );
         match message {
-            ControlMessage::Begin => {
+            ControlMessage::Begin(id) => {
+                self.block_id = Some(id);
                 self.block_lines = Some(Vec::new());
                 self.block_started_at = Some(std::time::Instant::now());
             }
-            ControlMessage::End | ControlMessage::Error => {
+            ControlMessage::End(_) | ControlMessage::Error(_) => {
                 // Unsolicited end without a begin: ignore.
             }
             ControlMessage::Output { pane, data } => {
@@ -1123,11 +1181,7 @@ impl<'a> ControlSession<'a> {
             | ControlMessage::ClientSessionChanged
             | ControlMessage::Ignored => {}
             ControlMessage::ClientDetached { client } => {
-                tracing::info!(
-                    session_id = %self.control_session_id,
-                    client = %client,
-                    "tmux client detached notification"
-                );
+                log_server_notice(self.control_session_id, "client-detached", client.len());
             }
             ControlMessage::Pause { pane } => {
                 // Flow control kicks in only if we enabled `pause-after`;
@@ -1142,18 +1196,17 @@ impl<'a> ControlSession<'a> {
             ControlMessage::Continue { pane } => {
                 self.paused_panes.remove(&pane);
             }
-            ControlMessage::ConfigError { text } | ControlMessage::Message { text } => {
-                tracing::info!(
-                    session_id = %self.control_session_id,
-                    message = %text,
-                    "tmux control server message"
-                );
+            ControlMessage::ConfigError { text } => {
+                log_server_notice(self.control_session_id, "config-error", text.len());
+            }
+            ControlMessage::Message { text } => {
+                log_server_notice(self.control_session_id, "message", text.len());
             }
             ControlMessage::Exit { reason } => {
-                tracing::info!(
-                    session_id = %self.control_session_id,
-                    reason = ?reason,
-                    "tmux control client exited"
+                log_server_notice(
+                    self.control_session_id,
+                    "exit",
+                    reason.as_ref().map_or(0, String::len),
                 );
                 self.mark_exit();
             }
@@ -1172,10 +1225,8 @@ impl<'a> ControlSession<'a> {
                 // A notification provably produced before the last capture is
                 // already painted by the seed — tmux defers such blocks past
                 // the command's `%end`, so arrival order alone cannot tell.
-                if let (Some(at), Some(capture_at)) = (produced_at, virtual_pane.capture_at) {
-                    if at <= capture_at {
-                        return;
-                    }
+                if output_precedes_capture(produced_at, virtual_pane.capture_at) {
+                    return;
                 }
                 let decoded = virtual_pane.decoder.decode(&data);
                 let text = if virtual_pane.capture.has_active() {
@@ -1222,14 +1273,7 @@ impl<'a> ControlSession<'a> {
                 .unknown_output
                 .entry(pane.to_string())
                 .or_insert_with(|| (VecDeque::new(), 0));
-            while *total + data.len() > PENDING_PANE_OUTPUT_MAX_BYTES {
-                let Some((_, old)) = pending.pop_front() else {
-                    break;
-                };
-                *total -= old.len();
-            }
-            *total += data.len();
-            pending.push_back((produced_at, data));
+            buffer_unknown_output(pending, total, produced_at, data);
         }
     }
 
@@ -1242,6 +1286,9 @@ impl<'a> ControlSession<'a> {
     ) {
         match kind {
             PendingKind::WindowsRefresh => {
+                if failed {
+                    return;
+                }
                 self.apply_window_list(lines);
                 self.reconcile_panes(channel).await;
             }
@@ -1297,36 +1344,19 @@ impl<'a> ControlSession<'a> {
                         let wrote_seed = if let Some(seed_lines) = virtual_pane.pending_seed.take()
                         {
                             let (x, y, history) = cursor.unwrap_or_default();
-                            let hist = history.min(seed_lines.len());
+                            let screen_rows = virtual_pane
+                                .desired
+                                .or(virtual_pane.dims)
+                                .map(|(_, rows)| rows as usize);
                             let mut decoder = TerminalOutputDecoder::new(&self.encoding);
-                            // Reset + clear first: this makes the seed
-                            // idempotent for remounted terminals and for
-                            // re-captures after a client grow (which must
-                            // overwrite '#' clipping marks already on
-                            // screen).
-                            let mut text = String::from("\x1b[H\x1b[2J\x1b[3J");
-                            if hist > 0 {
-                                // `capture-pane -S -` leads with
-                                // `history_size` scrollback rows. Writing
-                                // them plainly would leave stale rows (e.g.
-                                // leftover '#'/'%' marks) parked above the
-                                // prompt, so scroll them into the renderer's
-                                // own scrollback first, then paint only the
-                                // screen part.
-                                text.push_str(
-                                    &decoder.decode(seed_lines[..hist].join("\r\n").as_bytes()),
-                                );
-                                text.push_str("\r\n");
-                                text.push_str("\x1b[r\x1b[9999B");
-                                text.push_str(&"\n".repeat(hist));
-                                text.push_str("\x1b[H");
-                            }
-                            text.push_str(
-                                &decoder.decode(seed_lines[hist..].join("\r\n").as_bytes()),
+                            let text = compose_seed_payload(
+                                &seed_lines,
+                                x,
+                                y,
+                                history,
+                                screen_rows,
+                                &mut decoder,
                             );
-                            // `cursor_y` is screen-relative; with scrollback
-                            // scrolled away it lands directly on that row.
-                            text.push_str(&format!("\x1b[{};{}H", y + 1, x + 1));
                             virtual_pane.output.push_owned(text);
                             true
                         } else {
@@ -1337,31 +1367,7 @@ impl<'a> ControlSession<'a> {
                         virtual_pane.seeded = wrote_seed;
                     }
                     if !reseed {
-                        let capture_at = virtual_pane.capture_at;
-                        while let Some((produced_at, data)) =
-                            virtual_pane.pending_output.pop_front()
-                        {
-                            virtual_pane.pending_bytes -= data.len();
-                            // Entries provably produced before the snapshot —
-                            // and un-`aged` `%output`, which is always older —
-                            // are already painted; replaying them would draw
-                            // the same lines twice.
-                            let stale = match (produced_at, capture_at) {
-                                (Some(at), Some(cap)) => at <= cap,
-                                (None, Some(_)) => true,
-                                _ => false,
-                            };
-                            if stale {
-                                continue;
-                            }
-                            let decoded = virtual_pane.decoder.decode(&data);
-                            let text = if virtual_pane.capture.has_active() {
-                                virtual_pane.capture.process(&decoded)
-                            } else {
-                                decoded
-                            };
-                            virtual_pane.output.push_owned(text);
-                        }
+                        virtual_pane.replay_pending_output();
                     }
                 }
                 if reseed {
@@ -1400,38 +1406,10 @@ impl<'a> ControlSession<'a> {
     }
 
     fn apply_window_list(&mut self, lines: Vec<String>) {
-        for line in lines {
-            let mut parts = line.splitn(7, ' ');
-            let (Some(id), Some(index), Some(active), Some(layout_str)) =
-                (parts.next(), parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            let visible_str = parts.next().unwrap_or_default();
-            let flags = parts.next().unwrap_or_default();
-            let name = parts.next().unwrap_or_default();
-            let entry = self.windows.entry(id.to_string()).or_insert(WindowState {
-                name: String::new(),
-                index: 0,
-                layout: None,
-                visible_layout: None,
-                zoomed: false,
-            });
-            entry.name = name.to_string();
-            entry.index = index.parse().unwrap_or(entry.index);
-            if let Some((layout, _)) = super::control::parse_layout(layout_str) {
-                entry.visible_layout = Some(
-                    super::control::parse_layout(visible_str)
-                        .map(|(cell, _)| cell)
-                        .unwrap_or_else(|| layout.clone()),
-                );
-                entry.layout = Some(layout);
-            }
-            entry.zoomed = flags.contains('Z');
-            if active == "1" {
-                self.active_window = Some(id.to_string());
-            }
-        }
+        let snapshot = parse_window_snapshot(lines);
+        self.windows = snapshot.windows;
+        self.active_window = snapshot.active_window;
+        self.active_pane = snapshot.active_pane;
         self.emit_state();
     }
 
@@ -1528,43 +1506,69 @@ impl<'a> ControlSession<'a> {
                 }
             }
             SessionCommand::Resize { cols, rows } => {
+                let layout_dims = self.pane_dims(&pane_id);
+                let mut immediate_reseed = false;
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
-                    if pane.pending_dims != Some((cols, rows)) {
+                    if layout_dims == Some((cols, rows)) {
+                        // The renderer just fitted to the exact dimensions
+                        // the remote tmux layout already has (e.g. a hidden
+                        // background window tab becoming visible for the
+                        // first time). Promote immediately without the 250 ms
+                        // debounce; if the previous seed ran while the
+                        // renderer was still at its hidden default 80x24
+                        // (`seeded_desired != Some((cols, rows))`), reseed
+                        // now so rows and cursor align with the fitted xterm.
+                        pane.pending_dims = None;
+                        if pane.desired != Some((cols, rows)) {
+                            pane.desired = Some((cols, rows));
+                            pane.resize_attempts = None;
+                        }
+                        if pane.seeded_desired != Some((cols, rows)) {
+                            if pane.seeding {
+                                pane.reseed = true;
+                            } else {
+                                pane.seeded = false;
+                                immediate_reseed = true;
+                            }
+                        }
+                    } else if pane.pending_dims != Some((cols, rows)) {
                         pane.pending_dims = Some((cols, rows));
                         self.resize_deadline = Some(Box::pin(tokio::time::sleep(
                             Duration::from_millis(RESIZE_SYNC_DEBOUNCE_MS),
                         )));
                     }
                 }
+                if immediate_reseed {
+                    self.seed_pane(channel, &pane_id).await;
+                }
             }
             SessionCommand::SerialModemUpload { .. } => {
                 // Serial-only command; unreachable on an SSH control channel.
             }
             SessionCommand::AttachConfirmed { ack } => {
+                tracing::info!(
+                    session_id = %self.control_session_id,
+                    pane = %pane_id,
+                    known = self.panes.contains_key(&pane_id),
+                    "tmux pane attach"
+                );
                 let mut reseed = false;
-                let mut deferred_reseed = false;
-                let mut known = false;
                 if let Some(pane) = self.panes.get_mut(&pane_id) {
-                    known = true;
                     pane.output.attach_confirmed(ack);
-                    // A renderer attaching to an already-seeded pane was
-                    // remounted (fresh buffer); resend the screen. Attaches
-                    // within 250 ms are the same mount seen twice (e.g.
-                    // StrictMode), not a remount.
-                    let stale_attach = pane
+                    // A renderer re-attaching after its initial mount (e.g.
+                    // remount or wake from hibernation) has a fresh buffer and
+                    // needs the screen re-sent. The very first attach
+                    // (`last_attach.is_none()`) already receives the initial
+                    // seed drained from `pane.output` above, and attaches
+                    // within 250 ms are the same mount seen twice (StrictMode).
+                    let remount_attach = pane
                         .last_attach
-                        .is_none_or(|t| t.elapsed() > Duration::from_millis(250));
+                        .is_some_and(|t| t.elapsed() > Duration::from_millis(250));
                     if pane.seeding {
-                        // The in-flight capture may have been issued for a
-                        // renderer that is already gone, or its emit can beat
-                        // this mount's listener registration. Re-capture once
-                        // it lands so a snapshot provably reaches this attach.
-                        pane.reseed = true;
-                        deferred_reseed = true;
-                    } else if !pane.seeded || stale_attach {
-                        // `!seeded` with no seed in flight is an unrecoverable
-                        // state unless we capture here (the renderer would sit
-                        // blank until the next %output).
+                        if remount_attach {
+                            pane.reseed = true;
+                        }
+                    } else if !pane.seeded || remount_attach {
                         pane.seeded = false;
                         reseed = true;
                     }
@@ -1572,14 +1576,6 @@ impl<'a> ControlSession<'a> {
                 } else {
                     let _ = ack.send(());
                 }
-                tracing::info!(
-                    session_id = %self.control_session_id,
-                    pane = %pane_id,
-                    known,
-                    reseed,
-                    deferred_reseed,
-                    "tmux pane attach"
-                );
                 if reseed {
                     self.seed_pane(channel, &pane_id).await;
                 }
@@ -1706,6 +1702,7 @@ pub(crate) async fn run_control_session(
     initial: &[u8],
     encoding: &str,
     connection_id: Option<String>,
+    mut host_renderer_attached: bool,
 ) -> ControlExit {
     let mut session = ControlSession::new(app, session_id, manager, encoding, connection_id);
 
@@ -1725,8 +1722,13 @@ pub(crate) async fn run_control_session(
         .await;
     session.refresh_lists(channel).await;
 
+    let mut window_poll = tokio::time::interval(WINDOW_POLL_INTERVAL);
+    window_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    window_poll.tick().await;
+
     // Feed the bytes that arrived together with the first notification.
-    for line in session.parser.feed(initial) {
+    session.parser.push(initial);
+    while let Some(line) = session.parser.next_line() {
         session.handle_message(channel, line).await;
         if session.exit_seen {
             break;
@@ -1734,20 +1736,14 @@ pub(crate) async fn run_control_session(
     }
 
     let exit = loop {
-        if session.exit_seen || session.bail {
-            let mut leftover = Vec::new();
-            if session.bail {
-                // Replay the swallowed plain lines so the user sees what
-                // their shell actually answered to our probe commands.
-                leftover.extend_from_slice(session.unverified_lines.join("\r\n").as_bytes());
-                if !leftover.is_empty() {
-                    leftover.extend_from_slice(b"\r\n");
-                }
-            }
-            leftover.extend_from_slice(&session.parser.take_pending());
+        if session.exit_seen {
+            let leftover = session.parser.take_pending();
             break match session.exit_mode {
                 Some(ExitMode::Close) => ControlExit::Closed,
-                _ => ControlExit::ReturnToShell { leftover },
+                _ => ControlExit::ReturnToShell {
+                    leftover,
+                    host_renderer_attached,
+                },
             };
         }
 
@@ -1761,6 +1757,10 @@ pub(crate) async fn run_control_session(
             }, if session.detach_deadline.is_some() => {
                 // detach-client never produced %exit: fall back to closing.
                 break ControlExit::Closed;
+            }
+
+            _ = window_poll.tick(), if session.exit_mode.is_none() => {
+                session.refresh_windows(channel).await;
             }
 
             () = async {
@@ -1805,6 +1805,33 @@ pub(crate) async fn run_control_session(
                     }
                 }
                 session.sync_pane_sizes(channel).await;
+                // If a pane's settled renderer size already matches its remote
+                // layout (so `sync_pane_sizes` sent no resize and no
+                // `%layout-change` will follow), but the pane was last seeded
+                // at a different renderer size, reseed it now.
+                let to_reseed: Vec<String> = session
+                    .panes
+                    .keys()
+                    .filter(|pane_id| {
+                        let layout_dims = session.pane_dims(pane_id);
+                        session.panes.get(*pane_id).is_some_and(|pane| {
+                            pane.desired.is_some()
+                                && pane.desired == layout_dims
+                                && pane.seeded_desired != pane.desired
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                for pane_id in to_reseed {
+                    if let Some(pane) = session.panes.get_mut(&pane_id) {
+                        if pane.seeding {
+                            pane.reseed = true;
+                            continue;
+                        }
+                        pane.seeded = false;
+                    }
+                    session.seed_pane(channel, &pane_id).await;
+                }
             }
 
             () = async {
@@ -1833,7 +1860,11 @@ pub(crate) async fn run_control_session(
                     }
                     Some(SessionCommand::SerialModemUpload { .. }) => {}
                     Some(SessionCommand::AttachConfirmed { ack }) => {
+                        host_renderer_attached = true;
                         let _ = ack.send(());
+                    }
+                    Some(SessionCommand::DetachRenderer) => {
+                        host_renderer_attached = false;
                     }
                     Some(SessionCommand::GetEncoding { reply }) => {
                         let _ = reply.send(session.encoding.clone());
@@ -1858,8 +1889,7 @@ pub(crate) async fn run_control_session(
                         let _ = reply.send(result);
                     }
                     Some(
-                        SessionCommand::DetachRenderer
-                        | SessionCommand::Resize { .. }
+                        SessionCommand::Resize { .. }
                         | SessionCommand::PauseOutput
                         | SessionCommand::ResumeOutput
                         | SessionCommand::AckOutput { .. }
@@ -1897,8 +1927,10 @@ pub(crate) async fn run_control_session(
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
-                        for line in session.parser.feed(&data) {
+                        session.parser.push(&data);
+                        while let Some(line) = session.parser.next_line() {
                             session.handle_message(channel, line).await;
+                            if session.exit_seen { break; }
                         }
                     }
                     None | Some(ChannelMsg::Eof | ChannelMsg::Close) => {
@@ -1912,6 +1944,52 @@ pub(crate) async fn run_control_session(
 
     session.teardown().await;
     exit
+}
+
+/// Compose the terminal payload that paints a `capture-pane -ep -S -` snapshot
+/// into xterm and restores the cursor.
+///
+/// Two invariants keep the prompt and cursor aligned even when the renderer's
+/// current height differs from the remote tmux pane (e.g. a background window
+/// tab still at default 80x24 while hidden, or a host container shortened by
+/// `TmuxWindowStrip`):
+///
+/// 1. Trailing blank screen rows are trimmed before joining with `\r\n`.
+///    `capture-pane` emits all `pane_height` rows of the grid, including blank
+///    rows below the cursor; writing those trailing `\r\n`s into a shorter
+///    xterm scrolls the top rows (where the prompt sits) into scrollback, after
+///    which `\x1b[{y+1};{x+1}H` lands on an empty line at the right column.
+/// 2. When scrollback rows (`history > 0`) precede the screen portion, only
+///    `hist.min(screen_rows)` newlines are emitted at the bottom row to push
+///    the visible tail into xterm's scrollback without injecting blank lines.
+fn compose_seed_payload(
+    seed_lines: &[String],
+    x: u32,
+    y: u32,
+    history: usize,
+    screen_rows: Option<usize>,
+    decoder: &mut TerminalOutputDecoder,
+) -> String {
+    let hist = history.min(seed_lines.len());
+    // Reset + clear first: this makes the seed idempotent for remounted
+    // terminals and for re-captures after a client grow (which must overwrite
+    // '#' clipping marks already on screen).
+    let mut text = String::from("\x1b[H\x1b[2J\x1b[3J");
+    if hist > 0 {
+        let rows = screen_rows
+            .unwrap_or_else(|| seed_lines.len().saturating_sub(hist))
+            .max(1);
+        text.push_str(&decoder.decode(seed_lines[..hist].join("\r\n").as_bytes()));
+        text.push_str("\x1b[r\x1b[9999B");
+        text.push_str(&"\n".repeat(hist.min(rows)));
+        text.push_str("\x1b[H");
+    }
+    let screen = &seed_lines[hist..];
+    if let Some(last) = screen.iter().rposition(|line| !line.is_empty()) {
+        text.push_str(&decoder.decode(screen[..=last].join("\r\n").as_bytes()));
+    }
+    text.push_str(&format!("\x1b[{};{}H", y + 1, x + 1));
+    text
 }
 
 /// Window dimensions under which every pane could take its renderer's size:
@@ -1938,4 +2016,268 @@ fn needed_window_size(cell: &LayoutCell, panes: &HashMap<String, VirtualPane>) -
         }
     }
     (width, height)
+}
+
+#[derive(Default)]
+struct WindowSnapshot {
+    windows: HashMap<String, WindowState>,
+    active_window: Option<String>,
+    active_pane: Option<String>,
+}
+
+/// `window_name` is last because it may contain spaces. Empty flags still
+/// occupy their field; tmux replaces control characters in format output.
+fn parse_window_snapshot(lines: Vec<String>) -> WindowSnapshot {
+    let mut snapshot = WindowSnapshot::default();
+    for line in lines {
+        let mut fields = line.splitn(8, ' ');
+        let parsed = (|| {
+            let id = fields.next()?;
+            id.strip_prefix('@')?.parse::<u32>().ok()?;
+            let index = fields.next()?.parse::<u32>().ok()?;
+            let active = match fields.next()? {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let (layout, _) = super::control::parse_layout(fields.next()?)?;
+            let visible_layout = super::control::parse_layout(fields.next()?)
+                .map(|(cell, _)| cell)
+                .unwrap_or_else(|| layout.clone());
+            let flags = fields.next()?;
+            let pane = fields.next()?;
+            pane.strip_prefix('%')?.parse::<u32>().ok()?;
+            let name = fields.next().unwrap_or_default();
+            Some((
+                id.to_string(),
+                WindowState {
+                    name: name.to_string(),
+                    index,
+                    layout: Some(layout),
+                    visible_layout: Some(visible_layout),
+                    zoomed: flags.contains('Z'),
+                },
+                active,
+                pane.to_string(),
+            ))
+        })();
+        if let Some((id, window, active, pane)) = parsed {
+            if active {
+                snapshot.active_window = Some(id.clone());
+                snapshot.active_pane = Some(pane);
+            }
+            snapshot.windows.insert(id, window);
+        }
+    }
+    snapshot
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    fn pane(output: Arc<SessionOutputCoalescer>) -> VirtualPane {
+        VirtualPane {
+            session_id: "test-pane".to_string(),
+            output,
+            decoder: TerminalOutputDecoder::new("utf-8"),
+            forwarder: tokio::spawn(async {}),
+            pending_output: VecDeque::new(),
+            pending_bytes: 0,
+            seeded: false,
+            capture_at: None,
+            last_attach: None,
+            seeding: false,
+            reseed: false,
+            pending_seed: None,
+            desired: None,
+            pending_dims: None,
+            dims: None,
+            seeded_desired: None,
+            resize_attempts: None,
+            capture: OutputCaptureProcessor::new(),
+            cwd: Arc::default(),
+            routed_bytes: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_replays_continuous_plain_output_and_new_extended_output() {
+        let received = Arc::new(Mutex::new(String::new()));
+        let sink = received.clone();
+        let output = SessionOutputCoalescer::with_sink(move |payload| {
+            sink.lock().unwrap().push_str(&payload.data);
+        });
+        let mut pane = pane(output);
+        let capture_at = Instant::now();
+        pane.capture_at = Some(capture_at);
+        pane.output.push("snapshot\r\n");
+        pane.pending_output.push_back((
+            capture_at.checked_sub(Duration::from_millis(1)),
+            b"already captured".to_vec(),
+        ));
+        pane.pending_output
+            .push_back((Some(capture_at), b"also captured".to_vec()));
+        let mut expected = String::from("snapshot\r\n");
+        // Output keeps arriving between capture-pane and its cursor reply.
+        // Split UTF-8 across notifications to also check decoder continuity.
+        for i in 0..1000 {
+            let line = format!("row-{i}: 猫\r\n");
+            expected.push_str(&line);
+            let split = line.find('猫').unwrap() + 1;
+            pane.pending_output
+                .push_back((None, line.as_bytes()[..split].to_vec()));
+            pane.pending_output
+                .push_back((None, line.as_bytes()[split..].to_vec()));
+        }
+        pane.pending_output.push_back((
+            Some(capture_at + Duration::from_millis(1)),
+            b"after capture\r\n".to_vec(),
+        ));
+        expected.push_str("after capture\r\n");
+        pane.pending_bytes = pane.pending_output.iter().map(|(_, data)| data.len()).sum();
+
+        pane.seeded = true;
+        pane.replay_pending_output();
+        pane.output.close();
+
+        assert_eq!(*received.lock().unwrap(), expected);
+        assert!(pane.seeded);
+        assert!(pane.pending_output.is_empty());
+        assert_eq!(pane.pending_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn pending_replay_preserves_failed_seed_retry() {
+        let received = Arc::new(Mutex::new(String::new()));
+        let sink = received.clone();
+        let output = SessionOutputCoalescer::with_sink(move |payload| {
+            sink.lock().unwrap().push_str(&payload.data);
+        });
+        let mut pane = pane(output);
+        pane.pending_output.push_back((None, b"live".to_vec()));
+        pane.pending_bytes = 4;
+
+        pane.replay_pending_output();
+        pane.output.close();
+
+        assert_eq!(*received.lock().unwrap(), "live");
+        assert!(
+            !pane.seeded,
+            "failed captures must remain eligible for retry"
+        );
+        assert_eq!(pane.pending_bytes, 0);
+    }
+
+    #[test]
+    fn output_without_a_timestamp_or_snapshot_is_never_discarded() {
+        let at = Instant::now();
+        assert!(!output_precedes_capture(None, Some(at)));
+        assert!(!output_precedes_capture(Some(at), None));
+        assert!(!output_precedes_capture(None, None));
+    }
+
+    #[test]
+    fn unknown_output_caps_oversized_chunks_in_empty_and_populated_queues() {
+        let cap = PENDING_PANE_OUTPUT_MAX_BYTES;
+        let at = Some(Instant::now());
+        for prefilled in [false, true] {
+            let mut pending = VecDeque::new();
+            let mut total = 0;
+            if prefilled {
+                buffer_unknown_output(&mut pending, &mut total, None, b"old".to_vec());
+            }
+            let mut data = vec![b'x'; cap + 17];
+            data[..17].fill(b'd');
+            data[cap..].fill(b'z');
+            let expected = data[17..].to_vec();
+            buffer_unknown_output(&mut pending, &mut total, at, data);
+            assert_eq!(total, cap);
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0], (at, expected));
+            assert!(pending[0].1.capacity() <= cap);
+        }
+    }
+
+    #[test]
+    fn unknown_output_evicts_oldest_chunks_and_keeps_exact_limit() {
+        let cap = PENDING_PANE_OUTPUT_MAX_BYTES;
+        let mut pending = VecDeque::new();
+        let mut total = 0;
+        buffer_unknown_output(&mut pending, &mut total, None, vec![b'a'; cap / 2]);
+        buffer_unknown_output(&mut pending, &mut total, None, vec![b'b'; cap / 2]);
+        assert_eq!(total, cap);
+        assert_eq!(pending.len(), 2);
+        buffer_unknown_output(&mut pending, &mut total, None, b"tail".to_vec());
+        assert_eq!(total, cap / 2 + 4);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].1, vec![b'b'; cap / 2]);
+        assert_eq!(pending[1].1, b"tail");
+        assert_eq!(
+            total,
+            pending.iter().map(|(_, data)| data.len()).sum::<usize>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    fn row(id: u32, index: u32, active: bool, name: &str) -> String {
+        format!(
+            "@{id} {index} {} b25f,80x24,0,0,{id} b25f,80x24,0,0,{id}  %{id} {name}",
+            u8::from(active)
+        )
+    }
+
+    #[test]
+    fn snapshots_follow_swap_move_close_and_remote_active_pane() {
+        let first = parse_window_snapshot(vec![
+            row(1, 0, true, "shell"),
+            row(2, 1, false, "server logs"),
+        ]);
+        assert_eq!(first.active_window.as_deref(), Some("@1"));
+        assert_eq!(first.active_pane.as_deref(), Some("%1"));
+        assert_eq!(first.windows["@2"].name, "server logs");
+        let swapped = parse_window_snapshot(vec![
+            row(1, 1, false, "shell"),
+            row(2, 0, true, "server logs"),
+        ]);
+        assert_eq!(swapped.windows["@1"].index, 1);
+        assert_eq!(swapped.windows["@2"].index, 0);
+        assert_eq!(swapped.active_pane.as_deref(), Some("%2"));
+        let moved_and_closed = parse_window_snapshot(vec![row(2, 9, true, "server logs")]);
+        assert_eq!(moved_and_closed.windows.len(), 1);
+        assert!(!moved_and_closed.windows.contains_key("@1"));
+        assert_eq!(moved_and_closed.windows["@2"].index, 9);
+        let empty = parse_window_snapshot(Vec::new());
+        assert!(empty.windows.is_empty());
+        assert!(empty.active_window.is_none());
+    }
+
+    #[test]
+    fn seed_payload_trims_trailing_blank_screen_rows_so_hidden_xterm_does_not_scroll_prompt() {
+        // 29-row tmux capture: row 0 empty, row 1 has the prompt, rows 2..28 empty.
+        let mut lines = vec![String::new(), "root@dev ~ » ".to_string()];
+        lines.resize(29, String::new());
+        let mut decoder = TerminalOutputDecoder::new("utf-8");
+        let payload = compose_seed_payload(&lines, 13, 1, 0, Some(29), &mut decoder);
+        assert_eq!(payload, "\x1b[H\x1b[2J\x1b[3J\r\nroot@dev ~ » \x1b[2;14H");
+    }
+
+    #[test]
+    fn seed_payload_scrolls_history_by_at_most_screen_rows() {
+        let mut lines: Vec<String> = (0..50).map(|i| format!("hist-{i}")).collect();
+        lines.push("prompt$ ".to_string());
+        lines.resize(50 + 24, String::new());
+        let mut decoder = TerminalOutputDecoder::new("utf-8");
+        let payload = compose_seed_payload(&lines, 8, 0, 50, Some(24), &mut decoder);
+        assert!(payload.contains(&format!(
+            "\x1b[r\x1b[9999B{}\x1b[Hprompt$ \x1b[1;9H",
+            "\n".repeat(24)
+        )));
+    }
 }

@@ -40,6 +40,7 @@ import {
   isPagerSingleKeyInput,
 } from "@/lib/commandSuggestionSuppression";
 import { detectCredentialPromptKind } from "@/lib/credentialAutofill";
+import { getErrorMessage } from "@/lib/errors";
 import { invoke } from "@/lib/invoke";
 import { hexLuminance } from "@/lib/keywordHighlightPresets";
 import { logger } from "@/lib/logger";
@@ -101,6 +102,10 @@ import {
   TerminalResizeDeduper,
 } from "./terminalFitScheduler";
 import { installTerminalImageAddon } from "./terminalImageAddon";
+import {
+  getTerminalImagePreviewBackend,
+  openTerminalImagePreview,
+} from "./terminalImagePreview";
 import { stampTerminalWrittenLines } from "./terminalLineTimestamps";
 import {
   getSelectedInputRange,
@@ -110,6 +115,7 @@ import {
   readRecentOutput,
 } from "./terminalInputSelection";
 import { createTerminalLinkHandlers } from "./terminalLinkHandlers";
+import { createTerminalHistoryRecovery } from "./terminalHistoryRecovery";
 import type { TerminalOutputDrain } from "./terminalOutputDrain";
 import { AlternateScreenStateTracker } from "./alternateScreenStateTracker";
 import type { Dec2026FrameGate } from "./dec2026FrameGate";
@@ -183,6 +189,7 @@ export default function XTerminal({
   active,
   appLocked,
   visible = true,
+  suspendHibernation = false,
   sessionType,
   connectionId,
   temporaryConfig,
@@ -197,6 +204,7 @@ export default function XTerminal({
 }: XTerminalProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
+  const lastDimensionsRef = useRef<{ cols: number; rows: number } | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const fitSchedulerRef = useRef<TerminalFitScheduler | null>(null);
   const resizeDeduperRef = useRef(new TerminalResizeDeduper());
@@ -302,6 +310,7 @@ export default function XTerminal({
   const lineTimestampsRef = useRef<Map<number, number>>(new Map());
   const gutterLineOffsetRef = useRef(0);
   const sessionTypeRef = useRef(sessionType);
+  const sessionNameRef = useRef(sessionName);
   const connectionIdRef = useRef(connectionId);
   const temporaryConfigRef = useRef(temporaryConfig);
   const onReconnectedRef = useRef(onReconnected);
@@ -310,6 +319,7 @@ export default function XTerminal({
   const sessionIdRef = useRef(sessionId);
   const syncPeerSessionIdsRef = useRef(syncPeerSessionIds);
   const visibleRef = useRef(visible);
+  const suspendHibernationRef = useRef(suspendHibernation);
   const activeRef = useRef(active);
   const performanceModeRef = useRef<PerformanceMode>("normal");
   const alternateScreenTrackerRef = useRef(new AlternateScreenStateTracker());
@@ -440,6 +450,10 @@ export default function XTerminal({
   }, [sessionType]);
 
   useEffect(() => {
+    sessionNameRef.current = sessionName;
+  }, [sessionName]);
+
+  useEffect(() => {
     connectionIdRef.current = connectionId;
   }, [connectionId]);
 
@@ -498,6 +512,15 @@ export default function XTerminal({
     }
     handleVisibilityChangeRef.current?.();
   }, [requestWake, visible]);
+
+  useEffect(() => {
+    suspendHibernationRef.current = suspendHibernation;
+    if (suspendHibernation) {
+      clearHibernateTimer();
+    } else {
+      handleVisibilityChangeRef.current?.();
+    }
+  }, [clearHibernateTimer, suspendHibernation]);
 
   useEffect(() => {
     if (!hibernated) return;
@@ -858,6 +881,12 @@ export default function XTerminal({
     preservedReconnectContentRef.current = null;
 
     const terminal = new Terminal({
+      ...(lastDimensionsRef.current
+        ? {
+            cols: lastDimensionsRef.current.cols,
+            rows: lastDimensionsRef.current.rows,
+          }
+        : {}),
       scrollback: terminalSettings.scrollback_lines,
       cursorBlink: appearance.cursor_blink,
       cursorStyle: appearance.cursor_style as "block" | "underline" | "bar",
@@ -888,8 +917,39 @@ export default function XTerminal({
     const {
       oscLinkHandler,
       webLinksAddon,
+      imagePathLinkProvider,
       removePopup: removeLinkPopup,
-    } = createTerminalLinkHandlers(terminal, tRef);
+    } = createTerminalLinkHandlers(terminal, tRef, {
+      isEnabled: () =>
+        getTerminalImagePreviewBackend(sessionTypeRef.current) !== null,
+      getMatchOptions: () => ({
+        windowsPaths: sessionTypeRef.current === "Local" && isWindows,
+      }),
+      open: (path) => {
+        const sessionType = sessionTypeRef.current;
+        const label = sessionNameRef.current?.trim();
+        openTerminalImagePreview({
+          sessionId,
+          sessionType,
+          path,
+          target:
+            sessionType === "SSH" && label
+              ? { kind: "remote", label }
+              : undefined,
+        }).catch((error: unknown) => {
+          logger.error({
+            domain: "ui.error",
+            event: "terminal.image_preview_failed",
+            message: "Failed to preview terminal image path",
+            ids: { session_id: sessionId },
+            error,
+          });
+          toast.error(
+            getErrorMessage(error) || tRef.current("filePreview.openFailed"),
+          );
+        });
+      },
+    });
     const searchAddon = new SearchAddon({
       highlightLimit: TERMINAL_SEARCH_VISIBLE_MATCH_LIMIT,
     }) as SearchAddonWithLifecycle;
@@ -939,6 +999,9 @@ export default function XTerminal({
     terminal.options.linkHandler = oscLinkHandler;
     terminal.loadAddon(fitAddon);
     terminal.loadAddon(webLinksAddon);
+    const imagePathLinkDisposable = terminal.registerLinkProvider(
+      imagePathLinkProvider,
+    );
     terminal.loadAddon(searchAddon);
     terminal.loadAddon(serializeAddon);
     terminal.loadAddon(unicodeGraphemesAddon);
@@ -1812,7 +1875,15 @@ export default function XTerminal({
       },
     );
 
+    const historyRecovery = createTerminalHistoryRecovery(
+      terminal,
+      () =>
+        (outputDrainRef.current?.getPendingBytes() ?? 0) > 0 ||
+        (frameGateRef.current?.getHeldBytes() ?? 0) > 0,
+    );
     const writeParsedDisposable = terminal.onWriteParsed(() => {
+      const recovered = historyRecovery.onWriteParsed(inputStateRef.current);
+      if (recovered) inputStateRef.current = recovered;
       alternateScreenTrackerRef.current.setXtermBufferType(
         terminal.buffer.active.type,
       );
@@ -1882,7 +1953,9 @@ export default function XTerminal({
       lineTimestampsRef.current = new Map();
       gutterLineOffsetRef.current = 0;
       clearTerminalAll(terminal, {
-        shellRedraw: sessionTypeRef.current !== "Local" || !isWindows,
+        shellRedraw:
+          sessionTypeRef.current !== "Serial" &&
+          (sessionTypeRef.current !== "Local" || !isWindows),
       });
       focusTerminal();
       requestGutterRefresh();
@@ -1920,6 +1993,12 @@ export default function XTerminal({
 
     const handleFitComplete = (result: TerminalFitResult) => {
       if (!isTerminalAlive()) return;
+      if (terminal.cols > 0 && terminal.rows > 0) {
+        lastDimensionsRef.current = {
+          cols: terminal.cols,
+          rows: terminal.rows,
+        };
+      }
       sendBackendResize(terminal.cols, terminal.rows, result.reason);
       refreshGutter();
       snapshotRestoreController.completeAfterFinalFit();
@@ -2189,6 +2268,7 @@ export default function XTerminal({
         terminal,
         outputDrain,
         visibleRef,
+        suspendHibernationRef,
         sessionTypeRef,
         aiCapturingRef,
         zmodemActiveRef,
@@ -2225,7 +2305,10 @@ export default function XTerminal({
         repaintVisibleTerminal,
       });
 
-    handleVisibilityChangeRef.current = applyVisibilityPolicy;
+    handleVisibilityChangeRef.current = () => {
+      fitScheduler.notifyVisible();
+      applyVisibilityPolicy();
+    };
     applyVisibilityPolicy();
 
     const sessionEvents = createXTerminalSessionEvents({
@@ -2440,13 +2523,19 @@ export default function XTerminal({
         }
       }
 
+      const inputState = inputStateRef.current;
+      const isCompletionKey = data === "\t" || data === "\x1b[Z";
       if (
-        data !== "\t" &&
-        inputStateRef.current.desynced &&
-        inputStateRef.current.desyncReason === "tab"
+        inputState.desynced &&
+        !inputState.pasteMode &&
+        !inputState.multiline &&
+        terminal.buffer.active.type !== "alternate" &&
+        (isPlainTextInputData(data) || data === "\r") &&
+        inputState.desyncReason === "tab" &&
+        !isCompletionKey
       ) {
         const recovered = resyncFromTerminalLine(
-          inputStateRef.current,
+          inputState,
           readCurrentInputLine(terminal),
         );
         if (recovered) {
@@ -2520,7 +2609,7 @@ export default function XTerminal({
           command,
         );
       }
-      inputStateRef.current = applyTerminalInputData(
+      inputStateRef.current = historyRecovery.applyInput(
         inputStateRef.current,
         data,
       );
@@ -2557,6 +2646,9 @@ export default function XTerminal({
     });
 
     const resizeDisposable = terminal.onResize(({ cols, rows }) => {
+      if (cols > 0 && rows > 0) {
+        lastDimensionsRef.current = { cols, rows };
+      }
       sendBackendResize(cols, rows, "xterm.onResize");
       refreshGutter();
     });
@@ -2723,6 +2815,7 @@ export default function XTerminal({
       oscDisposable.dispose();
       remoteColorOscGuardDisposable.dispose();
       clipboardOscDisposable.dispose();
+      imagePathLinkDisposable.dispose();
       writeParsedDisposable.dispose();
       dataDisposable.dispose();
       binaryDisposable.dispose();
@@ -2775,6 +2868,12 @@ export default function XTerminal({
         Boolean(previousTextarea) &&
         document.activeElement === previousTextarea &&
         activeRef.current;
+      if (terminal.cols > 0 && terminal.rows > 0) {
+        lastDimensionsRef.current = {
+          cols: terminal.cols,
+          rows: terminal.rows,
+        };
+      }
       terminal.dispose();
       terminalRef.current = null;
       setTerminalInstance(null);
@@ -2845,8 +2944,8 @@ export default function XTerminal({
     visible,
     appLocked,
     terminalReady,
-    performanceMode,
     sessionId,
+    sessionType,
     showGutter,
     showContentPadding,
     workspacePaddingSetting: terminalSettings.show_workspace_padding,
@@ -2980,6 +3079,7 @@ export default function XTerminal({
       >
         <TerminalContextMenu
           sessionId={sessionId}
+          sessionType={sessionType}
           sessionName={sessionName}
           appLocked={appLocked}
           terminalRef={terminalRef}
