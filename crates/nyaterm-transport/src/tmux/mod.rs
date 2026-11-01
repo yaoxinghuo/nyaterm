@@ -22,3 +22,6 @@ pub use session::{TmuxStatePayload, TmuxWindowInfo};
 
 #[cfg(test)]
 mod test_peer;
+
+#[cfg(test)]
+mod integration_tests;
