@@ -18,6 +18,60 @@ pub(crate) enum InputSegment {
     Key(String),
 }
 
+/// Do not introduce a new split inside a complete key sequence merely because
+/// the input worker limits each turn. Incomplete user writes remain literal.
+pub(crate) fn batch_len(data: &[u8], limit: usize) -> usize {
+    let end = data.len().min(limit);
+    for index in end.saturating_sub(32)..end {
+        if data[index] == 0x1b
+            && let Some((_, len)) = key_at(&data[index..data.len().min(index + 32)])
+            && index + len > end
+        {
+            return index + len;
+        }
+    }
+    end
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::{InputParser, batch_len};
+
+    #[test]
+    fn worker_batching_preserves_complete_keys_across_the_byte_limit() {
+        for key in [b"\x1b[F".as_slice(), b"\x1b[1;5D", b"\x1bOP"] {
+            for offset in 0..key.len() {
+                let mut data = vec![b'x'; 256 - offset];
+                data.extend_from_slice(key);
+                data.extend_from_slice(b"tail");
+                let mut expected = InputParser::default().split_input(&data);
+                let take = batch_len(&data, 256);
+                let mut parser = InputParser::default();
+                let mut actual = parser.split_input(&data[..take]);
+                actual.extend(parser.split_input(&data[take..]));
+                // Batching may split adjacent literal runs; compare by
+                // translating them back to their semantic input spans.
+                fn merge(segments: &mut Vec<super::InputSegment>) {
+                    let mut joined = Vec::new();
+                    for segment in std::mem::take(segments) {
+                        match (joined.last_mut(), segment) {
+                            (
+                                Some(super::InputSegment::Literal(last)),
+                                super::InputSegment::Literal(next),
+                            ) => last.extend(next),
+                            (_, segment) => joined.push(segment),
+                        }
+                    }
+                    *segments = joined;
+                }
+                merge(&mut expected);
+                merge(&mut actual);
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+}
+
 /// Per-pane classification state, retained across input flushes.
 #[derive(Default)]
 pub(crate) struct InputParser {

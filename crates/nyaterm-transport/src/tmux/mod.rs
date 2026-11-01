@@ -11,6 +11,7 @@ pub(crate) mod control;
 pub(crate) mod detect;
 pub(crate) mod handshake;
 pub(crate) mod input;
+pub(crate) mod mailbox;
 pub(crate) mod session;
 
 pub(crate) use detect::{TmuxControlDetector, TmuxFeed};
@@ -18,3 +19,6 @@ pub(crate) use session::{ControlExit, run_control_session};
 
 pub use control::TmuxUiNode;
 pub use session::{TmuxStatePayload, TmuxWindowInfo};
+
+#[cfg(test)]
+mod test_peer;

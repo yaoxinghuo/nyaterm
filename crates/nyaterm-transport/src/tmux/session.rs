@@ -18,6 +18,7 @@
 
 use super::control::{BlockId, ControlMessage, ControlParser, LayoutCell, TmuxUiNode, parse_line};
 use super::input::{InputParser, InputSegment};
+use super::mailbox::{PendingCommand, Permit};
 use crate::session_event_queue::SessionEventQueue;
 use crate::session_types::{SessionEvent, SessionInfo, SessionKind};
 use crate::{
@@ -27,6 +28,7 @@ use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf, client};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, Sleep};
@@ -34,6 +36,25 @@ use tokio::time::{Duration, Sleep};
 /// Input is batched over this interval so `send-keys` stays cheap even for
 /// IME composition or paste bursts.
 const INPUT_FLUSH_DELAY_MS: u64 = 4;
+const MAX_PENDING_RESPONSES: usize = 128;
+const MAX_QUEUED_COMMANDS: usize = 1024;
+const COMMAND_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+// Worst case every input byte becomes a named-key command.
+const INPUT_BATCH_BYTES: usize = 256;
+
+type PendingSend = Pin<Box<dyn Future<Output = bool> + Send>>;
+
+#[derive(Default)]
+struct InputGuard {
+    _tmux: Option<Permit>,
+    _ssh: Option<ssh_mailbox::PendingWrite>,
+}
+
+struct Outgoing {
+    data: Vec<u8>,
+    responses: Vec<PendingKind>,
+    _guards: Vec<InputGuard>,
+}
 /// Max payload bytes per `send-keys` command line.
 const SEND_KEYS_CHUNK_BYTES: usize = 1024;
 /// Debounce for structural refreshes (`list-windows`/`list-panes`).
@@ -107,6 +128,8 @@ struct VirtualPane {
     /// `route_output` does not rescan the queue per chunk.
     pending_bytes: usize,
     seeded: bool,
+    seed_generation: u64,
+    seed_barrier: bool,
     /// When this pane's latest `capture-pane` snapshot was taken; output
     /// provably produced before it is already inside the seeded screen and
     /// must not be replayed (tmux defers notifications past `%end` blocks).
@@ -210,14 +233,17 @@ fn log_server_notice(session_id: &str, kind: &str, bytes: usize) {
 
 /// Why a response block was queued (FIFO correlation with `%begin`/`%end`).
 enum PendingKind {
+    FlowControl,
     WindowsRefresh,
     PanesRefresh,
     CapturePane {
         pane: String,
+        generation: u64,
     },
     /// Cursor position query issued after a pane's capture seed.
     SeedCursor {
         pane: String,
+        generation: u64,
     },
     /// `#{pane_current_path}` poll; a `cd` inside the pane emits no
     /// notification, so cwd is re-queried after each submitted command.
@@ -270,6 +296,8 @@ pub(crate) struct ControlSession<'a> {
     /// must be pushed for *every* line — internal queries push their kind so
     /// the response can be interpreted, everything else pushes `Ignore`.
     pending_responses: VecDeque<PendingKind>,
+    outgoing: VecDeque<Outgoing>,
+    fatal: bool,
 
     windows: HashMap<String, WindowState>,
     panes: HashMap<String, VirtualPane>,
@@ -279,7 +307,8 @@ pub(crate) struct ControlSession<'a> {
     active_pane: Option<String>,
 
     /// Buffered keystrokes per pane, flushed on a short timer.
-    input_buf: HashMap<String, Vec<u8>>,
+    input_buf: HashMap<String, VecDeque<u8>>,
+    input_guards: HashMap<String, Vec<InputGuard>>,
     /// Panes that have produced input; first write is logged for bring-up.
     seen_input: HashSet<String>,
     input_flush: Option<Pin<Box<Sleep>>>,
@@ -330,6 +359,8 @@ impl<'a> ControlSession<'a> {
             block_id: None,
             block_started_at: None,
             pending_responses: VecDeque::new(),
+            outgoing: VecDeque::new(),
+            fatal: false,
             windows: HashMap::new(),
             panes: HashMap::new(),
             pane_names: HashMap::new(),
@@ -337,6 +368,7 @@ impl<'a> ControlSession<'a> {
             active_window: None,
             active_pane: None,
             input_buf: HashMap::new(),
+            input_guards: HashMap::new(),
             seen_input: HashSet::new(),
             input_flush: None,
             paused_panes: HashSet::new(),
@@ -354,21 +386,54 @@ impl<'a> ControlSession<'a> {
         }
     }
 
-    /// Write one command line and register its expected response block.
+    /// Enqueue writes so SSH backpressure never prevents reading responses or
+    /// handling a local close. Correlation is registered when the send starts.
     async fn send_line(
         &mut self,
-        channel: &Arc<ChannelWriteHalf<client::Msg>>,
+        _channel: &Arc<ChannelWriteHalf<client::Msg>>,
         kind: PendingKind,
         line: &str,
     ) -> bool {
+        self.queue_batch(line, vec![kind])
+    }
+
+    fn queue_batch(&mut self, line: &str, responses: Vec<PendingKind>) -> bool {
+        if self.outgoing.len() >= MAX_QUEUED_COMMANDS {
+            // Structural notifications must not grow an unbounded deferred
+            // command queue either. Fail visibly instead of losing commands.
+            self.fatal = true;
+            return false;
+        }
         let mut data = line.as_bytes().to_vec();
         data.push(b'\n');
-        if channel.data_bytes(data).await.is_ok() {
-            self.pending_responses.push_back(kind);
-            true
-        } else {
-            false
+        self.outgoing.push_back(Outgoing {
+            data,
+            responses,
+            _guards: Vec::new(),
+        });
+        true
+    }
+
+    fn start_send(&mut self, channel: &Arc<ChannelWriteHalf<client::Msg>>) -> Option<PendingSend> {
+        while self.outgoing.front().is_some_and(|next| next.responses.iter().any(|kind| {
+            matches!(kind, PendingKind::CapturePane { pane, generation }
+                if self.panes.get(pane).is_none_or(|current| current.seed_generation != *generation))
+        })) { self.outgoing.pop_front(); }
+        let next = self.outgoing.front()?;
+        if self.pending_responses.len() + next.responses.len() > MAX_PENDING_RESPONSES {
+            return None;
         }
+        let outgoing = self.outgoing.pop_front().unwrap();
+        self.pending_responses.extend(outgoing.responses);
+        let channel = channel.clone();
+        Some(Box::pin(async move {
+            let _guards = outgoing._guards;
+            matches!(
+                tokio::time::timeout(COMMAND_WRITE_TIMEOUT, channel.data_bytes(outgoing.data))
+                    .await,
+                Ok(Ok(()))
+            )
+        }))
     }
 
     /// Queue an internal query whose block output should be parsed.
@@ -485,6 +550,8 @@ impl<'a> ControlSession<'a> {
                 pending_output,
                 pending_bytes,
                 seeded: false,
+                seed_generation: 0,
+                seed_barrier: false,
                 capture_at: None,
                 seeding: false,
                 reseed: false,
@@ -511,42 +578,55 @@ impl<'a> ControlSession<'a> {
         self.arm_cwd_query();
     }
 
-    async fn seed_pane(&mut self, channel: &Arc<ChannelWriteHalf<client::Msg>>, pane_id: &str) {
+    async fn seed_pane(&mut self, _channel: &Arc<ChannelWriteHalf<client::Msg>>, pane_id: &str) {
         let dims = self.pane_dims(pane_id);
-        if let Some(pane) = self.panes.get_mut(pane_id) {
-            if pane.seeding {
-                return;
-            }
-            pane.seeding = true;
-            pane.dims = dims;
-            pane.seeded_desired = pane.desired;
+        let Some(pane) = self.panes.get_mut(pane_id) else {
+            return;
+        };
+        if pane.seeding {
+            return;
         }
-        // `-e` keeps escape sequences, `-p` prints to stdout, `-S -` starts at
-        // the beginning of the pane's scrollback.
-        let command = format!("capture-pane -ep -S - -t '{pane_id}'");
-        self.send_query(
-            channel,
+        pane.seeding = true;
+        pane.seeded = false;
+        pane.pending_seed = None;
+        pane.dims = dims;
+        pane.seeded_desired = pane.desired;
+        let generation = pane.seed_generation;
+        pane.seed_barrier = self.paused_panes.contains(pane_id);
+        let mut responses = vec![
             PendingKind::CapturePane {
-                pane: pane_id.to_string(),
+                pane: pane_id.into(),
+                generation,
             },
-            &command,
-        )
-        .await;
-        // Ask for the live cursor so a sparse/fresh pane does not leave the
-        // terminal cursor parked at bottom-left after the seed. `cursor_y`
-        // is screen-relative while the capture text includes `history_size`
-        // scrollback lines on top, so the seed needs both to place the
-        // cursor at the matching row.
-        self.send_query(
-            channel,
             PendingKind::SeedCursor {
-                pane: pane_id.to_string(),
+                pane: pane_id.into(),
+                generation,
             },
-            &format!(
-                "display-message -p -t '{pane_id}' '#{{cursor_x}} #{{cursor_y}} #{{history_size}}'"
-            ),
-        )
-        .await;
+        ];
+        // Synchronous commands in one tmux command queue: no pane reads may
+        // occur between the screen/cursor capture and resetting the paused
+        // output offset. This is a protocol boundary, not a network-age guess.
+        let mut command = format!(
+            "capture-pane -ep -S - -t '{pane_id}' ; display-message -p -t '{pane_id}' '#{{cursor_x}} #{{cursor_y}} #{{history_size}}'"
+        );
+        if self.paused_panes.remove(pane_id) {
+            command.push_str(&format!(" ; refresh-client -A '{pane_id}:continue'"));
+            responses.push(PendingKind::Ignore);
+        }
+        self.queue_batch(&command, responses);
+    }
+
+    fn invalidate_seed(&mut self, pane_id: &str) {
+        if let Some(pane) = self.panes.get_mut(pane_id) {
+            pane.seed_generation += 1;
+            pane.seeded = false;
+            pane.seeding = false;
+            pane.reseed = false;
+            pane.pending_seed = None;
+            pane.capture_at = None;
+            pane.pending_output.clear();
+            pane.pending_bytes = 0;
+        }
     }
 
     async fn drop_pane(&mut self, pane_id: &str) {
@@ -555,6 +635,7 @@ impl<'a> ControlSession<'a> {
         };
         SessionManager::remove_tmux_pane(self.sessions, self.event_queue, &pane.session_id);
         self.input_buf.remove(pane_id);
+        self.input_guards.remove(pane_id);
         self.paused_panes.remove(pane_id);
         self.unknown_output.remove(pane_id);
         self.pane_names.remove(pane_id);
@@ -1103,7 +1184,9 @@ impl<'a> ControlSession<'a> {
             ControlMessage::Pause { pane } => {
                 // Flow control kicks in only if we enabled `pause-after`;
                 // give the renderer a moment then let tmux continue.
-                self.paused_panes.insert(pane);
+                if self.paused_panes.insert(pane.clone()) {
+                    self.invalidate_seed(&pane);
+                }
                 if self.continue_deadline.is_none() {
                     self.continue_deadline = Some(Box::pin(tokio::time::sleep(
                         Duration::from_millis(PAUSE_CONTINUE_DELAY_MS),
@@ -1111,7 +1194,10 @@ impl<'a> ControlSession<'a> {
                 }
             }
             ControlMessage::Continue { pane } => {
-                self.paused_panes.remove(&pane);
+                // A user may resume a pane from another control client.
+                if self.paused_panes.remove(&pane) {
+                    self.seed_pane(channel, &pane).await;
+                }
             }
             ControlMessage::ConfigError { text } => {
                 log_server_notice(self.control_session_id, "config-error", text.len());
@@ -1207,6 +1293,14 @@ impl<'a> ControlSession<'a> {
         failed: bool,
     ) {
         match kind {
+            PendingKind::FlowControl => {
+                if failed {
+                    self.emit_visible_text(
+                        "\r\n[tmux] Control-mode flow control is unsupported; detaching.\r\n",
+                    );
+                    self.request_detach(channel, ExitMode::Detach).await;
+                }
+            }
             PendingKind::WindowsRefresh => {
                 if failed {
                     return;
@@ -1228,8 +1322,9 @@ impl<'a> ControlSession<'a> {
                 }
                 self.emit_state();
             }
-            PendingKind::CapturePane { pane } => {
+            PendingKind::CapturePane { pane, generation } => {
                 if let Some(virtual_pane) = self.panes.get_mut(&pane)
+                    && virtual_pane.seed_generation == generation
                     && !failed
                 {
                     // Held until the SeedCursor reply arrives: the seed is
@@ -1241,17 +1336,22 @@ impl<'a> ControlSession<'a> {
                     // %begin is guaranteed inside it; anything later may
                     // be genuinely new (tmux defers it past %end) and must
                     // be replayed rather than dropped.
-                    virtual_pane.capture_at = Some(
+                    virtual_pane.capture_at = (!virtual_pane.seed_barrier).then(|| {
                         self.block_started_at
-                            .unwrap_or_else(std::time::Instant::now),
-                    );
+                            .unwrap_or_else(std::time::Instant::now)
+                    });
                 }
             }
-            PendingKind::SeedCursor { pane } => {
+            PendingKind::SeedCursor { pane, generation } => {
                 let mut reseed = false;
-                if let Some(virtual_pane) = self.panes.get_mut(&pane) {
+                if let Some(virtual_pane) = self.panes.get_mut(&pane)
+                    && virtual_pane.seed_generation == generation
+                {
                     virtual_pane.seeding = false;
                     reseed = std::mem::take(&mut virtual_pane.reseed);
+                    if reseed {
+                        virtual_pane.pending_seed = None;
+                    }
                     if !reseed {
                         let cursor = (!failed).then(|| lines.first()).flatten().and_then(|line| {
                             let mut parts = line.split_whitespace();
@@ -1335,9 +1435,17 @@ impl<'a> ControlSession<'a> {
     }
 
     async fn flush_input(&mut self, channel: &Arc<ChannelWriteHalf<client::Msg>>) {
-        let panes: Vec<String> = self.input_buf.keys().cloned().collect();
+        let panes: Vec<String> = self.input_buf.keys().take(1).cloned().collect();
         for pane_id in panes {
-            let data = self.input_buf.remove(&pane_id).unwrap_or_default();
+            let buffer = self.input_buf.get_mut(&pane_id).unwrap();
+            let take = super::input::batch_len(buffer.make_contiguous(), INPUT_BATCH_BYTES);
+            let data: Vec<u8> = buffer.drain(..take).collect();
+            let guards = if buffer.is_empty() {
+                self.input_buf.remove(&pane_id);
+                self.input_guards.remove(&pane_id).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             if data.is_empty() {
                 continue;
             }
@@ -1372,8 +1480,15 @@ impl<'a> ControlSession<'a> {
                     }
                 }
             }
+            if let Some(last) = self.outgoing.back_mut() {
+                last._guards.extend(guards);
+            }
         }
-        self.input_flush = None;
+        self.input_flush = (!self.input_buf.is_empty()).then(|| {
+            Box::pin(tokio::time::sleep(Duration::from_millis(
+                INPUT_FLUSH_DELAY_MS,
+            )))
+        });
     }
 
     fn arm_cwd_query(&mut self) {
@@ -1387,16 +1502,11 @@ impl<'a> ControlSession<'a> {
     async fn flush_cwd_queries(&mut self, channel: &Arc<ChannelWriteHalf<client::Msg>>) {
         self.cwd_deadline = None;
         let panes: Vec<String> = self.cwd_pending.drain().collect();
-        for pane_id in panes {
-            if !self.panes.contains_key(&pane_id) {
-                continue;
-            }
+        for pane in panes {
             self.send_query(
                 channel,
-                PendingKind::PaneCwd {
-                    pane: pane_id.clone(),
-                },
-                &format!("display-message -p -t '{pane_id}' '#{{pane_current_path}}'"),
+                PendingKind::PaneCwd { pane: pane.clone() },
+                &format!("display-message -p -t '{pane}' '#{{pane_current_path}}'"),
             )
             .await;
         }
@@ -1405,21 +1515,22 @@ impl<'a> ControlSession<'a> {
     async fn continue_paused(&mut self, channel: &Arc<ChannelWriteHalf<client::Msg>>) {
         let panes: Vec<String> = self.paused_panes.iter().cloned().collect();
         for pane in panes {
-            self.send_line(
-                channel,
-                PendingKind::Ignore,
-                &format!("refresh-client -A '{pane}:continue'"),
-            )
-            .await;
+            self.seed_pane(channel, &pane).await;
         }
-        self.paused_panes.clear();
         self.continue_deadline = None;
     }
 
     /// Input routed to a pane — either from its own virtual session
     /// (`TmuxPaneInput`) or from the bare host session id, which users and
     /// tools resolve to the pane they are looking at.
-    fn buffer_pane_input(&mut self, pane_id: &str, data: &[u8]) {
+    fn buffer_pane_input(&mut self, pane_id: &str, data: &[u8], guard: InputGuard) {
+        if !self.panes.contains_key(pane_id) || data.is_empty() {
+            return;
+        }
+        self.input_guards
+            .entry(pane_id.into())
+            .or_default()
+            .push(guard);
         if !data.is_empty() && self.seen_input.insert(pane_id.to_string()) {
             tracing::info!(
                 session_id = %self.control_session_id,
@@ -1431,7 +1542,7 @@ impl<'a> ControlSession<'a> {
         self.input_buf
             .entry(pane_id.to_string())
             .or_default()
-            .extend_from_slice(data);
+            .extend(data.iter().copied());
         if self.input_flush.is_none() {
             self.input_flush = Some(Box::pin(tokio::time::sleep(Duration::from_millis(
                 INPUT_FLUSH_DELAY_MS,
@@ -1492,6 +1603,9 @@ impl<'a> ControlSession<'a> {
             return;
         }
         self.exit_mode = Some(mode);
+        self.outgoing.clear();
+        self.input_buf.clear();
+        self.input_guards.clear();
         let _ = self
             .send_line(channel, PendingKind::Ignore, "detach-client")
             .await;
@@ -1525,6 +1639,7 @@ pub(crate) async fn run_control_session(
     tmux_tx: TmuxCommandSender,
     initial: &[u8],
 ) -> ControlExit {
+    tmux_cmd_rx.resume();
     let mut session = ControlSession::new(event_queue, session_id, sessions, tmux_tx);
 
     tracing::info!(
@@ -1537,7 +1652,7 @@ pub(crate) async fn run_control_session(
     session
         .send_line(
             channel,
-            PendingKind::Ignore,
+            PendingKind::FlowControl,
             "refresh-client -f pause-after=2",
         )
         .await;
@@ -1556,7 +1671,15 @@ pub(crate) async fn run_control_session(
         }
     }
 
+    let control = tmux_cmd_rx.control_receiver();
+    let mut pending_send: Option<PendingSend> = None;
     let exit = loop {
+        if session.fatal {
+            break ControlExit::Closed;
+        }
+        if pending_send.is_none() {
+            pending_send = session.start_send(channel);
+        }
         if session.exit_seen {
             let leftover = session.parser.take_pending();
             break match session.exit_mode {
@@ -1567,6 +1690,23 @@ pub(crate) async fn run_control_session(
 
         tokio::select! {
             biased;
+
+            command = control.recv() => {
+                match command {
+                    SshCommand::TmuxDetach => session.request_detach(channel, ExitMode::Detach).await,
+                    SshCommand::TmuxPaneClose { pane } => {
+                        session.send_line(channel, PendingKind::Ignore, &format!("kill-pane -t '{pane}'")).await;
+                        session.drop_pane(&pane).await;
+                        session.emit_state();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            result = async { pending_send.as_mut().unwrap().await }, if pending_send.is_some() => {
+                pending_send = None;
+                if !result { break ControlExit::Closed; }
+            }
 
             () = async {
                 if let Some(deadline) = session.detach_deadline.as_mut() {
@@ -1585,7 +1725,7 @@ pub(crate) async fn run_control_session(
                 if let Some(deadline) = session.input_flush.as_mut() {
                     deadline.as_mut().await;
                 }
-            }, if session.input_flush.is_some() => {
+            }, if session.input_flush.is_some() && session.outgoing.len() < MAX_QUEUED_COMMANDS / 2 && session.exit_mode.is_none() => {
                 session.flush_input(channel).await;
             }
 
@@ -1660,21 +1800,25 @@ pub(crate) async fn run_control_session(
                 session.flush_cwd_queries(channel).await;
             }
 
-            command = tmux_cmd_rx.recv() => {
-                match command {
+            command = tmux_cmd_rx.recv(), if session.outgoing.len() < MAX_QUEUED_COMMANDS / 2 && session.exit_mode.is_none() => {
+                let Some(PendingCommand { command, permit }) = command else { break ControlExit::Closed; };
+                match Some(command) {
                     Some(SshCommand::TmuxCommand { line }) => {
                         let clean = line.trim_matches(['\r', '\n']);
                         if !clean.is_empty() {
                             session
                                 .send_line(channel, PendingKind::UserCommand, clean)
                                 .await;
+                            if let Some(last) = session.outgoing.back_mut() {
+                                last._guards.push(InputGuard { _tmux: Some(permit), _ssh: None });
+                            }
                         }
                     }
                     Some(SshCommand::TmuxDetach) => {
                         session.request_detach(channel, ExitMode::Detach).await;
                     }
                     Some(SshCommand::TmuxPaneInput { pane, data }) => {
-                        session.buffer_pane_input(&pane, &data);
+                        session.buffer_pane_input(&pane, &data, InputGuard { _tmux: Some(permit), _ssh: None });
                     }
                     Some(SshCommand::TmuxPaneResize {
                         pane,
@@ -1711,14 +1855,15 @@ pub(crate) async fn run_control_session(
                 }
             }
 
-            command = host_rx.recv() => {
+            command = host_rx.recv(), if session.exit_mode.is_none() => {
                 match command {
                     Some(SshCommand::Write(write)) => {
                         // The control channel itself has no pty — input aimed
                         // at the bare session id means the pane the user is
                         // looking at. Forward to the active pane.
                         if let Some(pane_id) = session.active_pane.clone() {
-                            session.buffer_pane_input(&pane_id, &write.bytes);
+                            let data = write.bytes.clone();
+                            session.buffer_pane_input(&pane_id, &data, InputGuard { _tmux: None, _ssh: Some(write) });
                         }
                     }
                     Some(SshCommand::Resize { cols, rows, .. }) => {
@@ -1757,7 +1902,9 @@ pub(crate) async fn run_control_session(
         }
     };
 
+    drop(pending_send);
     session.teardown().await;
+    tmux_cmd_rx.discard_pending();
     exit
 }
 
@@ -1887,6 +2034,122 @@ fn parse_window_snapshot(lines: Vec<String>) -> WindowSnapshot {
 }
 
 #[cfg(test)]
+mod recovery_tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use super::{ControlSession, PendingKind};
+    use crate::session_event_queue::SessionEventQueue;
+    use crate::tmux::mailbox;
+    use crate::tmux::test_peer::connect;
+
+    #[tokio::test]
+    async fn pause_invalidates_inflight_seed_and_old_responses_cannot_paint() {
+        let connection = connect().await;
+        let queue = SessionEventQueue::new();
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mailbox::channel();
+        let mut session = ControlSession::new(&queue, "host", &sessions, tx);
+        session.spawn_pane("%0").await;
+        session.seed_pane(&connection.tx, "%0").await;
+        session
+            .handle_message(&connection.tx, "%pause %0".into())
+            .await;
+        session
+            .handle_message(&connection.tx, "%pause %0".into())
+            .await;
+        assert_eq!(
+            session.panes["%0"].seed_generation, 1,
+            "duplicate pause is coalesced"
+        );
+        session.continue_paused(&connection.tx).await;
+        session
+            .handle_block(
+                &connection.tx,
+                PendingKind::CapturePane {
+                    pane: "%0".into(),
+                    generation: 0,
+                },
+                vec!["obsolete".into()],
+                false,
+            )
+            .await;
+        session
+            .handle_block(
+                &connection.tx,
+                PendingKind::SeedCursor {
+                    pane: "%0".into(),
+                    generation: 0,
+                },
+                vec!["0 0 0".into()],
+                false,
+            )
+            .await;
+        assert!(!session.panes["%0"].seeded);
+        assert!(session.panes["%0"].pending_seed.is_none());
+        session
+            .handle_block(
+                &connection.tx,
+                PendingKind::CapturePane {
+                    pane: "%0".into(),
+                    generation: 1,
+                },
+                vec!["fresh".into()],
+                false,
+            )
+            .await;
+        session
+            .handle_block(
+                &connection.tx,
+                PendingKind::SeedCursor {
+                    pane: "%0".into(),
+                    generation: 1,
+                },
+                vec!["5 0 0".into()],
+                false,
+            )
+            .await;
+        assert!(session.panes["%0"].seeded);
+        let data: Vec<u8> = queue
+            .drain(100)
+            .events
+            .into_iter()
+            .filter_map(|event| match event {
+                crate::SessionEvent::Output { data, .. } => Some(data),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let text = String::from_utf8(data).unwrap();
+        assert!(text.contains("fresh"));
+        assert!(!text.contains("obsolete"));
+        assert!(
+            session.panes["%0"].capture_at.is_none(),
+            "the paused snapshot uses a protocol barrier"
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_close_cancels_paused_recovery_and_obsolete_outgoing_seeds() {
+        let connection = connect().await;
+        let queue = SessionEventQueue::new();
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mailbox::channel();
+        let mut session = ControlSession::new(&queue, "host", &sessions, tx);
+        session.spawn_pane("%0").await;
+        session.seed_pane(&connection.tx, "%0").await;
+        session
+            .handle_message(&connection.tx, "%pause %0".into())
+            .await;
+        session.drop_pane("%0").await;
+        session.continue_paused(&connection.tx).await;
+        assert!(session.start_send(&connection.tx).is_none());
+        assert!(session.paused_panes.is_empty());
+        assert!(sessions.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
 mod output_tests {
     use super::{
         InputParser, PENDING_PANE_OUTPUT_MAX_BYTES, VirtualPane, buffer_unknown_output,
@@ -1902,6 +2165,8 @@ mod output_tests {
             pending_output: VecDeque::new(),
             pending_bytes: 0,
             seeded: false,
+            seed_generation: 0,
+            seed_barrier: false,
             capture_at: None,
             seeding: false,
             reseed: false,

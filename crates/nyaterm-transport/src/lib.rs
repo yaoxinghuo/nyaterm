@@ -992,8 +992,8 @@ enum SshCommand {
 /// One channel carrying every tmux control-mode command — UI commands,
 /// detach, and projected-pane input/resize/close — so the FIFO that pairs
 /// `%begin`/`%end` responses stays strictly ordered.
-type TmuxCommandSender = tokio::sync::mpsc::UnboundedSender<SshCommand>;
-type TmuxCommandReceiver = tokio::sync::mpsc::UnboundedReceiver<SshCommand>;
+type TmuxCommandSender = tmux::mailbox::Sender;
+type TmuxCommandReceiver = tmux::mailbox::Receiver;
 
 struct OpenSshShellSession {
     handle: SshShellHandle,
@@ -1082,6 +1082,9 @@ impl SessionManager {
             .ok_or_else(|| SessionError::Worker(std::io::Error::other("reaper unavailable")))?
             .try_submit_with(|| {
                 let mut session = sessions.remove(session_id)?;
+                if let ManagedSession::Ssh(ssh) = &session {
+                    cancel_tmux_pane_output(&self.event_queue, &sessions, &ssh.tmux_tx);
+                }
                 // Clear pending input before waiting behind other cleanup jobs.
                 // Native cancellation and joins remain on the reaper worker.
                 match &session {
@@ -1504,7 +1507,7 @@ impl SessionManager {
             }
         })?;
         let (command_tx, command_rx) = ssh_mailbox::channel();
-        let (tmux_tx, tmux_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<SshCommand>();
+        let (tmux_tx, tmux_cmd_rx) = tmux::mailbox::channel();
         let tmux_active = Arc::new(AtomicBool::new(false));
         let worker_tmux_active = tmux_active.clone();
         // The control session builds pane transports sharing this sender so
@@ -1713,7 +1716,7 @@ impl SessionManager {
             Some(ManagedSession::Tcp(s)) => s.writer.command_tx.peak_bytes(),
             Some(ManagedSession::Serial(s)) => s.writer.command_tx.peak_bytes(),
             Some(ManagedSession::Ssh(s)) => s.command_tx.peak_bytes(),
-            Some(ManagedSession::TmuxPane(_)) => 0,
+            Some(ManagedSession::TmuxPane(pane)) => pane.tmux_tx.peak_bytes(),
             None => 0,
         }
     }
@@ -1882,12 +1885,17 @@ impl SessionManager {
     }
 
     pub fn close(&self, session_id: &str) -> Result<(), SessionError> {
-        let mut session = self
+        let mut sessions = self
             .sessions
             .lock()
-            .map_err(|_| SessionError::LockPoisoned)?
+            .map_err(|_| SessionError::LockPoisoned)?;
+        let mut session = sessions
             .remove(session_id)
             .ok_or_else(|| SessionError::NotFound(session_id.to_string()))?;
+        if let ManagedSession::Ssh(ssh) = &session {
+            cancel_tmux_pane_output(&self.event_queue, &sessions, &ssh.tmux_tx);
+        }
+        drop(sessions);
         if let ManagedSession::Local(local) = &mut session {
             local.cleanup_consumer = self.event_queue.consumer_for(session_id);
         }
@@ -1921,9 +1929,9 @@ impl SessionManager {
             .send(SshCommand::TmuxCommand {
                 line: line.to_string(),
             })
-            .map_err(|_| SessionError::Write {
+            .map_err(|source| SessionError::Write {
                 session_id: session_id.into(),
-                source: anyhow::anyhow!("tmux control channel closed"),
+                source: source.into(),
             })
     }
 
@@ -1949,9 +1957,9 @@ impl SessionManager {
         session
             .tmux_tx
             .send(SshCommand::TmuxDetach)
-            .map_err(|_| SessionError::Write {
+            .map_err(|source| SessionError::Write {
                 session_id: session_id.into(),
-                source: anyhow::anyhow!("tmux control channel closed"),
+                source: source.into(),
             })
     }
 
@@ -2303,6 +2311,23 @@ impl TerminalTransport for SshChannelTransport {
     }
 }
 
+/// A host worker may be parked publishing a virtual pane's output. Cancel its
+/// projections before joining it; cancelling only the host's queue cannot wake
+/// that producer. Identify ownership by the shared mailbox, not an id prefix.
+fn cancel_tmux_pane_output(
+    queue: &SessionEventQueue,
+    sessions: &HashMap<String, ManagedSession>,
+    sender: &TmuxCommandSender,
+) {
+    for (id, session) in sessions {
+        if let ManagedSession::TmuxPane(pane) = session
+            && pane.tmux_tx.same_channel(sender)
+        {
+            queue.cancel_session(id);
+        }
+    }
+}
+
 fn tmux_modem_unsupported() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -2315,12 +2340,7 @@ impl TerminalTransport for TmuxPaneTransport {
         if data.is_empty() {
             return Ok(());
         }
-        self.tmux_tx
-            .send(SshCommand::TmuxPaneInput {
-                pane: self.pane.clone(),
-                data: data.to_vec(),
-            })
-            .map_err(|_| anyhow::anyhow!("tmux control channel closed for pane {}", self.pane))
+        self.tmux_tx.write(&self.pane, data).map_err(Into::into)
     }
 
     fn write_raw(&mut self, _data: &[u8]) -> anyhow::Result<()> {
