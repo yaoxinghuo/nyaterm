@@ -3236,15 +3236,6 @@ async fn run_open_ssh_shell_session(
                     }
                     let output = shell_integration.filter_output(&display);
                     pending_output = Some(ssh_output_future(event_queue.clone(), session_id.clone(), output));
-                    if was_armed {
-                        // The remote `tmux -CC` client still owns the tty and
-                        // parses stdin as command lines (its raw tty also eats
-                        // ETX), so the reliable abort is a `detach-client`
-                        // command — the client exits and the shell's prompt
-                        // comes straight through.
-                        let _ = channel.data_bytes(b"detach-client\n".to_vec()).await;
-                        tmux_detector.expect_abort_reply();
-                    }
                 }
             }
             () = async {
@@ -3259,11 +3250,6 @@ async fn run_open_ssh_shell_session(
                 if tmux_detector.expire_silence() {
                     let output = shell_integration.filter_output(&tmux_unsupported_hint());
                     pending_output = Some(ssh_output_future(event_queue.clone(), session_id.clone(), output));
-                    // Same recovery as the expired-candidate path: the remote
-                    // client's stdin is the control protocol, so `detach-client`
-                    // — not ETX — is what gets the shell's prompt back.
-                    let _ = channel.data_bytes(b"detach-client\n".to_vec()).await;
-                    tmux_detector.expect_abort_reply();
                 }
             }
             command = command_rx.recv() => {
@@ -3319,14 +3305,21 @@ async fn run_open_ssh_shell_session(
                                 // writing its script into the control stream;
                                 // cancel it before the takeover.
                                 cancel_pending_upload(&mut pending_upload).await;
-                                if let Some(send) = pending_send.take() {
-                                    let _ = send.await;
+                                let settled = tokio::time::timeout(tmux::handshake::CONFIRM_TIMEOUT, async {
+                                    if let Some(send) = pending_send.take() { send.await?; }
+                                    if let Some(resize) = pending_resize.take() { resize.await?; }
+                                    Ok::<(), russh::Error>(())
+                                }).await;
+                                if !matches!(settled, Ok(Ok(()))) {
+                                    event_queue.push_async(SessionEvent::Exited {
+                                        session_id: session_id.clone(),
+                                        reason: "SSH input did not settle before tmux takeover; reconnect to restore the terminal".into(),
+                                    }).await;
+                                    break;
                                 }
-                                if let Some(resize) = pending_resize.take() {
-                                    let _ = resize.await;
-                                }
+                                tmux_active.store(true, Ordering::Release);
                                 match tmux::handshake::verify(&channel, &mut channel_rx, &startup, &rest).await {
-                                    Ok(initial) => {
+                                    tmux::handshake::Verification::Confirmed(initial) => {
                                         tracing::info!(
                                             session_id = %session_id,
                                             "tmux control mode confirmed; taking over SSH channel"
@@ -3393,17 +3386,22 @@ async fn run_open_ssh_shell_session(
                                             }
                                         }
                                     }
-                                    Err(raw) => {
-                                        // The probe did not confirm a control
-                                        // channel: replay every buffered byte
-                                        // so the shell keeps a complete stream.
-                                        tracing::warn!(
-                                            session_id = %session_id,
-                                            bytes = raw.len(),
-                                            "tmux control-mode probe failed; replaying buffered output"
-                                        );
-                                        let output = shell_integration.filter_output(&raw);
+                                    tmux::handshake::Verification::Exited(leftover) => {
+                                        tmux_active.store(false, Ordering::Release);
+                                        let output = shell_integration.filter_output(&leftover);
                                         ssh_output_future(event_queue.clone(), session_id.clone(), output).await;
+                                        tmux_detector = tmux::TmuxControlDetector::new();
+                                    }
+                                    tmux::handshake::Verification::Failed(reason) => {
+                                        // Without nonce confirmation neither shell nor tmux
+                                        // commands are safe. Close only this terminal channel.
+                                        tracing::warn!(session_id = %session_id, ?reason,
+                                            "tmux verification failed; closing terminal channel");
+                                        event_queue.push_async(SessionEvent::Exited {
+                                            session_id: session_id.clone(),
+                                            reason: format!("tmux control-mode verification failed ({reason:?}); reconnect to restore the terminal"),
+                                        }).await;
+                                        break;
                                     }
                                 }
                                 continue;
@@ -3493,15 +3491,12 @@ async fn run_open_ssh_shell_session(
     .await;
 }
 
-/// Advisory for a submitted `tmux -CC` whose control handshake never
-/// confirmed: the remote tmux is typically too old to speak the protocol
-/// (pre-2.x versions lack `%session-changed`/`%layout-change`). The remote
-/// `tmux -CC` process keeps owning the tty, so the caller follows the hint
-/// with a `detach-client` command that detaches it and hands the prompt back.
+/// An advisory is not evidence that the remote process accepts control commands.
+/// Never send a speculative detach/interrupt into a potentially ordinary shell.
 fn tmux_unsupported_hint() -> Vec<u8> {
     let stamp = tmux_local_stamp();
     format!(
-        "\x1b[2m[{stamp}] [nyaterm] tmux control mode could not be confirmed; the remote tmux is probably too old (this integration requires tmux 2.x+). Aborting the command.\x1b[0m\r\n"
+        "\x1b[2m[{stamp}] [nyaterm] tmux control mode could not be confirmed; no recovery command was sent because the remote protocol is unknown. Reconnect if terminal input is unavailable.\x1b[0m\r\n"
     )
     .into_bytes()
 }

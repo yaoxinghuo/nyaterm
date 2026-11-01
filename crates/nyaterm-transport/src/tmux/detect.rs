@@ -30,11 +30,6 @@ const MAX_INPUT_LINE_BYTES: usize = 4096;
 /// working so a merely slow attach can still take over later.
 const SILENT_HINT_DELAY: Duration = Duration::from_secs(10);
 
-/// How long `%`-protocol lines are swallowed after aborting an unsupported
-/// `tmux -CC`: long enough for the `detach-client` reply, short enough that
-/// delayed real output is only briefly buffered.
-const ABORT_REPLY_GRACE: Duration = Duration::from_secs(5);
-
 /// Commands whose following tokens are still "command position": prefix
 /// wrappers (`sudo nice tmux -CC`) and environment assignments
 /// (`FOO=1 tmux -CC` — handled via the `=` token rule).
@@ -272,14 +267,6 @@ pub(crate) struct TmuxControlDetector {
     /// One-shot guard so the "no control output" advisory is emitted
     /// at most once per armed `tmux -CC` submission.
     silence_hint_sent: bool,
-    /// After we abort an unsupported `tmux -CC` with a `detach-client`
-    /// command, the client's protocol reply (`%begin`/`%end` block, then
-    /// `%exit`) would print as literal noise. While this deadline is live,
-    /// `%`-prefixed lines are swallowed; anything else ends the swallow so
-    /// no real output is ever hidden.
-    abort_buf: Vec<u8>,
-    abort_deadline: Option<Instant>,
-    abort_line_start: bool,
 }
 
 impl TmuxControlDetector {
@@ -300,21 +287,11 @@ impl TmuxControlDetector {
             saw_shell_output: false,
             input_saw_escape: false,
             silence_hint_sent: false,
-            abort_buf: Vec::new(),
-            abort_deadline: None,
-            abort_line_start: true,
         }
     }
 
-    /// Arm the swallow window for the `detach-client` reply we are about to
-    /// write to an unsupported control client.
-    pub(crate) fn expect_abort_reply(&mut self) {
-        self.abort_deadline = Some(Instant::now() + ABORT_REPLY_GRACE);
-        self.abort_line_start = true;
-    }
-
     /// Whether an expiring candidate counts as a `tmux -CC` attempt worth
-    /// aborting. A candidate can only exist because an armed submission
+    /// reporting. A candidate can only exist because an armed submission
     /// produced bytes matching the `%begin `/DCS startup prefix — the
     /// prefix gate already rejected everything else — so its presence is
     /// itself the evidence; checking `is_armed()` alone races the shorter
@@ -335,8 +312,8 @@ impl TmuxControlDetector {
     /// accepts `-CC` yet never emits confirmable framing, so neither the
     /// candidate path nor the startup probe ever engages and the screen just
     /// freezes. Blind-armed submits count too — a history-recalled
-    /// `tmux -CC` is exactly what users retry with, and a stray
-    /// `detach-client` written to a non-tmux command is harmless.
+    /// `tmux -CC` is exactly what users retry with. This only permits an
+    /// advisory: silence never establishes the remote protocol.
     pub(crate) fn silence_deadline(&self) -> Option<Instant> {
         if self.done || self.candidate.is_some() || self.silence_hint_sent || self.saw_shell_output
         {
@@ -536,26 +513,14 @@ impl TmuxControlDetector {
     }
 
     pub(crate) fn deadline(&self) -> Option<Instant> {
-        match (self.candidate_deadline, self.abort_deadline) {
-            (Some(candidate), Some(abort)) => Some(candidate.min(abort)),
-            (candidate, abort) => candidate.or(abort),
-        }
+        self.candidate_deadline
     }
 
     /// Called by the SSH select loop even if the peer sends no more bytes.
     pub(crate) fn expire_candidate(&mut self) -> Vec<u8> {
         self.armed_at = None;
         self.blind_arm_at = None;
-        let mut out = Vec::new();
-        if self
-            .abort_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            out.append(&mut self.abort_buf);
-            self.abort_deadline = None;
-        }
-        out.extend(self.take_candidate());
-        out
+        self.take_candidate()
     }
 
     fn take_candidate(&mut self) -> Vec<u8> {
@@ -579,43 +544,6 @@ impl TmuxControlDetector {
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
             out.extend(self.expire_candidate());
-        }
-        if self.abort_deadline.is_some() {
-            if self
-                .abort_deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-            {
-                out.append(&mut self.abort_buf);
-                self.abort_deadline = None;
-            } else {
-                for &byte in data {
-                    if self.abort_line_start && byte == b'%' {
-                        self.abort_line_start = false;
-                        self.abort_buf.push(byte);
-                        continue;
-                    }
-                    self.abort_line_start = byte == b'\n';
-                    if !self.abort_buf.is_empty() {
-                        // Inside a withheld `%` line: swallow it whole, and
-                        // end the swallow once `%exit` confirms the client
-                        // is gone.
-                        self.abort_buf.push(byte);
-                        if byte == b'\n' {
-                            if self.abort_buf.starts_with(b"%exit") {
-                                self.abort_deadline = None;
-                            }
-                            self.abort_buf.clear();
-                            self.abort_line_start = true;
-                        } else if self.abort_buf.len() > CONFIRM_MAX_BYTES {
-                            out.append(&mut self.abort_buf);
-                            self.abort_deadline = None;
-                        }
-                        continue;
-                    }
-                    out.push(byte);
-                }
-                return TmuxFeed::Passthrough(out);
-            }
         }
         if !self.is_armed() {
             if self.candidate.is_some() {
@@ -774,9 +702,7 @@ impl TmuxControlDetector {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ABORT_REPLY_GRACE, BLIND_ARM_WINDOW, TmuxControlDetector, TmuxFeed, is_tmux_control_command,
-    };
+    use super::{BLIND_ARM_WINDOW, TmuxControlDetector, TmuxFeed, is_tmux_control_command};
     const STARTUP: &[u8] = b"%begin 1 2 0\r\n%end 1 2 0\r\n%window-add @0\r\n%sessions-changed\r\n%session-changed $0 0\r\n";
 
     #[test]
@@ -1206,50 +1132,5 @@ mod tests {
         assert_eq!(bytes, b"\x1b[?1049h\x1b[2J");
         tokio::time::sleep(BLIND_ARM_WINDOW + std::time::Duration::from_millis(50)).await;
         assert!(!detector.expiry_is_attempt());
-    }
-
-    #[test]
-    fn abort_reply_lines_are_swallowed_until_exit() {
-        // The `detach-client` reply is pure protocol noise: `%begin`/`%end`
-        // block lines and `%exit` must not render, while the prompt that
-        // follows passes through byte for byte.
-        let mut detector = TmuxControlDetector::new();
-        detector.expect_abort_reply();
-        let feed = detector.feed(b"%begin 1 2\n%end 1 2\n%exit\nroot@web ~ \xc2\xbb ");
-        let TmuxFeed::Passthrough(bytes) = feed else {
-            panic!("expected passthrough");
-        };
-        assert_eq!(bytes, b"root@web ~ \xc2\xbb ");
-    }
-
-    #[test]
-    fn abort_swallow_passes_unrelated_output_without_exit() {
-        // A non-`%` line before the reply ends nothing by itself: real
-        // output renders immediately and later protocol lines still get
-        // eaten inside the grace window.
-        let mut detector = TmuxControlDetector::new();
-        detector.expect_abort_reply();
-        let feed = detector.feed(b"shell noise\n%begin 1 2\n%end 1 2\nmore output\n");
-        let TmuxFeed::Passthrough(bytes) = feed else {
-            panic!("expected passthrough");
-        };
-        assert_eq!(bytes, b"shell noise\nmore output\n");
-        // The grace window is still open and its deadline is exposed.
-        assert!(detector.deadline().is_some());
-    }
-
-    #[tokio::test]
-    async fn abort_reply_grace_flush_releases_buffered_percent_line() {
-        // An incomplete `%` line at the grace deadline is flushed verbatim
-        // rather than held forever.
-        let mut detector = TmuxControlDetector::new();
-        detector.expect_abort_reply();
-        let feed = detector.feed(b"%begi");
-        assert!(matches!(feed, TmuxFeed::Passthrough(ref b) if b.is_empty()));
-        tokio::time::sleep(ABORT_REPLY_GRACE + std::time::Duration::from_millis(50)).await;
-        let TmuxFeed::Passthrough(bytes) = detector.feed(b"") else {
-            panic!("expected passthrough");
-        };
-        assert_eq!(bytes, b"%begi");
     }
 }

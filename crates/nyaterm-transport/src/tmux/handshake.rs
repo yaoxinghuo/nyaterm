@@ -53,6 +53,24 @@ enum Progress {
     Pending,
     Confirmed(Vec<u8>),
     Rejected,
+    Exited(Vec<u8>),
+    LimitExceeded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Failure {
+    Rejected,
+    LimitExceeded,
+    Timeout,
+    WriteFailed,
+    ChannelClosed,
+    ExitStatus(u32),
+}
+
+pub(crate) enum Verification {
+    Confirmed(Vec<u8>),
+    Exited(Vec<u8>),
+    Failed(Failure),
 }
 
 struct Probe {
@@ -76,10 +94,10 @@ impl Probe {
     }
 
     fn feed(&mut self, data: &[u8]) -> Progress {
-        self.raw.extend_from_slice(data);
-        if self.raw.len() > CONFIRM_MAX_BYTES {
-            return Progress::Rejected;
+        if data.len() > CONFIRM_MAX_BYTES.saturating_sub(self.raw.len()) {
+            return Progress::LimitExceeded;
         }
+        self.raw.extend_from_slice(data);
         while let Some(offset) = self.raw[self.consumed..].iter().position(|b| *b == b'\n') {
             let end = self.consumed + offset;
             let bytes = &self.raw[self.consumed..end];
@@ -101,11 +119,12 @@ impl Probe {
                     }
                     return Progress::Rejected;
                 }
-                Some(
-                    ControlMessage::Begin(_)
-                    | ControlMessage::Error(_)
-                    | ControlMessage::Exit { .. },
-                ) => return Progress::Rejected,
+                Some(ControlMessage::Exit { .. }) => {
+                    return Progress::Exited(self.raw[self.consumed..].to_vec());
+                }
+                Some(ControlMessage::Begin(_) | ControlMessage::Error(_)) => {
+                    return Progress::Rejected;
+                }
                 _ if self.block.is_some() => {
                     let (_, matched, count) = self.block.as_mut().unwrap();
                     *matched = line == self.token;
@@ -120,39 +139,55 @@ impl Probe {
     }
 }
 
-/// On failure return every received byte, including the passive startup.
-/// The timeout covers both writing the probe and waiting for its response.
+/// A rejected or timed-out probe does not establish that the peer is a shell.
+/// The caller must close that channel rather than inject recovery commands or
+/// resume user input. Only an explicit protocol exit permits shell handback.
 pub(crate) async fn verify(
     channel: &Arc<ChannelWriteHalf<client::Msg>>,
     channel_rx: &mut ChannelReadHalf,
     startup: &[u8],
     initial: &[u8],
-) -> Result<Vec<u8>, Vec<u8>> {
+) -> Verification {
     let mut probe = Probe::new(startup);
-    if probe.feed(initial) == Progress::Rejected {
-        return Err(probe.raw);
+    match probe.feed(initial) {
+        Progress::Pending => {}
+        Progress::Confirmed(rest) => return Verification::Confirmed(rest),
+        Progress::Exited(rest) => return Verification::Exited(rest),
+        Progress::Rejected => return Verification::Failed(Failure::Rejected),
+        Progress::LimitExceeded => return Verification::Failed(Failure::LimitExceeded),
     }
     let result = tokio::time::timeout(CONFIRM_TIMEOUT, async {
         let command = format!("{}\n", probe.command);
-        channel.data_bytes(command.into_bytes()).await.ok()?;
+        if channel.data_bytes(command.into_bytes()).await.is_err() {
+            return Verification::Failed(Failure::WriteFailed);
+        }
         loop {
             match channel_rx.wait().await {
                 Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
                     match probe.feed(&data) {
                         Progress::Pending => {}
-                        Progress::Confirmed(rest) => return Some(rest),
-                        Progress::Rejected => return None,
+                        Progress::Confirmed(rest) => return Verification::Confirmed(rest),
+                        Progress::Exited(rest) => return Verification::Exited(rest),
+                        Progress::Rejected => return Verification::Failed(Failure::Rejected),
+                        Progress::LimitExceeded => {
+                            return Verification::Failed(Failure::LimitExceeded);
+                        }
                     }
                 }
-                None | Some(ChannelMsg::Eof | ChannelMsg::Close) => return None,
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    return Verification::Failed(Failure::ExitStatus(exit_status));
+                }
+                None | Some(ChannelMsg::Eof | ChannelMsg::Close) => {
+                    return Verification::Failed(Failure::ChannelClosed);
+                }
                 _ => {}
             }
         }
     })
     .await;
     match result {
-        Ok(Some(rest)) => Ok(rest),
-        _ => Err(probe.raw),
+        Ok(outcome) => outcome,
+        Err(_) => Verification::Failed(Failure::Timeout),
     }
 }
 
@@ -173,7 +208,7 @@ mod tests {
             match probe.feed(&data) {
                 Progress::Pending => {}
                 Progress::Confirmed(rest) => return Some(rest),
-                Progress::Rejected => return None,
+                Progress::Rejected | Progress::LimitExceeded | Progress::Exited(_) => return None,
             }
         }
         None
@@ -219,7 +254,7 @@ mod tests {
         assert_eq!(probe.feed(echo.as_bytes()), Progress::Pending);
         assert_eq!(
             probe.feed(&vec![b'x'; CONFIRM_MAX_BYTES]),
-            Progress::Rejected
+            Progress::LimitExceeded
         );
     }
 
