@@ -490,10 +490,12 @@ impl TmuxControlDetector {
                 b'\'' if !double => single = !single,
                 b'"' if !single => double = !double,
                 b'\\' if !single => i += 1,
-                _ if !single && !double && bytes[i..].starts_with(b"tmux") => {
-                    if is_tmux_control_command(&text[i..]) {
-                        return true;
-                    }
+                _ if !single
+                    && !double
+                    && bytes[i..].starts_with(b"tmux")
+                    && is_tmux_control_command(&text[i..]) =>
+                {
+                    return true;
                 }
                 _ => {}
             }
