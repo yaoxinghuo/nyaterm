@@ -3349,6 +3349,9 @@ async fn run_open_ssh_shell_session(
                                 startup,
                                 rest,
                             } => {
+                                // Disable binary transfers before any awaited
+                                // output flush, upload cancellation or input drain.
+                                tmux_active.store(true, Ordering::Release);
                                 // The confirmed startup frame and everything
                                 // after it belong to the control channel, not
                                 // the terminal. Bytes before it (the echoed
@@ -3373,7 +3376,6 @@ async fn run_open_ssh_shell_session(
                                     }).await;
                                     break;
                                 }
-                                tmux_active.store(true, Ordering::Release);
                                 match tmux::handshake::verify(&channel, &mut channel_rx, &startup, &rest).await {
                                     tmux::handshake::Verification::Confirmed(initial) => {
                                         tracing::info!(
