@@ -243,11 +243,11 @@ impl NyaTermApp {
             // Focus may still sit on a pane whose transport is gone; hand it
             // back to the host shell. Deferred — activation reads surface
             // entities and this handler runs inside an app update.
-            if self
-                .session
-                .active_id()
-                .is_some_and(|active| self.tmux.pane_for_session(active).is_some())
-            {
+            if self.session.active_id().is_some_and(|active| {
+                self.tmux
+                    .pane_for_session(active)
+                    .is_some_and(|(host, _)| host == session_id)
+            }) {
                 let host_id = session_id.clone();
                 let app = cx.entity();
                 cx.defer(move |cx| {
@@ -900,3 +900,6 @@ fn tmux_strip_icon_button(
         )
         .on_click(click)
 }
+
+#[cfg(test)]
+mod tests;
