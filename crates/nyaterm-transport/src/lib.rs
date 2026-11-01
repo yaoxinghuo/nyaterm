@@ -3113,10 +3113,52 @@ async fn run_open_ssh_shell_session(
             }, if tmux_detector.deadline().is_some() => {
                 // The candidate line outlived its confirm window without a
                 // decision: release the withheld bytes into the shell stream.
+                let was_armed = tmux_detector.expiry_is_attempt();
                 let bytes = tmux_detector.expire_candidate();
                 if !bytes.is_empty() {
-                    let output = shell_integration.filter_output(&bytes);
+                    // The candidate expired while a `tmux -CC` submission was
+                    // still armed — control-ish bytes arrived but the handshake
+                    // never confirmed. Old tmux speaks a partial protocol and
+                    // leaves its client owning the tty; say how to get out.
+                    // Replay and hint go out as one write so the hint cannot
+                    // cancel the in-flight replay.
+                    let mut display = bytes;
+                    if was_armed {
+                        if !display.ends_with(b"\n") {
+                            display.extend_from_slice(b"\r\n");
+                        }
+                        display.extend_from_slice(&tmux_unsupported_hint());
+                    }
+                    let output = shell_integration.filter_output(&display);
                     pending_output = Some(ssh_output_future(event_queue.clone(), session_id.clone(), output));
+                    if was_armed {
+                        // The remote `tmux -CC` client still owns the tty and
+                        // parses stdin as command lines (its raw tty also eats
+                        // ETX), so the reliable abort is a `detach-client`
+                        // command — the client exits and the shell's prompt
+                        // comes straight through.
+                        let _ = channel.data_bytes(b"detach-client\n".to_vec()).await;
+                        tmux_detector.expect_abort_reply();
+                    }
+                }
+            }
+            () = async {
+                if let Some(deadline) = tmux_detector.silence_deadline() {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }, if tmux_detector.silence_deadline().is_some() => {
+                // A submitted `tmux -CC` produced no channel output at all —
+                // typically a pre-2.x tmux that cannot speak the protocol.
+                // Advisory only: detection stays armed so a slow attach can
+                // still take over afterwards.
+                if tmux_detector.expire_silence() {
+                    let output = shell_integration.filter_output(&tmux_unsupported_hint());
+                    pending_output = Some(ssh_output_future(event_queue.clone(), session_id.clone(), output));
+                    // Same recovery as the expired-candidate path: the remote
+                    // client's stdin is the control protocol, so `detach-client`
+                    // — not ETX — is what gets the shell's prompt back.
+                    let _ = channel.data_bytes(b"detach-client\n".to_vec()).await;
+                    tmux_detector.expect_abort_reply();
                 }
             }
             command = command_rx.recv() => {
@@ -3191,7 +3233,7 @@ async fn run_open_ssh_shell_session(
                                         // channel went while panes took over.
                                         let stamp = tmux_local_stamp();
                                         let banner = format!(
-                                            "\r\n\x1b[2m[{stamp}] [nyaterm] tmux control mode\x1b[0m\r\n"
+                                            "\x1b[2m[{stamp}] [nyaterm] tmux control mode\x1b[0m\r\n"
                                         );
                                         let output = shell_integration.filter_output(banner.as_bytes());
                                         ssh_output_future(event_queue.clone(), session_id.clone(), output).await;
@@ -3216,7 +3258,7 @@ async fn run_open_ssh_shell_session(
                                                 // line ahead of the prompt.
                                                 let stamp = tmux_local_stamp();
                                                 let banner = format!(
-                                                    "\r\n\x1b[2m[{stamp}] [nyaterm] tmux detached; back to shell\x1b[0m\r\n"
+                                                    "\x1b[2m[{stamp}] [nyaterm] tmux detached; back to shell\x1b[0m\r\n"
                                                 );
                                                 let output = shell_integration.filter_output(banner.as_bytes());
                                                 ssh_output_future(event_queue.clone(), session_id.clone(), output).await;
@@ -3344,6 +3386,19 @@ async fn run_open_ssh_shell_session(
         x11_multiplex_registration,
     )
     .await;
+}
+
+/// Advisory for a submitted `tmux -CC` whose control handshake never
+/// confirmed: the remote tmux is typically too old to speak the protocol
+/// (pre-2.x versions lack `%session-changed`/`%layout-change`). The remote
+/// `tmux -CC` process keeps owning the tty, so the caller follows the hint
+/// with a `detach-client` command that detaches it and hands the prompt back.
+fn tmux_unsupported_hint() -> Vec<u8> {
+    let stamp = tmux_local_stamp();
+    format!(
+        "\x1b[2m[{stamp}] [nyaterm] tmux control mode could not be confirmed; the remote tmux is probably too old (this integration requires tmux 2.x+). Aborting the command.\x1b[0m\r\n"
+    )
+    .into_bytes()
 }
 
 /// `[YYYY-MM-DD HH:MM:SS]` in local time for the tmux takeover/detach banners.
