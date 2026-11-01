@@ -58,8 +58,15 @@ fn tmux_host_close_releases_full_pane_output_without_cancelling_other_hosts() {
         ] {
             let mut pane_info = info.clone();
             pane_info.id = id.into();
-            SessionManager::register_tmux_pane(&manager.sessions, pane_info, "%0".into(), sender)
-                .unwrap();
+            SessionManager::register_tmux_pane(
+                &manager.sessions,
+                &manager.event_queue,
+                "host",
+                pane_info,
+                "%0".into(),
+                sender,
+            )
+            .unwrap();
         }
         manager.event_queue.push(SessionEvent::Output {
             session_id: "projection".into(),
@@ -113,6 +120,28 @@ fn tmux_host_close_releases_full_pane_output_without_cancelling_other_hosts() {
         worker_done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(manager.event_queue.session_cancelled("projection"));
         assert!(!manager.event_queue.session_cancelled("host:unrelated"));
+        let (late_info, late_tx) = {
+            let sessions = manager.sessions.lock().unwrap();
+            let crate::ManagedSession::TmuxPane(pane) = &sessions["projection"] else {
+                unreachable!()
+            };
+            (pane.info.clone(), pane.tmux_tx.clone())
+        };
+        assert!(matches!(
+            SessionManager::register_tmux_pane(
+                &manager.sessions,
+                &manager.event_queue,
+                "host",
+                late_info,
+                "%0".into(),
+                late_tx,
+            ),
+            Err(SessionError::NotFound(_))
+        ));
+        assert!(
+            manager.event_queue.session_cancelled("projection"),
+            "a late layout must not reopen the cancelled output queue"
+        );
     }
 }
 

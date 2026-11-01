@@ -513,6 +513,8 @@ impl<'a> ControlSession<'a> {
         // drive write/resize/close through the ordered tmux channel.
         if let Err(error) = SessionManager::register_tmux_pane(
             self.sessions,
+            self.event_queue,
+            self.control_session_id,
             info,
             pane_id.to_string(),
             self.tmux_tx.clone(),
@@ -525,13 +527,6 @@ impl<'a> ControlSession<'a> {
             );
             return;
         }
-        // The virtual session id is reused every time this pane re-enters
-        // the tracked layout (window switch, detach/reattach, transient
-        // layout drops). An earlier `remove_tmux_pane` may have cancelled
-        // the queue entry — without lifting that, `accepts` silently
-        // refuses every push and the pane renders forever blank.
-        self.event_queue.resume_session(&session_id);
-
         let pane_key = pane_id.to_string();
 
         // Output that arrived before the pane was mapped is replayed after

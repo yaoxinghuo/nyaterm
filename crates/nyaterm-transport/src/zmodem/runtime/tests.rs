@@ -294,7 +294,15 @@ fn tmux_modem_capability_and_every_raw_writer_reject_before_sending() {
     };
     active.store(true, Ordering::Release);
     info.id = "pane".into();
-    SessionManager::register_tmux_pane(&manager.sessions, info, "%0".into(), tx).unwrap();
+    SessionManager::register_tmux_pane(
+        &manager.sessions,
+        &manager.event_queue,
+        "test",
+        info,
+        "%0".into(),
+        tx,
+    )
+    .unwrap();
     for session in ["test", "pane"] {
         assert!(!manager.supports_modem_transfer(session));
         for error in [

@@ -1083,6 +1083,7 @@ impl SessionManager {
             .try_submit_with(|| {
                 let mut session = sessions.remove(session_id)?;
                 if let ManagedSession::Ssh(ssh) = &session {
+                    self.event_queue.cancel_session(session_id);
                     cancel_tmux_pane_output(&self.event_queue, &sessions, &ssh.tmux_tx);
                 }
                 // Clear pending input before waiting behind other cleanup jobs.
@@ -1893,6 +1894,7 @@ impl SessionManager {
             .remove(session_id)
             .ok_or_else(|| SessionError::NotFound(session_id.to_string()))?;
         if let ManagedSession::Ssh(ssh) = &session {
+            self.event_queue.cancel_session(session_id);
             cancel_tmux_pane_output(&self.event_queue, &sessions, &ssh.tmux_tx);
         }
         drop(sessions);
@@ -1967,11 +1969,20 @@ impl SessionManager {
     /// `resize` and `close` route through the control channel.
     pub(crate) fn register_tmux_pane(
         sessions: &Arc<Mutex<HashMap<String, ManagedSession>>>,
+        event_queue: &SessionEventQueue,
+        host_id: &str,
         info: SessionInfo,
         pane: String,
         tmux_tx: TmuxCommandSender,
     ) -> Result<(), SessionError> {
         let mut sessions = sessions.lock().map_err(|_| SessionError::LockPoisoned)?;
+        // Host cancellation, pane registration and reopening its output must
+        // share the registry lock. Otherwise a late layout response could
+        // reopen a cancelled pane queue while close is joining its producer.
+        if event_queue.session_cancelled(host_id) {
+            return Err(SessionError::NotFound(host_id.into()));
+        }
+        event_queue.resume_session(&info.id);
         sessions.insert(
             info.id.clone(),
             ManagedSession::TmuxPane(TmuxPaneTransport {
