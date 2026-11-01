@@ -3230,7 +3230,20 @@ async fn run_open_ssh_shell_session(
                                                 }
                                                 tmux_detector = tmux::TmuxControlDetector::new();
                                             }
-                                            tmux::ControlExit::Closed => break,
+                                            tmux::ControlExit::Closed => {
+                                                // The control channel died on
+                                                // its own (idle drop, network
+                                                // loss, server close). Mirror
+                                                // the plain-SSH EOF path so the
+                                                // session renders disconnected
+                                                // instead of swallowing input
+                                                // into a dead channel.
+                                                event_queue.push_async(SessionEvent::Exited {
+                                                    session_id: session_id.clone(),
+                                                    reason: "tmux control channel closed".to_string(),
+                                                }).await;
+                                                break;
+                                            }
                                         }
                                     }
                                     Err(raw) => {
