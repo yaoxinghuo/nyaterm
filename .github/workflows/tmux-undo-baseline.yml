@@ -47,7 +47,11 @@ jobs:
             grep -F 'right: "abc"' "$RUNNER_TEMP/tmux-undo-$label.log"
           done
       - name: Verify platform shortcut fix on the same runner
-        run: >-
-          cargo test -p nyaterm-desktop --lib
-          quick_command_editor_literal_toggle_preserves_the_editor_selection_and_undo_in_both_surfaces
-          --locked
+        run: |
+          # The initial checkout predates both worktree builds. Cargo may
+          # reuse their newer same-package artifacts in the shared target.
+          touch crates/nyaterm-transport/src/lib.rs
+          touch crates/nyaterm-desktop/src/features/panels/quick_commands_panel/panel/tests.rs
+          cargo test -p nyaterm-desktop --lib \
+            quick_command_editor_literal_toggle_preserves_the_editor_selection_and_undo_in_both_surfaces \
+            --locked
