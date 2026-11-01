@@ -3209,6 +3209,47 @@ fn command_send_preferences_load_legacy_defaults_and_preserve_unknown_settings()
 }
 
 #[test]
+fn mac_matcher_loads_legacy_defaults_and_round_trips_without_losing_unknown_options() {
+    let dir = unique_temp_dir("mac-matcher-settings");
+    let store = ConnectionStore::open(&dir).unwrap();
+    for terminal in [
+        serde_json::json!({}),
+        serde_json::json!({"action_links_matchers": {"ipv4": false, "archive": false, "host_port": false}}),
+    ] {
+        store
+            .save_settings_value(&serde_json::json!({"terminal": terminal}))
+            .unwrap();
+        let summary = store.load_app_settings_summary().unwrap();
+        assert!(summary.terminal_action_links_matchers.mac);
+        assert!(!summary.terminal_action_links_enabled);
+    }
+    store.save_settings_value(&serde_json::json!({"terminal": {
+        "future_terminal_option": "keep",
+        "action_links_enabled": true,
+        "action_links_matchers": {"ipv4": false, "mac": false, "future_matcher": {"enabled": true}}
+    }})).unwrap();
+    let mut summary = store.load_app_settings_summary().unwrap();
+    assert!(!summary.terminal_action_links_matchers.mac);
+    assert!(!summary.terminal_action_links_matchers.ipv4);
+    for mac in [true, false] {
+        summary.terminal_action_links_matchers.mac = mac;
+        let loaded = store.save_terminal_settings(&summary).unwrap();
+        assert_eq!(loaded.terminal_action_links_matchers.mac, mac);
+        assert!(loaded.terminal_action_links_enabled);
+        assert!(!loaded.terminal_action_links_matchers.ipv4);
+        let raw = store.load_settings_value().unwrap();
+        assert_eq!(raw["terminal"]["action_links_matchers"]["mac"], mac);
+        assert_eq!(
+            raw["terminal"]["action_links_matchers"]["future_matcher"],
+            serde_json::json!({"enabled": true})
+        );
+        assert_eq!(raw["terminal"]["future_terminal_option"], "keep");
+    }
+    drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn save_ui_layout_preserves_explicit_empty_activity_zone() {
     let dir = unique_temp_dir("settings-empty-activity-zone");
     let store = ConnectionStore::open(&dir).expect("store");
@@ -4270,6 +4311,7 @@ fn workspace_pane_layout_roundtrip() {
 #[test]
 fn open_tab_pane_root_expands_and_maps_layout() {
     let tab = nyaterm_core::models::RestorableOpenTab {
+        ssh_runtime_mode: None,
         title: "split".to_string(),
         session_type: "SSH".to_string(),
         connection_id: Some("c1".to_string()),
@@ -4333,6 +4375,7 @@ fn open_tabs_roundtrip() {
             Some("#22c55e".to_string()),
         ),
         nyaterm_core::models::RestorableOpenTab {
+            ssh_runtime_mode: None,
             title: "prod".to_string(),
             session_type: "SSH".to_string(),
             connection_id: Some("conn-1".to_string()),
@@ -4362,6 +4405,36 @@ fn open_tabs_roundtrip() {
     assert_eq!(loaded, tabs);
     store.save_open_tabs(&[]).expect("clear");
     assert!(store.load_open_tabs().expect("load empty").is_empty());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn open_tabs_preserve_legacy_and_tauri_ssh_modes_in_the_existing_document() {
+    let dir = unique_temp_dir("open-tabs-ssh-modes");
+    let store = ConnectionStore::open(&dir).unwrap();
+    let tabs: Vec<nyaterm_core::models::RestorableOpenTab> = serde_json::from_value(serde_json::json!([
+        {"title":"legacy", "session_type":"SSH", "connection_id":"saved"},
+        {"title":"Tauri split", "session_type":"SSH", "ssh_runtime_mode":"standard", "root":{
+            "kind":"split", "id":"split", "direction":"vertical", "ratio":0.5,
+            "first":{"kind":"leaf", "id":"a", "session_type":"SSH", "connection_id":"a", "ssh_runtime_mode":"sftp"},
+            "second":{"kind":"leaf", "id":"b", "session_type":"SSH", "connection_id":"b", "ssh_runtime_mode":"future-mode"}
+        }}
+    ])).unwrap();
+    store.save_open_tabs(&tabs).unwrap();
+    let restored = store.load_open_tabs().unwrap();
+    assert_eq!(restored, tabs);
+    assert!(restored[0].ssh_runtime_modes_supported());
+    assert!(!restored[1].ssh_runtime_modes_supported());
+    assert_eq!(
+        restored[1].expanded_sessions()[1]
+            .ssh_runtime_mode
+            .as_deref(),
+        Some("future-mode")
+    );
+    drop(store);
+    let reopened = ConnectionStore::open(&dir).unwrap();
+    assert_eq!(reopened.load_open_tabs().unwrap(), tabs);
+    drop(reopened);
     std::fs::remove_dir_all(dir).ok();
 }
 

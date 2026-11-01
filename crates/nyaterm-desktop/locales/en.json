@@ -2394,13 +2394,15 @@
     "keywordHighlightLogicalLinesDesc": "Keywords match continuously across automatic line wraps, but never across explicit line breaks.",
     "shortcutConflictMessage": "Shortcut conflicts with %{shortcut}",
     "actionLinks": "Action Links",
-    "actionLinksDesc": "Recognize patterns (IP, archive, host:port, path) in terminal output. Ctrl/Cmd+Click to run the default command. Alt+Click to show all actions.",
+    "actionLinksDesc": "Recognize IP, MAC, archive, host:port and URL patterns in terminal output. Ctrl/Cmd+Click performs the default action. Alt+Click shows all actions.",
     "actionLinksMatcherArchive": "Archive File",
     "actionLinksMatcherArchiveDesc": "extract, list contents",
     "actionLinksMatcherHostPort": "Host:Port",
     "actionLinksMatcherHostPortDesc": "curl, nc -vz, telnet",
     "actionLinksMatcherIpv4": "IPv4 Address",
     "actionLinksMatcherIpv4Desc": "ping, traceroute, ssh, curl",
+    "actionLinksMatcherMac": "MAC Address",
+    "actionLinksMatcherMacDesc": "Copy or insert one of five MAC formats",
     "actionLinksMatchers": "Enabled Matchers",
     "addFallbackFont": "Add Fallback",
     "addCertificate": "Add OpenSSH certificate",
@@ -3503,6 +3505,9 @@
     "unsupportedOption": "Temporary links only support direct connections."
   },
   "terminal": {
+    "macCopy": "Copy",
+    "macInsert": "Insert",
+    "macCopied": "MAC address copied",
     "retryUnavailable": "The connection was deleted or its launch configuration is unavailable.",
     "encodingUnsupported": "Unsupported character encoding. Select a supported encoding.",
     "encodingInvalidInput": "Input must be valid UTF-8.",
@@ -3903,6 +3908,11 @@
     "conflict": "Saved themes changed elsewhere. Your edits are preserved. Export them or discard them and reload before retrying."
   },
   "authForm": {
+    "connectionPasswordEnter": "Enter a password; leave blank to ask when connecting",
+    "connectionPasswordStored": "Saved password",
+    "connectionPasswordAccount": "Provided by the selected account",
+    "connectionPasswordLegacy": "Using this connection’s existing password. Unlink the account to edit it.",
+    "connectionPasswordUnavailable": "The password could not be loaded. The saved password has been kept.",
     "newPasswordRequiredLabel": "New password (required)",
     "accountPasswordUnreadable": "The account password could not be decrypted. Modify it in account settings.",
     "accountName": "Account name (required)",
@@ -3947,11 +3957,18 @@
     "hideSecret": "Hide value"
   },
   "tmux": {
-      "detach": "Detach (tmux session stays on the server)",
-      "killWindow": "Close window (kill-window)",
-      "newWindow": "New window",
-      "splitHorizontal": "Split top/bottom",
-      "splitVertical": "Split left/right",
-      "commandPlaceholder": "tmux command, e.g. resize-pane -Z"
+    "detach": "Detach (tmux session stays on the server)",
+    "killWindow": "Close window (kill-window)",
+    "newWindow": "New window",
+    "splitHorizontal": "Split top/bottom",
+    "splitVertical": "Split left/right",
+    "commandPlaceholder": "tmux command, e.g. resize-pane -Z"
+  },
+  "externalOpen": {
+    "queueFull": "Too many external connection requests. Try again later.",
+    "invalidUrl": "An external connection request was rejected: invalid or unsupported parameters.",
+    "matchTitle": "Choose a connection",
+    "matchDescription": "Several saved connections match. Choose one or open a temporary connection.",
+    "useTemporary": "Open temporary connection"
   }
 }

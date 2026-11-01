@@ -1,5 +1,6 @@
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::Pixels;
+use nyaterm_core::mac_address::MacAddressFormat;
 use nyaterm_core::{
     CredentialPromptKind, SavedCredential, compile_prompt_regex, get_credential_prompt_pattern,
 };
@@ -7,6 +8,8 @@ use rust_i18n::t;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+
+use crate::action_links::ActionLinkTarget;
 
 use super::event_wake::{ANY_INTEREST, EventWake};
 
@@ -62,7 +65,6 @@ pub(crate) enum ConnectionEditorSection {
     Display,
     Session,
     Serial,
-    Startup,
 }
 
 impl ConnectionEditorSection {
@@ -91,7 +93,7 @@ impl ConnectionEditorSection {
                 Self::Session,
             ],
             ConnectionKindTab::Serial => &[Self::Basic, Self::Serial, Self::Terminal],
-            ConnectionKindTab::Local => &[Self::Basic, Self::Startup, Self::Terminal],
+            ConnectionKindTab::Local => &[Self::Basic, Self::Terminal],
         }
     }
 
@@ -110,7 +112,6 @@ impl ConnectionEditorSection {
             Self::Display => "display",
             Self::Session => "session",
             Self::Serial => "serial",
-            Self::Startup => "startup",
         }
     }
 
@@ -129,7 +130,6 @@ impl ConnectionEditorSection {
             Self::Display => t!("dialog.editorSections.display"),
             Self::Session => t!("dialog.editorSections.session"),
             Self::Serial => t!("dialog.editorSections.serial"),
-            Self::Startup => t!("dialog.editorSections.startup"),
         }
     }
 }
@@ -264,13 +264,13 @@ impl ConnectionEditorField {
             | Self::Username
             | Self::Domain
             | Self::Password
+            | Self::ShellPath
+            | Self::ShellArgs
+            | Self::WorkingDir
             | Self::AgentEnvironmentVariable
             | Self::AgentUnixSocket => ConnectionEditorSection::Basic,
             Self::AgentForwardingEnvironmentVariable | Self::AgentForwardingSocketPath => {
                 ConnectionEditorSection::Forwarding
-            }
-            Self::ShellPath | Self::ShellArgs | Self::WorkingDir => {
-                ConnectionEditorSection::Startup
             }
             Self::SerialPort | Self::BaudRate => ConnectionEditorSection::Serial,
             Self::PostLoginCommand | Self::PostLoginDelay => ConnectionEditorSection::PostLogin,
@@ -452,6 +452,17 @@ impl std::fmt::Debug for ConnectionEditorState {
     }
 }
 
+impl ConnectionEditorState {
+    pub(crate) fn password_account_id(&self) -> Option<&str> {
+        match self.kind {
+            ConnectionKindTab::Ssh | ConnectionKindTab::Telnet => self.account_id.as_deref(),
+            ConnectionKindTab::Rdp | ConnectionKindTab::Vnc => self.password_id.as_deref(),
+            _ => None,
+        }
+        .filter(|id| !id.is_empty())
+    }
+}
+
 /// What the saved-connections list's context menu was opened on.
 ///
 /// The list owns exactly one context menu and picks its items from this. Giving
@@ -489,13 +500,16 @@ pub(crate) struct ConnectionGroupEditorState {
 pub(crate) struct ActionLinkMenuAction {
     pub(crate) id: String,
     pub(crate) label: String,
-    pub(crate) command: Option<String>,
-    pub(crate) open_url: Option<String>,
+    pub(crate) target: ActionLinkTarget,
+    pub(crate) mac_format: Option<MacAddressFormat>,
     pub(crate) is_default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ActionLinkMenuState {
+    /// Distinguishes reopened menus even at the same location in the same session.
+    pub(crate) generation: u64,
+    pub(crate) session_id: String,
     pub(crate) x: Pixels,
     pub(crate) y: Pixels,
     pub(crate) kind_label: String,

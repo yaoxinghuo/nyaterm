@@ -2401,13 +2401,15 @@
     "keywordHighlightLogicalLinesDesc": "關鍵字會跨自動折行連續比對，但不會跨實際換行比對。",
     "shortcutConflictMessage": "快捷鍵與 %{shortcut} 衝突",
     "actionLinks": "快捷動作",
-    "actionLinksDesc": "識別終端輸出中的 IP、壓縮包、host:port 和路徑，並提供快捷操作。Ctrl/Cmd + 單擊填入預設命令，Alt + 單擊檢視所有動作。",
+    "actionLinksDesc": "識別終端輸出中的 IP、MAC、壓縮檔、host:port 和 URL，並提供快捷操作。Ctrl/Cmd + 按一下執行預設動作，Alt + 按一下查看所有動作。",
     "actionLinksMatcherArchive": "壓縮檔案",
     "actionLinksMatcherArchiveDesc": "解壓、檢視內容",
     "actionLinksMatcherHostPort": "Host:Port",
     "actionLinksMatcherHostPortDesc": "curl、nc -vz、telnet",
     "actionLinksMatcherIpv4": "IPv4 位址",
     "actionLinksMatcherIpv4Desc": "ping、traceroute、ssh、curl",
+    "actionLinksMatcherMac": "MAC 位址",
+    "actionLinksMatcherMacDesc": "轉換為五種格式並複製或插入終端",
     "actionLinksMatchers": "啟用的符合器",
     "addFallbackFont": "新增備選字型",
     "addCertificate": "新增 OpenSSH 使用者憑證",
@@ -3510,6 +3512,9 @@
     "unsupportedOption": "該 SSH 輸入使用了臨時連結暫不支援的選項。"
   },
   "terminal": {
+    "macCopy": "複製",
+    "macInsert": "插入",
+    "macCopied": "MAC 位址已複製",
     "retryUnavailable": "連線已刪除或缺少啟動設定，無法重新連線。",
     "encodingUnsupported": "不支援此字元編碼，請選擇受支援的編碼。",
     "encodingInvalidInput": "輸入必須是有效的 UTF-8 文字。",
@@ -3910,6 +3915,11 @@
     "conflict": "已儲存主題已在其他位置變更，編輯內容已保留。請先匯出編輯，或放棄編輯並重新載入後重試。"
   },
   "authForm": {
+    "connectionPasswordEnter": "輸入密碼，留空則連線時詢問",
+    "connectionPasswordStored": "已儲存密碼",
+    "connectionPasswordAccount": "由所選帳戶提供",
+    "connectionPasswordLegacy": "使用此連線原有密碼；解除帳戶關聯後可編輯。",
+    "connectionPasswordUnavailable": "無法讀取密碼，已保留原密碼。",
     "newPasswordRequiredLabel": "新密碼（必填）",
     "accountPasswordUnreadable": "無法解密帳戶密碼，請在帳戶中修改密碼。",
     "accountName": "帳戶名稱（必填）",
@@ -3954,11 +3964,18 @@
     "hideSecret": "隱藏內容"
   },
   "tmux": {
-      "detach": "分離（遠端 tmux 工作階段保留）",
-      "killWindow": "關閉視窗（kill-window）",
-      "newWindow": "新增視窗",
-      "splitHorizontal": "上下分割",
-      "splitVertical": "左右分割",
-      "commandPlaceholder": "tmux 指令，例如 resize-pane -Z"
+    "detach": "分離（遠端 tmux 工作階段保留）",
+    "killWindow": "關閉視窗（kill-window）",
+    "newWindow": "新增視窗",
+    "splitHorizontal": "上下分割",
+    "splitVertical": "左右分割",
+    "commandPlaceholder": "tmux 指令，例如 resize-pane -Z"
+  },
+  "externalOpen": {
+    "queueFull": "外部連線請求過多，請稍後重試。",
+    "invalidUrl": "外部連線請求遭拒：參數無效或不受支援。",
+    "matchTitle": "選擇連線",
+    "matchDescription": "找到多個符合的已儲存連線，請選擇一個或開啟臨時連線。",
+    "useTemporary": "開啟臨時連線"
   }
 }
