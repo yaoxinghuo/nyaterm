@@ -477,9 +477,43 @@ impl TmuxControlDetector {
         }
     }
 
+    /// True when a `tmux` occurrence outside shell quoting starts a suffix
+    /// that parses as a control-mode command. Escaped bytes and quote
+    /// interior are skipped so `echo 'x; tmux -CC'` cannot match.
+    fn tmux_suffix_matches(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        let mut single = false;
+        let mut double = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\'' if !double => single = !single,
+                b'"' if !single => double = !double,
+                b'\\' if !single => i += 1,
+                _ if !single && !double && bytes[i..].starts_with(b"tmux") => {
+                    if is_tmux_control_command(&text[i..]) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn evaluate_input_line(&mut self, line: &[u8]) {
-        match std::str::from_utf8(line) {
-            Ok(text) if is_tmux_control_command(text) => {
+        let text = std::str::from_utf8(line).unwrap_or("");
+        // Keys pressed inside a fullscreen remote program (a nested `tmux
+        // attach`, vim, ...) still land in this line buffer even though the
+        // shell never saw them, leaving a garbage prefix on the next real
+        // command. The line the shell actually ran is the tail, so a `tmux`
+        // token outside quotes may start the match — quoted occurrences stay
+        // data (e.g. `echo 'x; tmux -CC'`) just like in a full-line parse. A
+        // false arm resolves cheaply when ordinary output hits a line start.
+        let matched = is_tmux_control_command(text) || Self::tmux_suffix_matches(text);
+        match (matched, text) {
+            (true, _) => {
                 self.armed_at = Some(Instant::now());
                 self.silence_hint_sent = false;
                 self.echo_tail = true;
@@ -489,7 +523,7 @@ impl TmuxControlDetector {
             }
             // A different submitted command resolves the `tmux -CC` attempt
             // either way — close the window rather than staying primed.
-            _ if line.iter().any(|b| !b.is_ascii_whitespace()) => {
+            (false, _) if line.iter().any(|b| !b.is_ascii_whitespace()) => {
                 self.armed_at = None;
                 self.echo_tail = false;
                 self.saw_shell_output = false;
@@ -1108,6 +1142,18 @@ mod tests {
             detector.feed(b"tmux -CC new -As0\r\n\x1b[?2004l\r-bash: tmux: command not found\r\n");
         assert!(matches!(feed, TmuxFeed::Passthrough(_)));
         assert!(detector.silence_deadline().is_none());
+    }
+
+    #[test]
+    fn keys_from_a_nested_tmux_do_not_block_the_next_arm() {
+        // Detaching a plain `tmux attach` types `C-b d` inside the remote
+        // program; those bytes land in our tracked line as a garbage prefix
+        // even though the next shell command runs clean. The `tmux -CC`
+        // tail must still arm — otherwise the control client's output
+        // passes through invisibly and the tab hangs.
+        let mut detector = TmuxControlDetector::new();
+        detector.feed_input(b"\x02dtmux -CC new -As0\r");
+        assert!(detector.is_armed());
     }
 
     #[test]
