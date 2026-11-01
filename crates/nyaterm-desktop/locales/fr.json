@@ -3963,6 +3963,7 @@
     "hideSecret": "Masquer la valeur"
   },
   "tmux": {
+    "modemDisabled": "Les transferts XMODEM/YMODEM/ZMODEM ne sont pas disponibles en mode contrôle tmux. Utilisez SFTP.",
     "detach": "Détacher (la session tmux reste sur le serveur)",
     "killWindow": "Fermer la fenêtre (kill-window)",
     "newWindow": "Nouvelle fenêtre",

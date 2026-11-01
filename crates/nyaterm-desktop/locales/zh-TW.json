@@ -3964,6 +3964,7 @@
     "hideSecret": "隱藏內容"
   },
   "tmux": {
+    "modemDisabled": "tmux 控制模式不支援 XMODEM/YMODEM/ZMODEM 檔案傳輸，請使用 SFTP。",
     "detach": "分離（遠端 tmux 工作階段保留）",
     "killWindow": "關閉視窗（kill-window）",
     "newWindow": "新增視窗",

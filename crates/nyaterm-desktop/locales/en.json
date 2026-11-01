@@ -3957,6 +3957,7 @@
     "hideSecret": "Hide value"
   },
   "tmux": {
+    "modemDisabled": "XMODEM/YMODEM/ZMODEM transfers are unavailable in tmux control mode. Use SFTP instead.",
     "detach": "Detach (tmux session stays on the server)",
     "killWindow": "Close window (kill-window)",
     "newWindow": "New window",

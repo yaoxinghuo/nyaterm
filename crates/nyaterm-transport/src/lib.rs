@@ -1692,8 +1692,15 @@ impl SessionManager {
         self.sessions.lock().is_ok_and(|sessions| {
             // Output already queued by an exited session still needs protocol filtering.
             // Session existence is checked by the eventual writer, not this policy gate.
-            !matches!(sessions.get(session_id), Some(ManagedSession::Serial(serial))
-                if serial.flow_control == nyaterm_core::models::connection::SerialFlowControl::Software)
+            match sessions.get(session_id) {
+                Some(ManagedSession::TmuxPane(_)) => false,
+                Some(ManagedSession::Ssh(ssh)) if ssh.tmux_active.load(Ordering::Acquire) => false,
+                Some(ManagedSession::Serial(serial)) => {
+                    serial.flow_control
+                        != nyaterm_core::models::connection::SerialFlowControl::Software
+                }
+                _ => true,
+            }
         })
     }
 
@@ -1750,6 +1757,18 @@ impl SessionManager {
                 .lock()
                 .map_err(|_| SessionError::LockPoisoned)?;
             match sessions.get(session_id) {
+                Some(ManagedSession::TmuxPane(_)) => {
+                    return Err(SessionError::Write {
+                        session_id: session_id.into(),
+                        source: tmux_modem_unsupported().into(),
+                    });
+                }
+                Some(ManagedSession::Ssh(ssh)) if ssh.tmux_active.load(Ordering::Acquire) => {
+                    return Err(SessionError::Write {
+                        session_id: session_id.into(),
+                        source: tmux_modem_unsupported().into(),
+                    });
+                }
                 Some(ManagedSession::Tcp(session)) => {
                     telnet_wire_size(data, session.config.raw_tcp)
                 }
@@ -1797,9 +1816,7 @@ impl SessionManager {
                             Some(ManagedSession::TmuxPane(_)) => {
                                 return Err(SessionError::Write {
                                     session_id: session_id.into(),
-                                    source: anyhow::anyhow!(
-                                        "file-transfer protocols are not supported inside a tmux pane"
-                                    ),
+                                    source: tmux_modem_unsupported().into(),
                                 });
                             }
                             None => return Err(SessionError::NotFound(session_id.into())),
@@ -2251,6 +2268,9 @@ impl TerminalTransport for SshChannelTransport {
     }
 
     fn write_raw(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        if self.tmux_active.load(Ordering::Acquire) {
+            return Err(tmux_modem_unsupported().into());
+        }
         if !self.shell_enabled {
             return Err(connection_attempt::ShellUnavailable.into());
         }
@@ -2283,6 +2303,13 @@ impl TerminalTransport for SshChannelTransport {
     }
 }
 
+fn tmux_modem_unsupported() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "file-transfer protocols are not supported in tmux control mode",
+    )
+}
+
 impl TerminalTransport for TmuxPaneTransport {
     fn write(&mut self, data: &[u8]) -> anyhow::Result<()> {
         if data.is_empty() {
@@ -2296,10 +2323,8 @@ impl TerminalTransport for TmuxPaneTransport {
             .map_err(|_| anyhow::anyhow!("tmux control channel closed for pane {}", self.pane))
     }
 
-    /// Protocol bytes stay literal; the control session classifies them for
-    /// `send-keys` so remote panes receive the right key encoding.
-    fn write_raw(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        self.write(data)
+    fn write_raw(&mut self, _data: &[u8]) -> anyhow::Result<()> {
+        Err(tmux_modem_unsupported().into())
     }
 
     fn resize(

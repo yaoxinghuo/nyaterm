@@ -3963,6 +3963,7 @@
     "hideSecret": "内容を非表示"
   },
   "tmux": {
+    "modemDisabled": "tmux 制御モードでは XMODEM/YMODEM/ZMODEM ファイル転送を利用できません。SFTP を使用してください。",
     "detach": "デタッチ（リモート tmux セッションは維持）",
     "killWindow": "ウィンドウを閉じる（kill-window）",
     "newWindow": "新規ウィンドウ",

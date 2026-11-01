@@ -3957,6 +3957,7 @@
     "hideSecret": "隐藏内容"
   },
   "tmux": {
+    "modemDisabled": "tmux 控制模式不支持 XMODEM/YMODEM/ZMODEM 文件传输，请使用 SFTP。",
     "detach": "分离（远端 tmux 会话保留）",
     "killWindow": "关闭窗口（kill-window）",
     "newWindow": "新建窗口",

@@ -3964,6 +3964,7 @@
     "hideSecret": "내용 숨기기"
   },
   "tmux": {
+    "modemDisabled": "tmux 제어 모드에서는 XMODEM/YMODEM/ZMODEM 파일 전송을 사용할 수 없습니다. SFTP를 사용하세요.",
     "detach": "분리 (원격 tmux 세션 유지)",
     "killWindow": "창 닫기 (kill-window)",
     "newWindow": "새 창",
